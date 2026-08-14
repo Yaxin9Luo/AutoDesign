@@ -1,0 +1,221 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --serif: "Palatino Linotype", Palatino, "Book Antiqua", serif;
+  --sans: Arial, Helvetica, sans-serif;
+}
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+    min-height: 0;
+  }
+  html {
+    font-family: var(--sans);
+  }
+  body {
+    overflow: hidden;
+    color: oklch(0.17 0.01 58);
+    background-color: oklch(0.982 0.005 88);
+    background-image:
+      radial-gradient(ellipse 900px 420px at 50% -12%, oklch(1 0 0 / 0.86), transparent 68%),
+      linear-gradient(oklch(0.72 0.01 76 / 0.085) 1px, transparent 1px),
+      linear-gradient(90deg, oklch(0.72 0.01 76 / 0.075) 1px, transparent 1px);
+    background-size: auto, 48px 48px, 48px 48px;
+    background-position: center top, 0 0, 0 0;
+  }
+  ::selection {
+    background: oklch(0.62 0.145 43);
+    color: white;
+  }
+
+  /* Unified focus ring — replaces ad-hoc focus:ring-* in components.
+   * Editorial: 2px accent outline at 2px offset, no shadow halo. */
+  :focus-visible {
+    outline: 2px solid oklch(0.62 0.145 43);
+    outline-offset: 2px;
+    border-radius: 4px;
+  }
+  /* Buttons / inputs already have a border — push the outline outside. */
+  button:focus-visible,
+  a:focus-visible,
+  [role="button"]:focus-visible {
+    outline-offset: 3px;
+  }
+  /* Don't stack our outline on inputs that get a border-color treatment. */
+  input:focus-visible,
+  textarea:focus-visible,
+  select:focus-visible {
+    outline: none;
+  }
+}
+
+@layer components {
+  /* ---------- Editorial type system ----------
+   * Use these classes (not raw text-* / font-* combos) for any
+   * semantically-loaded text: section eyebrows, page titles, lede paragraphs.
+   * Keeps rhythm consistent across components. */
+  .eyebrow {
+    @apply text-[10px] font-medium uppercase text-ink-500;
+    letter-spacing: 0.18em;
+    font-feature-settings: "ss01", "cv11";
+  }
+  .eyebrow-rule {
+    @apply text-[10px] font-medium uppercase text-ink-500;
+    letter-spacing: 0.18em;
+    font-feature-settings: "ss01", "cv11";
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+  }
+  .eyebrow-rule::before {
+    content: "";
+    width: 18px;
+    height: 1px;
+    background: oklch(0.85 0.016 80);
+  }
+  .display-1 {
+    font-family: var(--serif);
+    font-size: clamp(40px, 5.6vw, 64px);
+    font-weight: 350;
+    line-height: 1.05;
+    letter-spacing: 0;
+    color: oklch(0.18 0.014 60);
+    text-wrap: balance;
+  }
+  .display-2 {
+    font-family: var(--serif);
+    font-size: clamp(24px, 3vw, 32px);
+    font-weight: 400;
+    line-height: 1.15;
+    letter-spacing: 0;
+    color: oklch(0.18 0.014 60);
+    text-wrap: balance;
+  }
+  .display-3 {
+    font-family: var(--serif);
+    font-size: 18px;
+    font-weight: 450;
+    line-height: 1.25;
+    letter-spacing: 0;
+    color: oklch(0.18 0.014 60);
+  }
+  .lede {
+    font-size: 16px;
+    line-height: 1.55;
+    color: oklch(0.32 0.012 55);
+    font-weight: 400;
+  }
+  .dek {
+    font-size: 13px;
+    line-height: 1.5;
+    color: oklch(0.55 0.018 70);
+    font-weight: 400;
+  }
+
+  /* ---------- Form atoms (kept names from prior version) ---------- */
+  .field-label {
+    @apply text-[10px] font-medium uppercase text-ink-500;
+    letter-spacing: 0.16em;
+  }
+  .field-input {
+    @apply w-full rounded-md border border-ink-300/80 bg-surface-raised/80 px-2.5 py-1.5 text-[13px] text-ink-900 outline-none transition focus:border-accent;
+  }
+  .icon-btn {
+    @apply inline-flex h-7 w-7 items-center justify-center rounded-md text-ink-500 transition hover:bg-surface-raised hover:text-ink-900 disabled:cursor-not-allowed disabled:opacity-40;
+    transition-timing-function: cubic-bezier(0.2, 0.8, 0.2, 1);
+  }
+  .icon-btn-active {
+    @apply bg-ink-900 text-white hover:bg-ink-900 hover:text-white;
+  }
+  .seg-btn {
+    @apply flex flex-1 items-center justify-center rounded-md px-2 py-1.5 text-xs font-medium text-ink-500 transition hover:text-ink-900;
+  }
+  .seg-btn-active {
+    @apply bg-white text-ink-900 shadow-sm;
+  }
+  .panel-h {
+    @apply text-[10px] font-medium uppercase text-ink-500;
+    letter-spacing: 0.18em;
+    font-feature-settings: "ss01", "cv11";
+  }
+  /* Tab atom — used by Properties sidebar; ink-900 underline on active. */
+  .tab-btn {
+    @apply relative flex flex-1 items-center justify-center px-2 py-2 text-[10px] font-medium uppercase text-ink-500 transition hover:text-ink-900;
+    letter-spacing: 0.18em;
+  }
+  .tab-btn-active {
+    @apply text-ink-900;
+  }
+  .tab-btn-active::after {
+    content: "";
+    position: absolute;
+    left: 50%;
+    bottom: -1px;
+    width: 16px;
+    height: 1.5px;
+    background: oklch(0.18 0.014 60);
+    transform: translateX(-50%);
+  }
+
+  .run-output-panel {
+    border: 1px solid oklch(0.86 0.009 82 / 0.72);
+    border-radius: 6px;
+    background: oklch(1 0 0 / 0.72);
+    padding: 12px;
+    box-shadow: 0 1px 0 oklch(0.17 0.01 58 / 0.035);
+  }
+  .run-output-panel-compact {
+    padding: 10px;
+  }
+
+  /* Tabular numerics — for timers, zoom, percentages, version. */
+  .tabular {
+    font-variant-numeric: tabular-nums;
+  }
+
+  .app-shell,
+  .canvas-grid-bg {
+    background-color: oklch(0.982 0.005 88);
+    background-image:
+      linear-gradient(oklch(0.72 0.01 76 / 0.08) 1px, transparent 1px),
+      linear-gradient(90deg, oklch(0.72 0.01 76 / 0.07) 1px, transparent 1px);
+    background-size: 48px 48px, 48px 48px;
+  }
+
+  .app-panel {
+    @apply border-ink-300/70 bg-paper/90 backdrop-blur-md;
+  }
+}
+
+/* tiny scrollbar — tinted to ink palette */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-thumb {
+  background: oklch(0.86 0.009 82);
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: oklch(0.73 0.010 76);
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* Reduced-motion: respect user preference globally. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "generated_mood": {
+    "use_when": "General product, pitch, travel, training, or company decks need atmosphere, hero art, dividers, or conceptual diagrams that are not factual evidence.",
+    "rules": [
+      "Keep generated imagery editable-adjacent: use it as image blocks inside html_artifact, not as whole-slide replacements.",
+      "Use one prompt prefix and visual system across the deck.",
+      "Never present generated mood art as a chart, screenshot, source quote, or metric proof."
+    ]
+  },
+  "source_evidence": {
+    "use_when": "A deck includes attached documents, screenshots, charts, tables, or user-provided product captures.",
+    "rules": [
+      "Preserve source/source_id metadata on evidence blocks.",
+      "Reserve bbox slots before final text expansion.",
+      "Repair evidence visuals by resizing, cropping, annotating, simplifying, or splitting slides, not by regenerating them."
+    ]
+  },
+  "no_image_mode": {
+    "use_when": "The user asks for text-only, no images, or a clean internal memo deck.",
+    "rules": [
+      "Use editable text, tables, metrics, shapes, and diagrams.",
+      "Maintain layout variety through rhythm, scale, contrast, and section breaks."
+    ]
+  }
+}

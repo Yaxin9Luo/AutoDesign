@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 1600" width="1200" height="1600">
+  <rect width="1200" height="1600" fill="#f4ede2"/>
+
+  <text x="80" y="220" font-family="Inter, system-ui, sans-serif" font-size="28"
+        font-weight="500" letter-spacing="6" fill="#6b6b6b">
+    OPEN · DESIGN · 2026 · MOCK BACKEND
+  </text>
+
+  <text x="80" y="450" font-family="'Playfair Display', Georgia, serif"
+        font-size="168" font-weight="600" fill="#1f1f1f"
+        style="letter-spacing:-2px">
+    <tspan x="80" dy="0">Design,</tspan>
+    <tspan x="80" dy="180">in a conversation.</tspan>
+  </text>
+
+  <text x="80" y="980" font-family="Inter, system-ui, sans-serif"
+        font-size="36" font-weight="400" fill="#2a2a2a">
+    <tspan x="80" dy="0">This SVG was served by FastAPI at</tspan>
+    <tspan x="80" dy="56">/api/files/_mock/poster.svg.</tspan>
+    <tspan x="80" dy="80" font-size="28" fill="#5a5a5a">
+      Phase A — fetch chain verified, no agent ran.
+    </tspan>
+  </text>
+
+  <rect x="80" y="1280" width="220" height="16" fill="#1d3a2f"/>
+
+  <text x="80" y="1340" font-family="'JetBrains Mono', ui-monospace, monospace"
+        font-size="22" font-weight="500" fill="#1f1f1f">
+    POST /api/generate { artifact_type: "poster" }
+  </text>
+</svg>

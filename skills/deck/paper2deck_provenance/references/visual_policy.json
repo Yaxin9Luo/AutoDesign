@@ -1,0 +1,55 @@
+{
+  "paper_visual_priority": [
+    "method_diagram",
+    "main_results_table",
+    "qualitative_examples",
+    "ablation_or_scaling_plot",
+    "architecture_or_pipeline"
+  ],
+  "generated_image_policy": {
+    "cover": "optional ambient background",
+    "content": "avoid for technical evidence",
+    "closing": "optional quiet ambience"
+  },
+  "minimum_expectations": {
+    "figures_when_available_ge_5": 4,
+    "figures_when_available_ge_10": 6,
+    "wide_table_max_columns_before_subset": 8,
+    "default_18_slide_visual_unit_slides": 13,
+    "four_eligible_assets_source_placements": 8
+  },
+  "visual_unit_contract": {
+    "counted_units": [
+      "eligible_original_source_visual",
+      "native_html_table",
+      "source_verifiable_equation",
+      "editable_mechanism_diagram"
+    ],
+    "editability": "Keep all non-source-crop text, table cells, formula labels, diagram labels, and callouts editable.",
+    "equation_and_diagram_provenance": "Set data-visual-unit and data-evidence-ref on equations and mechanism diagrams."
+  },
+  "source_reuse_contract": {
+    "default_18_slide_few_asset_cap_per_asset": 2,
+    "same_slide_duplicate": "forbidden",
+    "local_interpretation": "Every placement needs a placement-specific figcaption or evidence-readout; reuse must explain a different panel, comparison, mechanism, or implication."
+  },
+  "source_id_contract": {
+    "allowed_patterns": ["ingest_fig_NN", "ingest_fig_NN_panel", "ingest_table_NN"],
+    "rule": "Use exact ingest source ids in layout slots and evidence blocks; never invent replacement ids for paper visuals."
+  },
+  "slot_contract": {
+    "order": "Reserve figure/table bounding-box slots before writing final body copy.",
+    "caption_zone": "Each source-backed slide keeps a caption or evidence-readout zone in the same or adjacent panel.",
+    "wide_table": "Subset a table wider than 8 columns to a narrative 4-6 column native table."
+  },
+  "editable_callouts": "When copy names a row, cell, panel, curve, or result, anchor an editable callout to the relevant figure or table block.",
+  "speaker_notes": "For speaker-ready decks, explain the claim, evidence, transition, and why the visual matters in plain spoken language.",
+  "provenance_fields": ["block_id", "source", "source_id", "evidence_quote"],
+  "claim_coverage": "When a claim graph exists, slide.covers must retain relevant tension, mechanism, evidence, and implication nodes.",
+  "repair_order": [
+    "restore exact ingest source ids",
+    "remove unverifiable numbers or bind them to evidence_quote",
+    "reduce copy or split a slide before shrinking evidence",
+    "revise storyboard and grouped slots before individual bounding boxes"
+  ]
+}

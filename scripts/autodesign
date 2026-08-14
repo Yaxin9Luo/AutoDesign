@@ -1,0 +1,401 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_SOURCE="${BASH_SOURCE[0]}"
+while [ -L "${SCRIPT_SOURCE}" ]; do
+  SOURCE_DIR="$(cd -P -- "$(dirname -- "${SCRIPT_SOURCE}")" && pwd)"
+  LINK_TARGET="$(readlink "${SCRIPT_SOURCE}")"
+  case "${LINK_TARGET}" in
+    /*) SCRIPT_SOURCE="${LINK_TARGET}" ;;
+    *) SCRIPT_SOURCE="${SOURCE_DIR}/${LINK_TARGET}" ;;
+  esac
+done
+SCRIPT_DIR="$(cd -P -- "$(dirname -- "${SCRIPT_SOURCE}")" && pwd)"
+REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
+
+STATE_DIR="${AUTODESIGN_STATE_DIR:-${DESIGNANYTHING_STATE_DIR:-${HOME}/.autodesign}}"
+case "${STATE_DIR}" in
+  /*) ;;
+  *) STATE_DIR="$(pwd -P)/${STATE_DIR}" ;;
+esac
+LEGACY_STATE_DIR="${HOME}/.designanything"
+SETUP_STAMP="${STATE_DIR}/setup.stamp"
+LEGACY_REPO_SETUP_STAMP="${REPO_ROOT}/.designanything/setup.stamp"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  autodesign start [--port PORT] [--skip-setup]
+  autodesign setup
+  autodesign doctor
+  autodesign path
+  autodesign <CLI command> [options]
+
+Commands:
+  start        Start the local backend and open the browser UI.
+  setup        Install Python, browser, and locked video runtime dependencies.
+  doctor       Check local runtime prerequisites.
+  path         Print the installed AutoDesign directory.
+
+Other commands are delegated to the AutoDesign Python CLI. For example:
+  autodesign run "Create an academic paper poster."
+EOF
+}
+
+die() {
+  echo "error: $*" >&2
+  exit 1
+}
+
+have_cmd() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+need_cmd() {
+  have_cmd "$1" || die "Missing required command: $1"
+}
+
+migrate_legacy_state() {
+  if [ "${STATE_DIR}" = "${LEGACY_STATE_DIR}" ]; then
+    return 0
+  fi
+  if [ ! -e "${STATE_DIR}" ] && [ -d "${LEGACY_STATE_DIR}" ] && [ ! -L "${LEGACY_STATE_DIR}" ]; then
+    mkdir -p "$(dirname -- "${STATE_DIR}")"
+    mv "${LEGACY_STATE_DIR}" "${STATE_DIR}"
+    if ! ln -s "${STATE_DIR}" "${LEGACY_STATE_DIR}"; then
+      mv "${STATE_DIR}" "${LEGACY_STATE_DIR}"
+      die "Could not create the legacy state compatibility symlink"
+    fi
+    echo "Migrated AutoDesign state to ${STATE_DIR}." >&2
+  elif [ -e "${STATE_DIR}" ] && [ -d "${LEGACY_STATE_DIR}" ] && [ ! -L "${LEGACY_STATE_DIR}" ]; then
+    echo "warning: both ${STATE_DIR} and legacy ${LEGACY_STATE_DIR} exist; leaving both unchanged" >&2
+  fi
+}
+
+python_for_launcher() {
+  if [ -x "${REPO_ROOT}/.venv/bin/python" ]; then
+    printf '%s\n' "${REPO_ROOT}/.venv/bin/python"
+  elif have_cmd python3; then
+    command -v python3
+  else
+    return 1
+  fi
+}
+
+pick_port() {
+  local preferred="$1"
+  local py
+
+  py="$(python_for_launcher)" || {
+    printf '%s\n' "${preferred}"
+    return 0
+  }
+
+  "${py}" - "${preferred}" <<'PY'
+import socket
+import sys
+
+preferred = int(sys.argv[1])
+for port in range(preferred, preferred + 50):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        try:
+            s.bind(("127.0.0.1", port))
+        except OSError:
+            continue
+        print(port)
+        raise SystemExit(0)
+raise SystemExit(f"no free localhost port found in {preferred}-{preferred + 49}")
+PY
+}
+
+probe_port_with_python() {
+  local port="$1"
+  shift
+
+  "$@" - "${port}" <<'PY'
+import errno
+import socket
+import sys
+
+try:
+    port = int(sys.argv[1])
+except ValueError:
+    print("invalid")
+    raise SystemExit(0)
+
+if port < 1 or port > 65535:
+    print("invalid")
+    raise SystemExit(0)
+
+with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+    try:
+        sock.bind(("127.0.0.1", port))
+    except OSError as exc:
+        if exc.errno == errno.EADDRINUSE:
+            print("busy")
+        else:
+            print(f"unavailable: {exc.strerror or exc}")
+    else:
+        print("available")
+PY
+}
+
+probe_port() {
+  local port="$1"
+  local py
+
+  if py="$(python_for_launcher)"; then
+    probe_port_with_python "${port}" "${py}"
+  elif have_cmd uv; then
+    (
+      cd "${REPO_ROOT}"
+      probe_port_with_python "${port}" uv run python
+    )
+  else
+    printf '%s\n' "unavailable: Python interpreter not found"
+  fi
+}
+
+ensure_web_dist() {
+  if [ ! -f "${REPO_ROOT}/web/dist/index.html" ]; then
+    die "Built frontend missing at ${REPO_ROOT}/web/dist/index.html. Use a release bundle that includes web/dist, or run the Developer Setup to build it."
+  fi
+}
+
+ensure_video_runtime() {
+  local runtime_dir="${REPO_ROOT}/runtime/video"
+  local node_version
+  local node_major
+
+  [ -f "${runtime_dir}/package.json" ] || die "Video runtime package is missing at ${runtime_dir}/package.json"
+  [ -f "${runtime_dir}/package-lock.json" ] || die "Video runtime lockfile is missing at ${runtime_dir}/package-lock.json"
+  need_cmd node
+  need_cmd npm
+  node_version="$(node --version 2>/dev/null || true)"
+  node_major="${node_version#v}"
+  node_major="${node_major%%.*}"
+  case "${node_major}" in
+    ''|*[!0-9]*)
+      die "Could not determine Node.js version from: ${node_version:-<empty>}"
+      ;;
+  esac
+  if [ "${node_major}" -lt 22 ]; then
+    die "Video runtime requires Node.js 22 or newer; found ${node_version}"
+  fi
+
+  echo "Installing locked Video runtime with npm..."
+  (
+    cd "${runtime_dir}"
+    npm ci --omit=dev
+  )
+  [ -x "${runtime_dir}/node_modules/.bin/hyperframes" ] \
+    || die "Video runtime installation did not produce HyperFrames"
+  echo "Ensuring the HyperFrames rendering browser..."
+  "${runtime_dir}/node_modules/.bin/hyperframes" browser ensure
+}
+
+run_setup() {
+  cd "${REPO_ROOT}"
+  need_cmd uv
+  ensure_web_dist
+  migrate_legacy_state
+  mkdir -p "${STATE_DIR}"
+  echo "Installing Python dependencies with uv..."
+  uv sync
+  echo "Installing Playwright browsers..."
+  uv run python scripts/install_playwright_browsers.py
+  ensure_video_runtime
+  date -u +"%Y-%m-%dT%H:%M:%SZ" >"${SETUP_STAMP}"
+}
+
+setup_if_needed() {
+  migrate_legacy_state
+  if [ -x "${REPO_ROOT}/.venv/bin/python" ] && {
+    [ -f "${SETUP_STAMP}" ] || [ -f "${LEGACY_REPO_SETUP_STAMP}" ]
+  } && [ -x "${REPO_ROOT}/runtime/video/node_modules/.bin/hyperframes" ]; then
+    return 0
+  fi
+  run_setup
+}
+
+cmd_start() {
+  local port="${BACKEND_PORT:-8000}"
+  local skip_setup=0
+  local explicit_port=0
+  local selected_port
+
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --port)
+        [ "$#" -ge 2 ] || die "--port requires a value"
+        port="$2"
+        explicit_port=1
+        shift 2
+        ;;
+      --skip-setup)
+        skip_setup=1
+        shift
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        die "Unknown start option: $1"
+        ;;
+    esac
+  done
+
+  ensure_web_dist
+  migrate_legacy_state
+  if [ "${skip_setup}" != "1" ]; then
+    setup_if_needed
+  fi
+
+  selected_port="${port}"
+  if [ "${explicit_port}" = "1" ]; then
+    local port_status
+    if port_status="$(probe_port "${selected_port}")"; then
+      case "${port_status}" in
+        available)
+          ;;
+        busy)
+          die "Requested port ${selected_port} is already in use. Choose another port or omit --port to select an available port."
+          ;;
+        invalid)
+          die "Requested port ${selected_port} is invalid. Use a port between 1 and 65535."
+          ;;
+        unavailable:*)
+          die "Requested port ${selected_port} is unavailable: ${port_status#unavailable: }"
+          ;;
+        *)
+          die "Could not validate requested port ${selected_port} before startup."
+          ;;
+      esac
+    else
+      die "Could not validate requested port ${selected_port} before startup."
+    fi
+  else
+    selected_port="$(pick_port "${port}")"
+    if [ "${selected_port}" != "${port}" ]; then
+      echo "Port ${port} is busy; using ${selected_port}."
+    fi
+  fi
+
+  cd "${REPO_ROOT}"
+  exec env \
+    BACKEND_PORT="${selected_port}" \
+    AUTODESIGN_SKIP_SETUP=1 \
+    DESIGNANYTHING_SKIP_SETUP=1 \
+    "${REPO_ROOT}/scripts/start_local_web.sh"
+}
+
+cmd_doctor() {
+  local status=0
+
+  echo "AutoDesign path: ${REPO_ROOT}"
+  echo "AutoDesign state: ${STATE_DIR}"
+
+  if [ -f "${REPO_ROOT}/web/dist/index.html" ]; then
+    echo "web/dist: ok"
+  else
+    echo "web/dist: missing"
+    status=1
+  fi
+
+  if have_cmd uv; then
+    echo "uv: $(uv --version)"
+  else
+    echo "uv: missing"
+    status=1
+  fi
+
+  if have_cmd node; then
+    local node_version
+    local node_major
+    node_version="$(node --version 2>/dev/null || true)"
+    node_major="${node_version#v}"
+    node_major="${node_major%%.*}"
+    if [ -n "${node_major}" ] && [ "${node_major}" -ge 22 ] 2>/dev/null; then
+      echo "node: ${node_version}"
+    else
+      echo "node: ${node_version:-unknown}; Video requires Node.js 22+"
+      status=1
+    fi
+  else
+    echo "node: missing; Video requires Node.js 22+"
+    status=1
+  fi
+
+  if [ -x "${REPO_ROOT}/runtime/video/node_modules/.bin/hyperframes" ]; then
+    echo "hyperframes: $("${REPO_ROOT}/runtime/video/node_modules/.bin/hyperframes" --version 2>/dev/null || echo installed)"
+  else
+    echo "hyperframes: missing; run autodesign setup"
+    status=1
+  fi
+
+  for media_cmd in ffmpeg ffprobe; do
+    if have_cmd "${media_cmd}"; then
+      echo "${media_cmd}: $(command -v "${media_cmd}")"
+    else
+      echo "${media_cmd}: missing; Video export is unavailable"
+      status=1
+    fi
+  done
+
+  if have_cmd codex; then
+    if codex login status >/dev/null 2>&1; then
+      echo "codex: installed and logged in"
+    else
+      echo "codex: installed but not logged in"
+    fi
+  else
+    echo "codex: missing"
+  fi
+
+  if [ -f "${REPO_ROOT}/.env" ]; then
+    echo ".env: found"
+  else
+    echo ".env: missing; you can still enter API settings in the Web UI"
+  fi
+
+  return "${status}"
+}
+
+run_cli() {
+  local module="autodesign"
+
+  need_cmd uv
+  migrate_legacy_state
+  if [ ! -e "${REPO_ROOT}/autodesign" ]; then
+    module="design_anything.cli"
+  fi
+  cd "${REPO_ROOT}"
+  exec uv --cache-dir "${REPO_ROOT}/.uv-cache" run python -m "${module}" "$@"
+}
+
+command_name="${1:-start}"
+if [ "$#" -gt 0 ]; then
+  shift
+fi
+
+case "${command_name}" in
+  start)
+    cmd_start "$@"
+    ;;
+  setup)
+    run_setup
+    ;;
+  doctor)
+    cmd_doctor
+    ;;
+  path)
+    echo "${REPO_ROOT}"
+    ;;
+  -h|--help|help)
+    usage
+    ;;
+  *)
+    run_cli "${command_name}" "$@"
+    ;;
+esac

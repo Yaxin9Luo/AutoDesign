@@ -1,0 +1,14 @@
+/* Selected html-ppt-style theme tokens adapted for AutoDesign guidance only.
+   These are not loaded by the renderer in this implementation slice. */
+:root {
+  --html-ppt-bg: #ffffff;
+  --html-ppt-surface: #f7f8fa;
+  --html-ppt-text: #111827;
+  --html-ppt-muted: #64748b;
+  --html-ppt-border: #cbd5e1;
+  --html-ppt-accent: #3b6cff;
+  --html-ppt-grad: linear-gradient(135deg,#3b6cff,#7a5cff 55%,#ff5c8a);
+  --html-ppt-font-sans: Inter, "Noto Sans SC", system-ui, sans-serif;
+  --html-ppt-font-serif: PlayfairDisplay, "Noto Serif SC", Georgia, serif;
+  --html-ppt-font-mono: JetBrainsMono, "IBM Plex Mono", monospace;
+}

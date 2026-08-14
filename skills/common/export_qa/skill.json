@@ -1,0 +1,15 @@
+{
+  "manifest_version": 2,
+  "id": "common.export_qa",
+  "version": "0.2.0",
+  "description": "Shared editable-export QA and repair priorities for AutoDesign artifacts.",
+  "applies_to": ["all"],
+  "stages": ["plan", "critique", "repair"],
+  "triggers": [],
+  "priority": 10,
+  "enabled_by_default": true,
+  "source": {"kind": "autodesign", "description": "Shared final artifact QA policy for AutoDesign outputs."},
+  "assets": [],
+  "resources": [{"id": "export_checks", "path": "references/export_checks.md", "description": "Artifact export checks and repair ordering.", "stages": ["plan", "repair"], "when_to_read": "Read when planning export guarantees or handling QA findings.", "media_type": "text/markdown"}],
+  "outputs": ["qa_policy", "repair_priorities"]
+}

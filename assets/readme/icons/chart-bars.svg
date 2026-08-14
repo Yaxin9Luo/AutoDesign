@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#64748B" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" role="img" aria-labelledby="title desc">
+  <title id="title">Full-scale benchmark</title>
+  <desc id="desc">Outline bar chart used beside full-scale benchmark results.</desc>
+  <path d="M3 21h18M5 18v-6h4v6M10 18V6h4v12M15 18V9h4v9"/>
+</svg>

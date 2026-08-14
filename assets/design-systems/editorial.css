@@ -1,0 +1,90 @@
+/* Editorial — magazine-grade serif hierarchy. */
+
+:root {
+  --ld-bg: #fbf9f4;
+  --ld-bg-alt: #f2ede1;
+  --ld-bg-dark: #1a1a1a;
+  --ld-fg: #1a1a1a;
+  --ld-fg-muted: #6b6358;
+  --ld-fg-inverse: #f5ece0;
+  --ld-rule: #2a2824;
+  --ld-accent: #7a2020;
+}
+
+body { background: #e8e2d3; color: var(--ld-fg); font-family: Georgia, 'Times New Roman', serif; }
+.ld-landing { background: var(--ld-bg); }
+
+.ld-section { padding: 120px 80px; gap: 24px; }
+.ld-section[data-section-variant="hero"] {
+  background: var(--ld-bg); text-align: center; align-items: center;
+  padding: 180px 80px 140px;
+}
+.ld-section[data-section-variant="hero"] .layer.text { max-width: 720px; }
+.ld-section[data-section-variant="features"] {
+  background: var(--ld-bg-alt);
+  border-top: 1px solid var(--ld-rule); border-bottom: 1px solid var(--ld-rule);
+}
+.ld-section[data-section-variant="cta"] {
+  background: var(--ld-bg-dark); color: var(--ld-fg-inverse);
+  text-align: center; align-items: center; padding: 120px 80px;
+}
+.ld-section[data-section-variant="footer"] {
+  background: var(--ld-bg); color: var(--ld-fg-muted);
+  border-top: 1px solid var(--ld-rule);
+  padding: 48px 80px; font-size: 13px; letter-spacing: 0.05em;
+}
+
+/* Image layers (v1.0 #8.75) — sharp edges, thin rule, captioned feel */
+.ld-landing figure.layer.image {
+  margin: 0; padding: 0; width: 100%;
+  border-radius: 0; overflow: hidden;
+  border-top: 1px solid var(--ld-rule);
+  border-bottom: 1px solid var(--ld-rule);
+}
+.ld-landing figure.layer.image img {
+  width: 100%; height: auto; display: block;
+  filter: saturate(0.9);
+}
+/* Hero: image wide below the narrow text column, or side-by-side */
+.ld-section[data-section-variant="hero"][data-has-image="true"] figure.layer.image {
+  margin-top: 48px; max-width: 960px;
+  border-top: 2px solid var(--ld-rule); border-bottom: 2px solid var(--ld-rule);
+}
+/* Features: images as editorial thumbnails above text */
+.ld-section[data-section-variant="features"][data-has-image="true"] figure.layer.image {
+  aspect-ratio: 4 / 3; max-width: 360px;
+}
+
+.ld-landing .layer.text {
+  font-family: Georgia, 'Times New Roman', serif;
+  font-feature-settings: "liga" 1, "dlig" 1, "kern" 1;
+}
+/* Serif for headline positions (first child of each section), sans-ish for body. */
+.ld-section .layer.text:first-of-type {
+  font-weight: 700; letter-spacing: -0.015em; line-height: 1.2;
+}
+.ld-section .layer.text:not(:first-of-type) {
+  font-style: italic; color: var(--ld-fg-muted); line-height: 1.65;
+}
+.ld-section[data-section-variant="cta"] .layer.text:not(:first-of-type) {
+  color: var(--ld-fg-inverse); opacity: 0.85;
+}
+
+/* v1.3 — top nav: serif small-caps rule with hairline border */
+.ld-header { background: var(--ld-bg); border-bottom: 1px solid var(--ld-rule); padding: 18px 80px; }
+.ld-nav ul { justify-content: center; gap: 42px; }
+.ld-nav a { color: var(--ld-fg); font-family: Georgia, serif; font-size: 13px;
+            letter-spacing: 0.16em; text-transform: uppercase; }
+.ld-nav a:hover { color: var(--ld-accent); }
+.ld-nav a[aria-current="page"] { color: var(--ld-accent); border-bottom: 1px solid var(--ld-accent); }
+
+/* v1.3 — CTA: link-style, no button chrome (editorial rejects buttons) */
+.ld-cta { font-family: Georgia, serif; font-size: 17px; font-style: italic;
+          padding: 2px 0; border: 0; background: transparent; }
+.ld-cta--primary { color: var(--ld-accent); border-bottom: 2px solid var(--ld-accent); }
+.ld-cta--primary:hover { color: var(--ld-fg); border-bottom-color: var(--ld-fg); }
+.ld-cta--secondary { color: var(--ld-fg); border-bottom: 1px solid var(--ld-rule); }
+.ld-cta--secondary:hover { color: var(--ld-accent); border-bottom-color: var(--ld-accent); }
+.ld-cta--ghost { color: var(--ld-fg-muted); }
+.ld-cta--ghost:hover { color: var(--ld-fg); }
+.ld-cta:focus-visible { outline: 1px solid var(--ld-accent); outline-offset: 3px; }

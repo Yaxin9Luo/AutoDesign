@@ -1,0 +1,535 @@
+{
+  "version": 6,
+  "kind": "academic_poster_color_palettes",
+  "default_palette_id": "bright_cobalt",
+  "usage_contract": "Use the selected palette sparingly. The identity header uses the fixed white/near-white treatment with a single top accent rule only; do not use bottom header rules, filled title bands, four-sided outlines, or mixed header styles for new paper posters. Use palette color elsewhere for compact filled section title bands with white text, thin dividers, and a few lead-key accents; keep panel interiors, table cells, and ordinary readouts white or neutral. Keep source figure/table wrapper DOM boxes for measurement, but make wrapper borders transparent with no visible outline or shadow.",
+  "palettes": [
+    {
+      "id": "bright_cobalt",
+      "name": "Cardinal Red",
+      "use_when": "Strong red sectioning, closest to the reference conference posters.",
+      "roles": {
+        "background": "#FFFFFF",
+        "text": "#21181B",
+        "primary": "#C1121F",
+        "secondary": "#F7DEE1",
+        "accent": "#C1121F",
+        "header_text": "#FFFFFF",
+        "bar": "#C1121F"
+      },
+      "selection_keywords": [
+        "conference",
+        "academic poster",
+        "formal poster",
+        "sectioning",
+        "strong red",
+        "cardinal red",
+        "reference poster"
+      ],
+      "domain_tags": [
+        "general",
+        "conference",
+        "formal"
+      ],
+      "tone_tags": [
+        "strong",
+        "formal",
+        "high visibility",
+        "conference"
+      ],
+      "avoid_keywords": [
+        "avoid cardinal red",
+        "avoid red"
+      ]
+    },
+    {
+      "id": "teal_coral",
+      "name": "ICLR Purple",
+      "use_when": "High-contrast purple identity without filling content panels; useful when figures already carry color.",
+      "roles": {
+        "background": "#FFFFFF",
+        "text": "#211927",
+        "primary": "#6F2DA8",
+        "secondary": "#E8DCF7",
+        "accent": "#6F2DA8",
+        "header_text": "#FFFFFF",
+        "bar": "#6F2DA8"
+      },
+      "selection_keywords": [
+        "iclr",
+        "purple",
+        "theory",
+        "optimization",
+        "graph",
+        "algorithm",
+        "proof",
+        "theorem",
+        "complexity",
+        "self-supervised",
+        "self supervised",
+        "pretraining",
+        "pre-training",
+        "rotation",
+        "patch rotation",
+        "patch token",
+        "patchrot",
+        "figures already carry color",
+        "iclr purple",
+        "high contrast",
+        "saturated",
+        "bright color"
+      ],
+      "domain_tags": [
+        "theory",
+        "optimization",
+        "algorithms",
+        "math"
+      ],
+      "tone_tags": [
+        "restrained",
+        "purple",
+        "plain",
+        "academic",
+        "saturated",
+        "high contrast"
+      ],
+      "avoid_keywords": [
+        "avoid iclr purple",
+        "avoid purple"
+      ]
+    },
+    {
+      "id": "plum_sage",
+      "name": "Teal",
+      "use_when": "Saturated technical teal with a strong header-rule accent and high contrast.",
+      "roles": {
+        "background": "#FFFFFF",
+        "text": "#142625",
+        "primary": "#007E78",
+        "secondary": "#D8F1EF",
+        "accent": "#007E78",
+        "header_text": "#FFFFFF",
+        "bar": "#007E78"
+      },
+      "selection_keywords": [
+        "teal",
+        "technical",
+        "fresh",
+        "method",
+        "systems",
+        "applied ai",
+        "visualization",
+        "multimodal",
+        "agent",
+        "high contrast",
+        "saturated",
+        "bright color"
+      ],
+      "domain_tags": [
+        "applied_ai",
+        "systems",
+        "visualization"
+      ],
+      "tone_tags": [
+        "fresh",
+        "technical",
+        "strong",
+        "saturated",
+        "high contrast"
+      ],
+      "avoid_keywords": [
+        "avoid teal"
+      ]
+    },
+    {
+      "id": "tangerine_blue",
+      "name": "Royal Blue",
+      "use_when": "Saturated AI blue with strong conference visibility.",
+      "roles": {
+        "background": "#FFFFFF",
+        "text": "#17223A",
+        "primary": "#285BB8",
+        "secondary": "#E0E7FA",
+        "accent": "#285BB8",
+        "header_text": "#FFFFFF",
+        "bar": "#285BB8"
+      },
+      "selection_keywords": [
+        "royal blue",
+        "language",
+        "nlp",
+        "llm",
+        "large language",
+        "transformer",
+        "attention",
+        "reasoning",
+        "rag",
+        "retrieval",
+        "benchmark",
+        "high contrast",
+        "saturated",
+        "bright color"
+      ],
+      "domain_tags": [
+        "nlp",
+        "language_models",
+        "ai"
+      ],
+      "tone_tags": [
+        "safe",
+        "technical",
+        "restrained",
+        "saturated",
+        "high contrast"
+      ],
+      "avoid_keywords": [
+        "avoid royal blue",
+        "avoid blue"
+      ]
+    },
+    {
+      "id": "blossom_teal",
+      "name": "Emerald",
+      "use_when": "High-contrast emerald for bio, health, and applied science posters.",
+      "roles": {
+        "background": "#FFFFFF",
+        "text": "#16251F",
+        "primary": "#007F50",
+        "secondary": "#D9F2E7",
+        "accent": "#007F50",
+        "header_text": "#FFFFFF",
+        "bar": "#007F50"
+      },
+      "selection_keywords": [
+        "emerald",
+        "green",
+        "bio",
+        "health",
+        "applied science",
+        "biology",
+        "medicine",
+        "ecology",
+        "high contrast",
+        "saturated",
+        "bright color"
+      ],
+      "domain_tags": [
+        "life_science",
+        "health",
+        "applied_science"
+      ],
+      "tone_tags": [
+        "fresh",
+        "green",
+        "strong",
+        "saturated",
+        "high contrast"
+      ],
+      "avoid_keywords": [
+        "avoid emerald",
+        "avoid green"
+      ]
+    },
+    {
+      "id": "lavender_forest",
+      "name": "Indigo",
+      "use_when": "A strong AI-friendly indigo with reliable white-title contrast.",
+      "roles": {
+        "background": "#FFFFFF",
+        "text": "#1D2034",
+        "primary": "#4049B8",
+        "secondary": "#E0E3FA",
+        "accent": "#4049B8",
+        "header_text": "#FFFFFF",
+        "bar": "#4049B8"
+      },
+      "selection_keywords": [
+        "indigo",
+        "ai",
+        "machine learning",
+        "model",
+        "benchmark",
+        "language",
+        "cool",
+        "high contrast",
+        "saturated",
+        "bright color"
+      ],
+      "domain_tags": [
+        "ai",
+        "machine_learning",
+        "technical"
+      ],
+      "tone_tags": [
+        "cool",
+        "indigo",
+        "clean",
+        "saturated",
+        "high contrast"
+      ],
+      "avoid_keywords": [
+        "avoid indigo"
+      ]
+    },
+    {
+      "id": "mulberry_mint",
+      "name": "Burgundy",
+      "use_when": "Replaces soft rosewood with a saturated red-wine academic heading.",
+      "roles": {
+        "background": "#FFFFFF",
+        "text": "#24191D",
+        "primary": "#A4113F",
+        "secondary": "#F0D6DF",
+        "accent": "#A4113F",
+        "header_text": "#FFFFFF",
+        "bar": "#A4113F"
+      },
+      "selection_keywords": [
+        "rosewood",
+        "red family",
+        "academic heading",
+        "medical",
+        "policy",
+        "social",
+        "burgundy",
+        "high contrast",
+        "saturated",
+        "bright color"
+      ],
+      "domain_tags": [
+        "medical",
+        "policy",
+        "social_science"
+      ],
+      "tone_tags": [
+        "restrained",
+        "warm",
+        "plain",
+        "saturated",
+        "high contrast"
+      ],
+      "avoid_keywords": [
+        "avoid rosewood"
+      ]
+    },
+    {
+      "id": "deep_navy",
+      "name": "Deep Navy",
+      "use_when": "Stable AI/ML navy with more weight than bright blue.",
+      "roles": {
+        "background": "#FFFFFF",
+        "text": "#111C2B",
+        "primary": "#123B6D",
+        "secondary": "#DCE8F4",
+        "accent": "#123B6D",
+        "header_text": "#FFFFFF",
+        "bar": "#123B6D"
+      },
+      "selection_keywords": [
+        "deep navy",
+        "navy",
+        "stable ai",
+        "machine learning",
+        "technical navy"
+      ],
+      "domain_tags": [
+        "ai",
+        "machine_learning",
+        "technical"
+      ],
+      "tone_tags": [
+        "deep",
+        "stable",
+        "formal",
+        "high contrast"
+      ],
+      "avoid_keywords": [
+        "avoid navy",
+        "avoid blue"
+      ]
+    },
+    {
+      "id": "petrol_teal",
+      "name": "Petrol Teal",
+      "use_when": "Serious blue-green technical palette, calmer than ordinary teal.",
+      "roles": {
+        "background": "#FFFFFF",
+        "text": "#132426",
+        "primary": "#00656D",
+        "secondary": "#D8ECEE",
+        "accent": "#00656D",
+        "header_text": "#FFFFFF",
+        "bar": "#00656D"
+      },
+      "selection_keywords": [
+        "petrol teal",
+        "blue green",
+        "technical teal",
+        "serious teal"
+      ],
+      "domain_tags": [
+        "systems",
+        "applied_ai",
+        "visualization"
+      ],
+      "tone_tags": [
+        "technical",
+        "serious",
+        "cool",
+        "high contrast"
+      ],
+      "avoid_keywords": [
+        "avoid petrol",
+        "avoid teal"
+      ]
+    },
+    {
+      "id": "burnt_orange",
+      "name": "Burnt Orange",
+      "use_when": "Warm non-blue option that stays academic when used only as structure color.",
+      "roles": {
+        "background": "#FFFFFF",
+        "text": "#251A13",
+        "primary": "#B84A16",
+        "secondary": "#F4DFD2",
+        "accent": "#B84A16",
+        "header_text": "#FFFFFF",
+        "bar": "#B84A16"
+      },
+      "selection_keywords": [
+        "burnt orange",
+        "orange",
+        "warm",
+        "non blue",
+        "warm technical"
+      ],
+      "domain_tags": [
+        "general",
+        "applied_science",
+        "engineering"
+      ],
+      "tone_tags": [
+        "warm",
+        "grounded",
+        "strong",
+        "high contrast"
+      ],
+      "avoid_keywords": [
+        "avoid orange",
+        "avoid warm"
+      ]
+    },
+    {
+      "id": "oxide_red",
+      "name": "Oxide Red",
+      "use_when": "Earthier red with less brightness than ruby or crimson.",
+      "roles": {
+        "background": "#FFFFFF",
+        "text": "#241715",
+        "primary": "#9E2F24",
+        "secondary": "#EEDBD8",
+        "accent": "#9E2F24",
+        "header_text": "#FFFFFF",
+        "bar": "#9E2F24"
+      },
+      "selection_keywords": [
+        "oxide red",
+        "earth red",
+        "muted red",
+        "serious red"
+      ],
+      "domain_tags": [
+        "formal",
+        "medical",
+        "general"
+      ],
+      "tone_tags": [
+        "earthy",
+        "serious",
+        "warm",
+        "high contrast"
+      ],
+      "avoid_keywords": [
+        "avoid oxide",
+        "avoid red"
+      ]
+    },
+    {
+      "id": "wine_rose",
+      "name": "Wine Rose",
+      "use_when": "Scholarly rose/wine tone, less loud than magenta.",
+      "roles": {
+        "background": "#FFFFFF",
+        "text": "#231720",
+        "primary": "#8F1D4F",
+        "secondary": "#EED9E3",
+        "accent": "#8F1D4F",
+        "header_text": "#FFFFFF",
+        "bar": "#8F1D4F"
+      },
+      "selection_keywords": [
+        "wine rose",
+        "wine",
+        "rose",
+        "scholarly rose"
+      ],
+      "domain_tags": [
+        "medical",
+        "social_science",
+        "policy"
+      ],
+      "tone_tags": [
+        "scholarly",
+        "warm",
+        "restrained",
+        "high contrast"
+      ],
+      "avoid_keywords": [
+        "avoid wine",
+        "avoid rose"
+      ]
+    },
+    {
+      "id": "deep_cyan",
+      "name": "Deep Cyan",
+      "use_when": "Cool cyan-blue with stronger contrast than pale blue.",
+      "roles": {
+        "background": "#FFFFFF",
+        "text": "#132331",
+        "primary": "#006B8F",
+        "secondary": "#D8EAF1",
+        "accent": "#006B8F",
+        "header_text": "#FFFFFF",
+        "bar": "#006B8F"
+      },
+      "selection_keywords": [
+        "deep cyan",
+        "cyan blue",
+        "cool blue",
+        "technical cyan"
+      ],
+      "domain_tags": [
+        "vision",
+        "ai",
+        "computational_science"
+      ],
+      "tone_tags": [
+        "cool",
+        "clear",
+        "technical",
+        "high contrast"
+      ],
+      "avoid_keywords": [
+        "avoid cyan",
+        "avoid blue"
+      ]
+    }
+  ],
+  "rules": [
+    "Define the selected palette as CSS variables on .paper-poster.",
+    "Use the fixed identity-header treatment: white/near-white header with a single top accent rule only; no bottom header rule or side outline.",
+    "Keep panel interiors, native table cells, and ordinary readouts white or neutral; source figure/table wrapper DOM boxes may exist for measurement but should use transparent borders with no visible outline or shadow.",
+    "Do not use gradients, random per-section colors, default AI purple/indigo, colored body panels, heavy colored panel borders, or extra decorative colors.",
+    "Keep source figures and source table crops in their original paper colors."
+  ]
+}

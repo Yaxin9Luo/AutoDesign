@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#64748B" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" role="img" aria-labelledby="title desc">
+  <title id="title">Artifact gallery</title>
+  <desc id="desc">Outline picture cards used beside the demo section.</desc>
+  <rect x="3" y="3" width="15" height="15" rx="2"/>
+  <path d="m6 15 3.5-3.5 2.5 2.5 2-2 4 4M8 8h.01M8 21h11a2 2 0 0 0 2-2V8"/>
+</svg>

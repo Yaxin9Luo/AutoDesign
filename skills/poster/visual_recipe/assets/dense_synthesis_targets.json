@@ -1,0 +1,231 @@
+{
+  "profile": "research_synthesis_dense",
+  "version": 1,
+  "source_set": "human_effort_gold_v1",
+  "primary_gold_policy": {
+    "human_references_are_primary": true,
+    "paper_source_screenshots_are_not_required_by_the_human_gold": true,
+    "density_native_synthesis_beats_raw_figure_area": true,
+    "summary": "The handmade LongCat, SAM2, and ViT references are the primary targets for layout, text information density, panel occupancy, academic typography, and palette discipline. They do not require paper source screenshots, so source figure area is a floor, not the main objective."
+  },
+  "secondary_visual_anchor_policy": {
+    "iteration51_longcat_is_visual_anchor_only": true,
+    "known_limitations": [
+      "local text overlap",
+      "imperfect paper text extraction",
+      "local DOM overflow"
+    ],
+    "summary": "Iteration 51 LongCat can guide the dense silhouette and positive skeleton, but it is not a clean DOM, overlap, typography, or source-fidelity gold target."
+  },
+  "handmade_gold_references": {
+    "arxiv2026_longcat_next": {
+      "id": "human_effort_gold_v1_longcat_handmade",
+      "case_slug": "arxiv2026_longcat_next",
+      "preview_path": "data/human_effort_gold_v1/arxiv2026_longcat_next/poster.png",
+      "html_path": "data/human_effort_gold_v1/arxiv2026_longcat_next/poster.html",
+      "quality_floor": {
+        "min_nonwhite_pixel_ratio": 0.23,
+        "max_longest_blank_vertical_run_ratio": 0.08,
+        "vertical_band_count": 10,
+        "min_vertical_band_nonwhite_ratios": [0.22, 0.16, 0.16, 0.19, 0.16, 0.18, 0.17, 0.18, 0.16, 0.13],
+        "max_vertical_band_floor_failures": 1,
+        "min_leaf_visible_words": 1050,
+        "min_source_figure_area_ratio": 0.08,
+        "min_native_information_units": 16
+      },
+      "gold_composite_baseline": {
+        "min_composite_score": 0.98,
+        "nonwhite_pixel_ratio": 0.4224,
+        "longest_blank_vertical_run_ratio": 0.0059,
+        "vertical_band_nonwhite_min": 0.3005,
+        "leaf_visible_words": 1611,
+        "source_figure_area_ratio": 0.08,
+        "native_information_units": 30,
+        "panel_count": 10,
+        "section_heading_count": 36
+      }
+    },
+    "sam2": {
+      "id": "human_effort_gold_v1_sam2_handmade",
+      "case_slug": "sam2",
+      "preview_path": "data/human_effort_gold_v1/sam2/poster.png",
+      "html_path": "data/human_effort_gold_v1/sam2/poster.html",
+      "quality_floor": {
+        "min_nonwhite_pixel_ratio": 0.27,
+        "max_longest_blank_vertical_run_ratio": 0.08,
+        "vertical_band_count": 10,
+        "min_vertical_band_nonwhite_ratios": [0.22, 0.20, 0.15, 0.22, 0.22, 0.145, 0.156, 0.195, 0.216, 0.22],
+        "max_vertical_band_floor_failures": 1,
+        "min_leaf_visible_words": 1100,
+        "min_source_figure_area_ratio": 0.08,
+        "min_native_information_units": 10
+      },
+      "gold_composite_baseline": {
+        "min_composite_score": 0.98,
+        "nonwhite_pixel_ratio": 0.4855,
+        "longest_blank_vertical_run_ratio": 0.0039,
+        "vertical_band_nonwhite_min": 0.3225,
+        "leaf_visible_words": 1786,
+        "source_figure_area_ratio": 0.08,
+        "native_information_units": 16,
+        "panel_count": 12,
+        "section_heading_count": 30
+      }
+    },
+    "vit": {
+      "id": "human_effort_gold_v1_vit_handmade",
+      "case_slug": "vit",
+      "preview_path": "data/human_effort_gold_v1/vit/poster.png",
+      "html_path": "data/human_effort_gold_v1/vit/poster.html",
+      "quality_floor": {
+        "min_nonwhite_pixel_ratio": 0.30,
+        "max_longest_blank_vertical_run_ratio": 0.08,
+        "vertical_band_count": 10,
+        "min_vertical_band_nonwhite_ratios": [0.22, 0.22, 0.22, 0.22, 0.195, 0.146, 0.22, 0.22, 0.147, 0.107],
+        "max_vertical_band_floor_failures": 1,
+        "min_leaf_visible_words": 950,
+        "min_source_figure_area_ratio": 0.08,
+        "min_native_information_units": 9
+      },
+      "gold_composite_baseline": {
+        "min_composite_score": 0.98,
+        "nonwhite_pixel_ratio": 0.5389,
+        "longest_blank_vertical_run_ratio": 0.0039,
+        "vertical_band_nonwhite_min": 0.2374,
+        "leaf_visible_words": 1516,
+        "source_figure_area_ratio": 0.08,
+        "native_information_units": 13,
+        "panel_count": 12,
+        "section_heading_count": 27
+      }
+    }
+  },
+  "gold_regression_references": {
+    "arxiv2026_longcat_next": {
+      "id": "iteration51_longcat_dense_gold",
+      "name": "Iteration 51 LongCat dense authored HTML poster",
+      "role": "dense_skeleton_visual_anchor",
+      "weight": 0.35,
+      "source_iteration": 51,
+      "case_slug": "arxiv2026_longcat_next",
+      "preview_path": "out/poster_quality_loop/human_effort_six_pack_raphael/iteration_51/generated_posters/longcat-next-lexicalizing-modalities-as-discrete-tokens/preview.png",
+      "html_path": "out/poster_quality_loop/human_effort_six_pack_raphael/iteration_51/generated_posters/longcat-next-lexicalizing-modalities-as-discrete-tokens/poster.html",
+      "dom_audit_path": "out/poster_quality_loop/human_effort_six_pack_raphael/iteration_51/generated_posters/longcat-next-lexicalizing-modalities-as-discrete-tokens/paper_poster_dom_audit.json",
+      "visual_density_floor": {
+        "gold_nonwhite_pixel_ratio": 0.2966,
+        "min_nonwhite_pixel_ratio": 0.18,
+        "gold_longest_blank_vertical_run_ratio": 0.053,
+        "max_longest_blank_vertical_run_ratio": 0.09,
+        "vertical_band_count": 10,
+        "min_vertical_band_nonwhite_ratios": [0.08, 0.12, 0.11, 0.14, 0.14, 0.14, 0.10, 0.14, 0.08, 0.035],
+        "max_vertical_band_floor_failures": 1,
+        "gold_leaf_visible_words": 1309,
+        "min_leaf_visible_words": 1000,
+        "gold_source_figure_area_ratio": 0.20,
+        "min_source_figure_area_ratio": 0.18,
+        "gold_native_information_units": 12,
+        "min_native_information_units": 12
+      },
+      "dense_skeleton": {
+        "layout_archetype": "dense_native_synthesis_board",
+        "known_limitations": [
+          "local text overlap",
+          "imperfect paper text extraction",
+          "local DOM overflow"
+        ],
+        "use_for": [
+          "overall dense silhouette",
+          "compact contract-grid main-panel rhythm",
+          "vertical band occupancy",
+          "positive dense skeleton constraints"
+        ],
+        "do_not_use_for": [
+          "overlap tolerance target",
+          "text extraction correctness target",
+          "clean DOM quality target",
+          "replacement for handmade gold references"
+        ],
+        "positive_constraints": [
+          "Start from a compressed dense skeleton: compact three-row identity header, contract-defined numbered main panels with internal substructure, narrow gutters, and no full-height deterministic blank bands.",
+          "Every vertical band must carry visible ink from text, native tables/cards/pipelines, source figures, or captions; do not solve DOM overflow by deleting content or widening whitespace.",
+          "Use a middle method/pipeline band, benchmark/result table band, analysis/evidence band, limitations/future band, and synthesis takeaway band.",
+          "Bind source figures/tables to nearby 18-45 word explanations inside the same panel; grouped panel summaries do not replace leaf DOM text.",
+          "If local text overflows, shrink/split that local block while preserving the dense skeleton and visual occupancy."
+        ],
+        "required_regions": [
+          "title_meta",
+          "motivation_problem",
+          "principal_contributions",
+          "model_card",
+          "method_pipeline",
+          "main_benchmark_table",
+          "secondary_evidence",
+          "qualitative_analysis",
+          "limitations_future",
+          "synthesis_takeaway"
+        ]
+      }
+    }
+  },
+  "reference_count": 3,
+  "target_panel_count": 8,
+  "min_panel_count": 6,
+  "target_native_information_units": 30,
+  "min_native_information_units": 18,
+  "target_visible_words": 1800,
+  "min_visible_words": 1300,
+  "min_effective_content_fill_ratio": 0.78,
+  "target_effective_content_fill_ratio": 0.86,
+  "max_low_information_blank_ratio": 0.14,
+  "min_panel_fill_ratio": 0.7,
+  "target_panel_fill_ratio": 0.82,
+  "min_text_fragment_count": 22,
+  "target_text_fragment_count": 28,
+  "min_mixed_text_evidence_panel_count": 4,
+  "min_readable_source_visual_area_ratio": 0.12,
+  "min_readable_source_visual_unit_ratio": 0.035,
+  "slot_fill_targets": {
+    "problem_contribution": 0.76,
+    "model_card": 0.78,
+    "method_pipeline": 0.82,
+    "results_table": 0.82,
+    "benchmark_table": 0.82,
+    "ablation_analysis": 0.78,
+    "limitations_future": 0.72,
+    "synthesis_takeaway": 0.7
+  },
+  "slot_native_information_unit_targets": {
+    "problem_contribution": 5,
+    "model_card": 5,
+    "method_pipeline": 9,
+    "results_table": 8,
+    "benchmark_table": 8,
+    "ablation_analysis": 6,
+    "limitations_future": 5,
+    "synthesis_takeaway": 3
+  },
+  "required_units": [
+    "model_card",
+    "method_pipeline",
+    "benchmark_table",
+    "ablation_analysis",
+    "limitations_future"
+  ],
+  "panel_jobs": [
+    "problem_contribution",
+    "model_card",
+    "method_pipeline",
+    "results_table",
+    "ablation_analysis",
+    "limitations_future",
+    "synthesis_takeaway"
+  ],
+  "generation_prior": [
+    "Treat the three human_effort_gold_v1 handmade posters as the primary gold references. Their high text information density, compact panel fill, Times New Roman academic typography, and restrained palette matter more than copying paper screenshots.",
+    "Treat iteration 51 LongCat as a secondary dense visual anchor only. Preserve its overall dense skeleton, but repair its local overlap and text extraction defects instead of copying those defects.",
+    "Use the contract-defined 3x2, 4x2, or 3x3 synthesis board for figure-light, model/system-heavy, or benchmark-heavy papers; 3x2 is the minimum, and 2x1/4x3 are not automatic paper-poster layouts. Carry extra detail inside native tables, compact comparison tables, method notes, and concise visual interpretation instead of adding more top-level sections.",
+    "Prefer editable model cards, method pipelines, benchmark tables, formulas, source-grounded bullets, ablation or limitation notes, and synthesis takeaway rows.",
+    "Keep dense text posterized: many short sections, strong panel heads, bold key terms, compact bullets, and native tables instead of raw abstract paragraphs.",
+    "A low screenshot count is acceptable only when dense native structure visibly saves human editorial labor."
+  ]
+}

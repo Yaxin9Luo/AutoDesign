@@ -1,0 +1,42 @@
+{
+  "financial_report": [
+    "cover",
+    "executive_summary",
+    "financial_snapshot",
+    "revenue_or_growth_drivers",
+    "cost_margin_cashflow",
+    "risks_and_sensitivities",
+    "outlook",
+    "appendix_or_sources"
+  ],
+  "industry_research": [
+    "cover",
+    "market_context",
+    "key_findings",
+    "segment_landscape",
+    "trend_drivers",
+    "competitive_map",
+    "implications",
+    "sources"
+  ],
+  "company_profile": [
+    "cover",
+    "company_at_a_glance",
+    "problem_or_market",
+    "products_or_capabilities",
+    "traction_or_proof",
+    "customers_or_cases",
+    "team_or_operations",
+    "next_step"
+  ],
+  "whitepaper": [
+    "cover",
+    "executive_summary",
+    "problem_context",
+    "framework_or_method",
+    "evidence",
+    "recommendations",
+    "implementation_path",
+    "sources"
+  ]
+}

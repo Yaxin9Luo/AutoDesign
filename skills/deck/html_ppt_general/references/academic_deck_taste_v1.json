@@ -1,0 +1,57 @@
+{
+  "version": 1,
+  "contract": "academic_deck_taste",
+  "delivery": {
+    "format": "HTML-only",
+    "default_slide_count": 18,
+    "slide_count_policy": "Use exactly 18 slides unless an explicit_user_override requests another count, a range, or no fixed count. Use 20-26 for a full formal academic talk.",
+    "aspect_ratio": "16:9",
+    "backgrounds": ["white", "off-white", "light"]
+  },
+  "content_density": {
+    "substantive_slide_words": {"recommended_min": 45, "recommended_max": 110, "hard_min": 30},
+    "role_word_ranges": {
+      "outline_or_checkpoint": [30, 65],
+      "problem_and_context": [45, 100],
+      "method_and_algorithm": [55, 140],
+      "results_and_analysis": [45, 110],
+      "closing": [20, 60]
+    },
+    "word_floor_exempt_roles": ["cover", "closing"]
+  },
+  "visual_evidence_units": [
+    "eligible_original_source_visual",
+    "native_html_table",
+    "source_verifiable_equation",
+    "editable_mechanism_diagram"
+  ],
+  "color_contract": {
+    "direction": "formal_academic",
+    "current_color_system": "preserve metadata and derive one restrained accent",
+    "canvas": "white or near-white",
+    "ink": "near-black",
+    "rules": "thin neutral gray",
+    "poster_palette": "do not spread poster surface roles across the deck"
+  },
+  "prefer": [
+    "serif main hierarchy with sans-serif small labels",
+    "flat editorial composition with varied evidence-led layouts",
+    "invisible keyboard and hash navigation",
+    "source figures and source tables with editable visual explanation",
+    "hidden source-anchored speaker notes"
+  ],
+  "reject": [
+    "black or dark default",
+    "decorative gradients",
+    "visible playback controls",
+    "dashboard card grids or nested panels",
+    "text walls",
+    "irrelevant sparse imagery",
+    "generic framework demo appearance"
+  ],
+  "renderer_theme_profiles": [
+    "modern_serif",
+    "metropolis_light",
+    "technical_light"
+  ]
+}

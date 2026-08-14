@@ -1,0 +1,19 @@
+{
+  "manifest_version": 2,
+  "id": "landing.visual_recipe",
+  "version": "0.3.0",
+  "description": "Semantic landing structure, evidence rhythm, paper-page taste, and repair guidance.",
+  "applies_to": ["landing"],
+  "stages": ["enhance", "plan", "critique", "repair"],
+  "triggers": [],
+  "priority": 60,
+  "enabled_by_default": true,
+  "source": {"kind": "autodesign", "description": "Landing page structure, section rhythm, and visual-reference revision playbook."},
+  "assets": [],
+  "resources": [
+    {"id": "paper_project_page_taste_v1", "path": "references/paper_project_page_taste_v1.md", "description": "Versioned user-labeled taste and rejection contract for paper project pages.", "stages": ["plan", "repair"], "when_to_read": "Read whenever the landing subtype is a paper project page, before planning its visual and interaction direction or repairing taste drift.", "media_type": "text/markdown"},
+    {"id": "section_map", "path": "references/section_map.json", "description": "Landing-page section arcs by product and paper-project scenario.", "stages": ["plan", "repair"], "when_to_read": "Read after classifying the landing-page scenario.", "media_type": "application/json"},
+    {"id": "layout_treatments", "path": "references/layout_treatments.md", "description": "First-viewport, paper-project, and repair layout treatments.", "stages": ["plan", "repair"], "when_to_read": "Read when planning or repairing page structure and evidence rhythm.", "media_type": "text/markdown"}
+  ],
+  "outputs": ["landing_section_arc", "proof_rhythm", "source_interaction_choice", "visual_reference_repair_policy"]
+}

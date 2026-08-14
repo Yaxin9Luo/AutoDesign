@@ -1,0 +1,15 @@
+{
+  "manifest_version": 2,
+  "id": "deck.paper2deck_provenance",
+  "version": "0.4.0",
+  "description": "Source-provenance and figure-placement guidance for academic paper decks.",
+  "applies_to": ["deck"],
+  "stages": ["enhance", "plan", "critique", "repair"],
+  "triggers": ["paper", "arxiv", "conference", "research", "论文", "学术", "会议", "paper2deck"],
+  "priority": 90,
+  "enabled_by_default": true,
+  "source": {"kind": "autodesign", "description": "AutoDesign paper2deck provenance and figure-placement playbook."},
+  "assets": [],
+  "resources": [{"id": "visual_policy", "path": "references/visual_policy.json", "description": "Paper-deck source visual role and provenance policy.", "stages": ["plan", "repair"], "when_to_read": "Read when selecting, reviewing, or repairing paper-deck visuals.", "media_type": "application/json"}],
+  "outputs": ["html_slide_arc", "figure_slot_plan", "provenance_policy", "speaker_notes_policy"]
+}

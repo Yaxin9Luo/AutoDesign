@@ -1,0 +1,24 @@
+{
+  "default_preservation": {
+    "slide_count": "preserve",
+    "core_text": "preserve",
+    "charts_tables": "preserve",
+    "brand_assets": "preserve",
+    "speaker_notes": "preserve_or_add_when_requested"
+  },
+  "allowed_changes": [
+    "visual_hierarchy",
+    "spacing_alignment",
+    "typography",
+    "color_system",
+    "section_rhythm",
+    "light_copy_polish_when_requested"
+  ],
+  "requires_explicit_user_request": [
+    "slide_count_reduction",
+    "major_copy_rewrite",
+    "removing_charts_or_tables",
+    "changing_business_claims",
+    "whole_slide_rasterization"
+  ]
+}

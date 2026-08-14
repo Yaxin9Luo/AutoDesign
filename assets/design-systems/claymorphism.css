@@ -1,0 +1,136 @@
+/* Claymorphism — soft, puffy, warm-pastel. */
+
+:root {
+  --ld-bg: #f4f0ea;
+  --ld-bg-alt: #eee7dc;
+  --ld-bg-dark: #2a2530;
+  --ld-fg: #3a2f4a;
+  --ld-fg-muted: #7a6d8a;
+  --ld-fg-inverse: #f4f0ea;
+  --ld-card-lavender: #dcd6f7;
+  --ld-card-mint: #c8e6c9;
+  --ld-card-peach: #ffd9b3;
+  --ld-card-sky: #c7e9f8;
+  --ld-accent: #a58cff;
+  --ld-shadow-clay:
+    inset 3px 3px 6px rgba(255, 255, 255, 0.6),
+    inset -3px -3px 6px rgba(0, 0, 0, 0.08),
+    10px 10px 24px rgba(170, 150, 200, 0.28);
+}
+
+body {
+  background: #e8e1d2; color: var(--ld-fg);
+  font-family: 'Nunito', 'Quicksand', 'DM Sans', system-ui, sans-serif;
+}
+.ld-landing {
+  background: var(--ld-bg);
+  border-radius: 32px;
+  margin: 48px auto;
+  box-shadow: var(--ld-shadow-clay);
+}
+
+.ld-section { padding: 100px 64px; gap: 28px; }
+.ld-section[data-section-variant="hero"] {
+  background: var(--ld-bg); text-align: center; align-items: center;
+  padding: 140px 64px;
+}
+.ld-section[data-section-variant="hero"] .layer.text:first-of-type {
+  background: var(--ld-card-lavender);
+  border-radius: 40px; padding: 32px 48px;
+  box-shadow: var(--ld-shadow-clay);
+  max-width: 760px;
+}
+.ld-section[data-section-variant="features"] {
+  background: var(--ld-bg-alt);
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 24px; padding: 100px 64px;
+}
+.ld-section[data-section-variant="features"] .layer.text {
+  background: var(--ld-card-lavender); color: var(--ld-fg);
+  border-radius: 28px; padding: 32px;
+  box-shadow: var(--ld-shadow-clay);
+}
+.ld-section[data-section-variant="features"] .layer.text:nth-of-type(2) { background: var(--ld-card-mint); }
+.ld-section[data-section-variant="features"] .layer.text:nth-of-type(3) { background: var(--ld-card-peach); }
+.ld-section[data-section-variant="features"] .layer.text:nth-of-type(4) { background: var(--ld-card-sky); }
+.ld-section[data-section-variant="cta"] {
+  background: var(--ld-bg-dark); color: var(--ld-fg-inverse);
+  text-align: center; align-items: center; padding: 120px 64px;
+  border-radius: 0;
+}
+.ld-section[data-section-variant="cta"] .layer.text:first-of-type {
+  background: var(--ld-accent); color: #ffffff;
+  border-radius: 999px; padding: 28px 56px;
+  box-shadow: var(--ld-shadow-clay);
+  display: inline-flex;
+}
+.ld-section[data-section-variant="footer"] {
+  background: var(--ld-bg); color: var(--ld-fg-muted);
+  padding: 48px 64px; font-size: 14px;
+  border-radius: 0 0 32px 32px;
+}
+
+/* Image layers (v1.0 #8.75) — clay puffiness applied to images too */
+.ld-landing figure.layer.image {
+  margin: 0; padding: 0; width: 100%;
+  border-radius: 32px; overflow: hidden;
+  box-shadow: var(--ld-shadow-clay);
+}
+.ld-landing figure.layer.image img {
+  width: 100%; height: auto; display: block;
+}
+/* Hero with image: image on right, text on left, rounded puffy card */
+.ld-section[data-section-variant="hero"][data-has-image="true"] {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 56px;
+  align-items: center; text-align: left;
+}
+.ld-section[data-section-variant="hero"][data-has-image="true"] .layer.text:first-of-type {
+  background: transparent; box-shadow: none; padding: 0; max-width: none;
+}
+.ld-section[data-section-variant="hero"][data-has-image="true"] figure.layer.image {
+  aspect-ratio: 3 / 4; border-radius: 40px;
+}
+/* Feature images: circular puffy icon inside each card */
+.ld-section[data-section-variant="features"][data-has-image="true"] figure.layer.image {
+  width: 96px; height: 96px; border-radius: 50%; margin-bottom: 12px;
+  box-shadow: var(--ld-shadow-clay);
+}
+
+.ld-landing .layer.text {
+  font-family: 'Nunito', 'Quicksand', 'DM Sans', system-ui, sans-serif;
+  font-weight: 600; line-height: 1.65;
+}
+.ld-section[data-section-variant="hero"] .layer.text:first-of-type,
+.ld-section[data-section-variant="features"] .layer.text:first-of-type,
+.ld-section[data-section-variant="cta"] .layer.text:first-of-type {
+  font-weight: 700; line-height: 1.2;
+}
+
+/* v1.3 — top nav: soft pastel pill with puffy shadow */
+.ld-header { background: var(--ld-bg); padding: 16px 32px; border-radius: 0 0 28px 28px;
+             box-shadow: 0 8px 18px rgba(170, 150, 200, 0.18); }
+.ld-nav ul { justify-content: center; gap: 30px; }
+.ld-nav a { color: var(--ld-fg); font-family: 'Nunito', 'Quicksand', system-ui, sans-serif;
+            font-weight: 700; font-size: 14px; padding: 6px 14px; border-radius: 14px;
+            transition: background .18s ease, color .18s ease; }
+.ld-nav a:hover { background: var(--ld-card-lavender); }
+.ld-nav a[aria-current="page"] { background: var(--ld-accent); color: #fff;
+                                 box-shadow: 4px 4px 12px rgba(165,140,255,0.35); }
+
+/* v1.3 — CTA: big puffy 3D buttons with pastel highlights */
+.ld-cta { font-family: 'Nunito', 'Quicksand', system-ui, sans-serif; font-weight: 800;
+          font-size: 17px; padding: 18px 32px; border-radius: 24px; border: 0;
+          transition: transform .18s ease, box-shadow .18s ease; }
+.ld-cta--primary { background: var(--ld-accent); color: #fff; box-shadow: var(--ld-shadow-clay); }
+.ld-cta--primary:hover { transform: translateY(-3px);
+                         box-shadow: inset 3px 3px 6px rgba(255,255,255,0.6),
+                                     inset -3px -3px 6px rgba(0,0,0,0.12),
+                                     14px 14px 32px rgba(165,140,255,0.4); }
+.ld-cta--secondary { background: var(--ld-card-peach); color: var(--ld-fg);
+                     box-shadow: var(--ld-shadow-clay); }
+.ld-cta--secondary:hover { transform: translateY(-3px); }
+.ld-cta--ghost { background: rgba(255,255,255,0.5); color: var(--ld-accent);
+                 box-shadow: inset 2px 2px 4px rgba(0,0,0,0.06),
+                             inset -2px -2px 4px rgba(255,255,255,0.8); }
+.ld-cta--ghost:hover { background: rgba(255,255,255,0.9); }
+.ld-cta:focus-visible { outline: 3px solid var(--ld-accent); outline-offset: 4px; }

@@ -1,0 +1,52 @@
+{
+  "modern_serif": {
+    "renderer_profile": true,
+    "use_when": "academic narratives, paper talks, research synthesis",
+    "visual_profile": "academic-light",
+    "palette": ["#F7F7F3", "#FFFFFF", "#171717", "#62676F", "#D7D9D2", "#9C2F3B"],
+    "type": {"display": "PlayfairDisplay", "body": "Inter", "mono": "JetBrainsMono"}
+  },
+  "metropolis_light": {
+    "renderer_profile": true,
+    "use_when": "minimal academic talks, conference presentations, clear progress narratives",
+    "visual_profile": "academic-light",
+    "palette": ["#F8FAFB", "#FFFFFF", "#202124", "#5F6368", "#DADCE0", "#00796B"],
+    "type": {"display": "IBMPlexSans", "body": "Inter", "mono": "JetBrainsMono"}
+  },
+  "technical_light": {
+    "renderer_profile": true,
+    "use_when": "systems papers, method explanations, engineering evidence",
+    "visual_profile": "academic-light",
+    "palette": ["#F4F7F9", "#FFFFFF", "#10212F", "#566575", "#CBD6DE", "#B63B28"],
+    "type": {"display": "IBMPlexSans", "body": "NotoSansSC", "mono": "JetBrainsMono"}
+  },
+  "corporate_clean": {
+    "use_when": "business reviews, enterprise updates, executive summaries",
+    "visual_profile": "modern-minimal",
+    "palette": ["#FFFFFF", "#F7F8FA", "#111827", "#64748B", "#CBD5E1", "#2563EB"],
+    "type": {"display": "Inter", "body": "Inter", "mono": "JetBrainsMono"}
+  },
+  "pitch_deck_vc": {
+    "use_when": "fundraising, startup pitch, state-of-company",
+    "visual_profile": "modern-minimal",
+    "palette": ["#FFFFFF", "#F8FAFC", "#0F172A", "#475569", "#E2E8F0", "#3B6CFF"],
+    "accent_gradient": "linear-gradient(135deg,#3b6cff,#7a5cff 55%,#ff5c8a)"
+  },
+  "engineering_whiteprint": {
+    "use_when": "technical architecture, systems design, developer talks",
+    "visual_profile": "tech-utility",
+    "palette": ["#FAFBFC", "#FFFFFF", "#0F172A", "#64748B", "#CBD5E1", "#176448"],
+    "type": {"display": "IBMPlexSans", "body": "Inter", "mono": "JetBrainsMono"}
+  },
+  "editorial_serif": {
+    "use_when": "strategy narratives, research summaries, thoughtful brand decks",
+    "visual_profile": "editorial-monocle",
+    "palette": ["#FAF7F0", "#FFFFFF", "#111216", "#6B5F57", "#D8CFC2", "#7F1D1D"],
+    "type": {"display": "PlayfairDisplay", "body": "Inter"}
+  },
+  "xiaohongshu_white": {
+    "use_when": "creator reports, lifestyle product decks, social content planning",
+    "visual_profile": "warm-soft",
+    "palette": ["#FFF9F7", "#FFFFFF", "#2A1E1B", "#8A6F68", "#F1D9D2", "#FF5C8A"]
+  }
+}

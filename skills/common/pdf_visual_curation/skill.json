@@ -1,0 +1,15 @@
+{
+  "manifest_version": 2,
+  "id": "common.pdf_visual_curation",
+  "version": "0.2.0",
+  "description": "Select and place PDF figures and tables as source evidence in editable artifacts.",
+  "applies_to": ["all"],
+  "stages": ["enhance", "plan", "critique", "repair"],
+  "triggers": ["pdf", "figure", "table", "visual", "图表", "图片", "表格"],
+  "priority": 94,
+  "enabled_by_default": true,
+  "source": {"kind": "autodesign", "description": "PDF figure/table curation policy for source-backed HTML artifacts."},
+  "assets": [],
+  "resources": [{"id": "visual_role_policy", "path": "references/visual_role_policy.json", "description": "Source visual buckets, exclusions, and slot guidance.", "stages": ["plan", "repair"], "when_to_read": "Read when selecting or repairing source visual coverage.", "media_type": "application/json"}],
+  "outputs": ["visual_candidate_policy", "source_visual_slot_plan", "pdf_visual_repair_policy"]
+}

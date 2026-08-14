@@ -1,0 +1,94 @@
+{
+  "pitch_deck": [
+    "cover",
+    "problem",
+    "solution",
+    "product",
+    "market",
+    "business_model",
+    "traction",
+    "team",
+    "ask",
+    "thanks"
+  ],
+  "technical_talk": [
+    "cover",
+    "agenda",
+    "problem_context",
+    "architecture_or_flow",
+    "implementation_details",
+    "demo_or_example",
+    "tradeoffs",
+    "results",
+    "takeaways",
+    "thanks"
+  ],
+  "weekly_report": [
+    "cover",
+    "executive_summary",
+    "kpi_grid",
+    "shipped_work",
+    "risks_blockers",
+    "next_week_plan",
+    "asks"
+  ],
+  "course_module": [
+    "cover",
+    "learning_objectives",
+    "concept",
+    "worked_example",
+    "practice_prompt",
+    "common_mistakes",
+    "recap"
+  ],
+  "product_intro": [
+    "cover",
+    "product_positioning",
+    "user_problem",
+    "core_workflow",
+    "feature_proof",
+    "differentiation",
+    "use_cases",
+    "next_step"
+  ],
+  "company_profile": [
+    "cover",
+    "company_at_a_glance",
+    "mission_or_market",
+    "products_or_capabilities",
+    "traction_or_proof",
+    "customers_or_cases",
+    "team_or_operations",
+    "contact_or_next_step"
+  ],
+  "travel_itinerary": [
+    "cover",
+    "trip_overview",
+    "map_or_route",
+    "daily_plan",
+    "highlight_experiences",
+    "budget_or_logistics",
+    "tips",
+    "closing"
+  ],
+  "industry_research": [
+    "cover",
+    "executive_summary",
+    "market_context",
+    "key_findings",
+    "competitive_landscape",
+    "trend_drivers",
+    "implications",
+    "sources_or_next_steps"
+  ],
+  "financial_report": [
+    "cover",
+    "executive_summary",
+    "financial_snapshot",
+    "growth_or_revenue_drivers",
+    "cost_margin_cashflow",
+    "risks",
+    "outlook",
+    "appendix_or_sources"
+  ]
+}

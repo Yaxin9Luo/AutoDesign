@@ -1,0 +1,19 @@
+{
+  "manifest_version": 2,
+  "id": "poster.table_craft",
+  "version": "0.2.0",
+  "description": "Evidence-first academic poster table planning, style, and repair guidance.",
+  "applies_to": ["poster"],
+  "stages": ["enhance", "plan", "critique", "repair"],
+  "triggers": ["paper poster", "conference poster", "academic poster", "table", "benchmark", "results table", "ablation", "论文海报", "学术海报", "表格", "实验结果", "消融"],
+  "priority": 70,
+  "enabled_by_default": true,
+  "source": {"kind": "autodesign", "description": "Paper-poster table craft guidance derived from strong Claude Design paper2poster examples."},
+  "assets": [],
+  "resources": [
+    {"id": "table_jobs", "path": "references/table_jobs.md", "description": "Table job selection and evidence-form guidance.", "stages": ["plan"], "when_to_read": "Read before choosing a source crop, native table, or result readout.", "media_type": "text/markdown"},
+    {"id": "academic_style", "path": "references/academic_style.md", "description": "Academic native-table typography and rule system.", "stages": ["plan", "repair"], "when_to_read": "Read when authoring or reviewing native poster tables.", "media_type": "text/markdown"},
+    {"id": "repair", "path": "references/repair.md", "description": "Table findings and evidence-preserving repair order.", "stages": ["repair"], "when_to_read": "Read after a table coverage, readability, or style finding.", "media_type": "text/markdown"}
+  ],
+  "outputs": ["poster_table_selection_policy", "native_table_design_rubric", "table_readout_repair_policy"]
+}

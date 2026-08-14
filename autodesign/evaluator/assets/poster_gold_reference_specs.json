@@ -1,0 +1,159 @@
+{
+  "version": 1,
+  "profile": "research_synthesis_dense",
+  "primary_gold_set": "human_effort_gold_v1",
+  "primary_gold_policy": {
+    "human_references_are_primary": true,
+    "paper_source_screenshots_are_not_required_by_the_human_gold": true,
+    "density_native_synthesis_beats_raw_figure_area": true,
+    "summary": "The three handmade human_effort_gold_v1 posters define the quality target: dense layout, high information content, coherent section rhythm, compact academic typography, and restrained palette. They may omit paper source screenshots, so source figure area is a readability floor, not the main objective."
+  },
+  "primary_gold_references": {
+    "arxiv2026_longcat_next": {
+      "id": "human_effort_gold_v1_longcat_handmade",
+      "case_slug": "arxiv2026_longcat_next",
+      "preview_path": "data/human_effort_gold_v1/arxiv2026_longcat_next/poster.png",
+      "html_path": "data/human_effort_gold_v1/arxiv2026_longcat_next/poster.html",
+      "quality_traits": [
+        "dense native text blocks",
+        "compact academic section rhythm",
+        "high panel occupancy",
+        "many local information units",
+        "consistent restrained palette"
+      ],
+      "floor": {
+        "min_nonwhite_pixel_ratio": 0.23,
+        "max_longest_blank_vertical_run_ratio": 0.08,
+        "min_leaf_visible_words": 1050,
+        "min_native_information_units": 16,
+        "min_source_figure_area_ratio": 0.08
+      }
+    },
+    "sam2": {
+      "id": "human_effort_gold_v1_sam2_handmade",
+      "case_slug": "sam2",
+      "preview_path": "data/human_effort_gold_v1/sam2/poster.png",
+      "html_path": "data/human_effort_gold_v1/sam2/poster.html",
+      "quality_traits": [
+        "dense panel fill",
+        "short high-value section units",
+        "strong vertical band occupancy",
+        "native reconstruction instead of page screenshots",
+        "consistent academic palette"
+      ],
+      "floor": {
+        "min_nonwhite_pixel_ratio": 0.27,
+        "max_longest_blank_vertical_run_ratio": 0.08,
+        "min_leaf_visible_words": 1100,
+        "min_native_information_units": 10,
+        "min_source_figure_area_ratio": 0.08
+      }
+    },
+    "vit": {
+      "id": "human_effort_gold_v1_vit_handmade",
+      "case_slug": "vit",
+      "preview_path": "data/human_effort_gold_v1/vit/poster.png",
+      "html_path": "data/human_effort_gold_v1/vit/poster.html",
+      "quality_traits": [
+        "very high visual ink density",
+        "compact evidence table hierarchy",
+        "filled panels across all vertical bands",
+        "dense figure-text adjacency where figures exist",
+        "consistent Times New Roman academic typography"
+      ],
+      "floor": {
+        "min_nonwhite_pixel_ratio": 0.30,
+        "max_longest_blank_vertical_run_ratio": 0.08,
+        "min_leaf_visible_words": 950,
+        "min_native_information_units": 9,
+        "min_source_figure_area_ratio": 0.08
+      }
+    }
+  },
+  "secondary_visual_anchors": {
+    "iteration51_longcat": {
+      "id": "iteration51_longcat_dense_visual_anchor",
+      "case_slug": "arxiv2026_longcat_next",
+      "source_iteration": 51,
+      "role": "dense_skeleton_visual_anchor",
+      "preview_path": "out/poster_quality_loop/human_effort_six_pack_raphael/iteration_51/generated_posters/longcat-next-lexicalizing-modalities-as-discrete-tokens/preview.png",
+      "html_path": "out/poster_quality_loop/human_effort_six_pack_raphael/iteration_51/generated_posters/longcat-next-lexicalizing-modalities-as-discrete-tokens/poster.html",
+      "known_limitations": [
+        "local text overlap",
+        "imperfect paper text extraction",
+        "local DOM overflow",
+        "not a clean typography or source-fidelity target"
+      ],
+      "use_for": [
+        "overall dense silhouette",
+        "compact 6-8 main-panel rhythm",
+        "high vertical band occupancy",
+        "positive dense skeleton constraints",
+        "preserving density while repairing local overflow"
+      ],
+      "do_not_use_for": [
+        "overlap tolerance target",
+        "text extraction correctness target",
+        "clean DOM quality target",
+        "replacement for handmade gold references"
+      ],
+      "weight": 0.35
+    }
+  },
+  "shared_generation_contract": {
+    "font_family": "Times New Roman",
+    "palette": {
+      "background": "#fbfaf6",
+      "surface": "#f2eee6",
+      "surface_alt": "#eee8dc",
+      "ink": "#111827",
+      "muted": "#5f5148",
+      "rule": "#c8beb0",
+      "accent": "#7f1d1d"
+    },
+    "panel_contract": {
+      "target_panel_count": 8,
+      "min_panel_count": 6,
+      "require_high_panel_occupancy": true,
+      "require_mixed_text_evidence_when_figures_exist": true,
+      "require_native_information_units": true,
+      "allow_low_source_figure_area_when_native_density_high": true,
+      "never_solve_overlap_by_deleting_density": true
+    },
+    "slot_lane_contract": {
+      "require_panel_roots": true,
+      "require_block_local_child_lanes": true,
+      "child_lane_roles": [
+        "heading",
+        "claim",
+        "body",
+        "native_unit",
+        "figure_or_table",
+        "caption",
+        "takeaway"
+      ],
+      "geometry_rule": "Each dense slot must contain authored child blocks with local left/top/width/height lanes. Flex/grid-only content that collapses into a small cluster is a contract failure."
+    },
+    "typography_contract": {
+      "title_weight": 700,
+      "heading_weight": 700,
+      "body_weight": 400,
+      "emphasis_weight": 700,
+      "letter_spacing": "0px",
+      "role_based_font_size_ladder_required": true
+    }
+  },
+  "acceptance_policy": {
+    "accept_only_if_primary_gold_density_floor_passes": true,
+    "p0_reduction_cannot_override_density_regression": true,
+    "iteration51_dense_but_overflowing_is_local_repair_not_global_failure": true,
+    "empty_panels_are_blockers": true,
+    "colorful_per_panel_palette_is_blocker": true,
+    "deterministic_recovery_is_blocker": true
+  },
+  "autopilot_cases": [
+    "arxiv2026_longcat_next",
+    "vit",
+    "iclr2024_lcbm"
+  ]
+}

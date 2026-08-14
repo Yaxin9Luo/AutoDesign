@@ -1,0 +1,42 @@
+{
+  "source": {
+    "format": "html-first-hyperframes",
+    "external_assets": "forbidden",
+    "network_apis": "forbidden",
+    "placeholder_is_success": false
+  },
+  "timeline": {
+    "default_duration_s": 360,
+    "accepted_duration_s": [300, 600],
+    "scene_count": [10, 14],
+    "width": 1920,
+    "height": 1080,
+    "fps": 30
+  },
+  "authoring": {
+    "scenes_inline_in_root_html": true,
+    "advisory_lint_warnings_trigger_restructure": false,
+    "custom_fonts_require_local_font_face": true
+  },
+  "narration": {
+    "language": "en",
+    "voice_presets": {
+      "male": {"engine": "kokoro", "voice_id": "am_michael"},
+      "female": {"engine": "kokoro", "voice_id": "af_heart"}
+    },
+    "mapping_version": "kokoro-v1",
+    "canonical_subtitles": ["srt", "vtt"],
+    "audio_artifact": "assets/narration.wav",
+    "whisper": "optional_qa_only"
+  },
+  "delivery": {
+    "fresh_output_required": true,
+    "video_codec": "h264",
+    "pixel_format": "yuv420p",
+    "audio_codec": "aac",
+    "tts_failure": "error",
+    "lint_failure": "error",
+    "render_failure": "error",
+    "probe_failure": "error"
+  }
+}

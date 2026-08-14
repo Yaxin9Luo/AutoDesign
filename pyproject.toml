@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "autodesign"
+version = "0.1.0"
+description = "Conversational design agent: web UI + CLI + editable HTML/PPTX/PSD/SVG artifacts."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "anthropic>=0.40.0",
+  "google-genai>=1.0.0",
+  "Pillow>=10.0.0",
+  "psd-tools>=1.11.0",
+  "svgwrite>=1.4.3",
+  "pydantic>=2.5.0",
+  "python-dotenv>=1.0.0",
+  "fonttools>=4.50.0",
+  "brotli>=1.1.0",
+  "beautifulsoup4>=4.12.0",
+  "python-pptx>=0.6.21",
+  "python-docx>=1.1.0",
+  "pymupdf>=1.24.0",
+  "openai>=1.54.0",
+  "playwright>=1.55.0",
+  "fastapi>=0.136.1",
+  "uvicorn[standard]>=0.46.0",
+  "python-multipart>=0.0.27",
+  "kokoro-onnx==0.5.0",
+  "soundfile==0.14.0",
+]
+
+[project.optional-dependencies]
+# OCR bridge for the image-mode poster evaluator. Optional: the evaluator
+# degrades gracefully (text-based metrics skipped) when no OCR engine is present.
+# RapidOCR ships PaddleOCR models on ONNX Runtime — CPU-only, no system binary.
+ocr = [
+  "opencv-python>=4.8.0",
+  "rapidocr-onnxruntime>=1.3.0",
+]
+
+[project.scripts]
+autodesign = "autodesign.cli:main"
+# Deprecated compatibility alias.
+design-anything = "autodesign.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["autodesign*", "design_anything*"]
+
+[tool.setuptools.package-data]
+"autodesign.evaluator" = ["assets/*.json"]

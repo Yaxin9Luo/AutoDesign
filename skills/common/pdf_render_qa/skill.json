@@ -1,0 +1,18 @@
+{
+  "manifest_version": 2,
+  "id": "common.pdf_render_qa",
+  "version": "0.2.0",
+  "description": "PDF source and export rendering QA for source-backed AutoDesign artifacts.",
+  "applies_to": ["all"],
+  "stages": ["enhance", "plan", "critique", "repair"],
+  "triggers": ["pdf", "paper", "report", "render", "poppler", "pdftoppm"],
+  "priority": 93,
+  "enabled_by_default": true,
+  "source": {"kind": "codex-skill-derived", "name": "pdf", "upstream_skill": "pdf", "description": "PDF rendering, extraction, and layout QA workflow for source and export PDFs."},
+  "assets": [],
+  "resources": [
+    {"id": "pdf_render_commands", "path": "references/pdf_render_commands.md", "description": "Approved PDF rendering and extraction commands.", "stages": ["plan"], "when_to_read": "Read before inspecting source PDFs or setting up PDF review.", "media_type": "text/markdown"},
+    {"id": "pdf_export_checks", "path": "references/pdf_export_checks.md", "description": "Visual checks and repair rules for exported PDFs.", "stages": ["repair"], "when_to_read": "Read when evaluating or repairing a PDF export.", "media_type": "text/markdown"}
+  ],
+  "outputs": ["pdf_render_policy", "pdf_layout_review_policy", "pdf_export_repair_policy"]
+}

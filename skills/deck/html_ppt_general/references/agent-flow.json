@@ -1,0 +1,25 @@
+{
+  "enhance": [
+    "source_parse_intent",
+    "keyword_or_search_intent",
+    "scenario_classification",
+    "outline_intent"
+  ],
+  "plan": [
+    "outline",
+    "per_slide_content_plan",
+    "asset_slot_plan",
+    "editable_html_draft"
+  ],
+  "critique": [
+    "design_gate",
+    "html_artifact_contract",
+    "export_qa"
+  ],
+  "repair": [
+    "local_block_repair",
+    "layout_rebalance",
+    "source_slot_restore",
+    "recompose"
+  ]
+}

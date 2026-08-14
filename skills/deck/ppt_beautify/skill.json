@@ -1,0 +1,15 @@
+{
+  "manifest_version": 2,
+  "id": "deck.ppt_beautify",
+  "version": "0.2.0",
+  "description": "HTML-first preservation and redesign policy for existing PPT or PPTX decks.",
+  "applies_to": ["deck"],
+  "stages": ["enhance", "plan", "critique", "repair"],
+  "triggers": ["pptx", "ppt", "powerpoint", "beautify", "redesign", "revamp", "美化", "改版", "润色PPT", "优化PPT"],
+  "priority": 88,
+  "enabled_by_default": true,
+  "source": {"kind": "autodesign", "description": "HTML-first beautification policy for existing PPT/PPTX decks."},
+  "assets": [],
+  "resources": [{"id": "beautify_policy", "path": "references/beautify_policy.json", "description": "Preservation, redesign, and QA rules for uploaded decks.", "stages": ["plan", "repair"], "when_to_read": "Read when preserving and redesigning an existing deck.", "media_type": "application/json"}],
+  "outputs": ["preservation_policy", "redesign_plan", "html_frame_mapping", "qa_policy"]
+}

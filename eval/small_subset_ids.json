@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "ids": [
+    "ai_ml_existing_20/2017-attention-is-all-you-need",
+    "ai_ml_existing_20/2020-nerf-representing-scenes-as-neural-radiance-fields-for-view-synthesis",
+    "biomed_health/2016-mimic-iii-a-freely-accessible-critical-care-database",
+    "biomed_health/2020-global-burden-of-369-diseases-and-injuries-in-204-countries-and-territories-1990-2019",
+    "climate_earth_environment/2020-global-carbon-budget-2020",
+    "climate_earth_environment/2023-global-carbon-budget-2023",
+    "economics_policy/2009-the-building-blocks-of-economic-complexity",
+    "economics_policy/2020-the-fall-of-the-labor-share-and-the-rise-of-superstar-firms",
+    "physics_astronomy/2016-observation-of-gravitational-waves-from-a-binary-black-hole-merger",
+    "physics_astronomy/2019-first-m87-event-horizon-telescope-results-i-the-shadow-of-the-supermassive-black-hole"
+  ]
+}

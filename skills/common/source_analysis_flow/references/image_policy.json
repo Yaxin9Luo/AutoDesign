@@ -1,0 +1,17 @@
+{
+  "smart_match": {
+    "description": "Use source evidence when it supports a claim; use generated mood imagery only for non-evidence ambience, covers, dividers, or conceptual support.",
+    "source_evidence": "Preserve source figures, tables, screenshots, logos, and quoted source snippets with source/source_id metadata.",
+    "generated_mood": "Allowed for hero/background/concept imagery when it does not imply factual evidence."
+  },
+  "source_only": {
+    "description": "Use only images and tables extracted from attached sources. Do not generate new factual or decorative imagery unless the user later asks.",
+    "source_evidence": "All visual claims must be backed by ingested source assets.",
+    "generated_mood": "Disabled except for simple editable shapes, backgrounds, and typography."
+  },
+  "no_images": {
+    "description": "Do not add image blocks. Use editable text, tables, shapes, metrics, and layout rhythm instead.",
+    "source_evidence": "Use source text/table data where needed, but avoid image placement.",
+    "generated_mood": "Disabled."
+  }
+}

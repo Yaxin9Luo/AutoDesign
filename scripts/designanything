@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+echo "warning: 'designanything' is deprecated; use 'autodesign'" >&2
+exec "${SCRIPT_DIR}/autodesign" "$@"

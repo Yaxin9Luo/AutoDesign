@@ -1,0 +1,104 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://autodesign.local/schemas/academic-identity-allowlist.json",
+  "title": "AutoDesign Academic Identity Allowlist",
+  "type": "object",
+  "required": ["version", "rules"],
+  "additionalProperties": true,
+  "properties": {
+    "version": {"type": "integer", "minimum": 1},
+    "updated_at": {"type": "string"},
+    "description": {"type": "string"},
+    "curation_policy": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "rules": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/rule"}
+    }
+  },
+  "$defs": {
+    "rule": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "id",
+        "entity_name",
+        "role",
+        "aliases",
+        "official_domains",
+        "confidence"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"
+        },
+        "entity_name": {"type": "string", "minLength": 1},
+        "role": {
+          "type": "string",
+          "enum": ["venue", "institution", "lab", "company", "society", "publisher", "project", "source"]
+        },
+        "aliases": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"type": "string", "minLength": 1},
+          "uniqueItems": true
+        },
+        "official_domains": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z0-9.-]+$"
+          },
+          "uniqueItems": true
+        },
+        "allowed_asset_domains": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z0-9.-]+$"
+          },
+          "uniqueItems": true
+        },
+        "homepages": {
+          "type": "array",
+          "items": {"type": "string", "format": "uri"},
+          "uniqueItems": true
+        },
+        "preferred_page_urls": {
+          "type": "array",
+          "items": {"type": "string", "format": "uri"},
+          "uniqueItems": true
+        },
+        "preferred_asset_urls": {
+          "type": "array",
+          "items": {"type": "string", "format": "uri"},
+          "uniqueItems": true
+        },
+        "confidence": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "curation_status": {
+          "type": "string",
+          "enum": [
+            "trusted_official_domain",
+            "manual_review_needed",
+            "deprecated"
+          ]
+        },
+        "tags": {
+          "type": "array",
+          "items": {"type": "string"},
+          "uniqueItems": true
+        },
+        "notes": {"type": "string"}
+      }
+    }
+  }
+}

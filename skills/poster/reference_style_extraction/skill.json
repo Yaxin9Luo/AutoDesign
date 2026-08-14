@@ -1,0 +1,20 @@
+{
+  "manifest_version": 2,
+  "id": "poster.reference_style_extraction",
+  "version": "0.2.0",
+  "description": "Style-only reference-poster blueprint extraction for the external Reference Style Agent.",
+  "applies_to": ["poster"],
+  "stages": ["plan"],
+  "triggers": ["reference style agent", "reference poster style extraction", "reference style blueprint"],
+  "priority": 90,
+  "enabled_by_default": false,
+  "source": {"kind": "autodesign", "description": "Opt-in planning guidance for the external Reference Style Agent that reconstructs poster style blueprints."},
+  "assets": [],
+  "resources": [
+    {"id": "output_contract_v4", "path": "references/output_contract_v4.md", "description": "Mandatory style-only reference blueprint output contract.", "stages": ["plan"], "when_to_read": "Read before authoring the reference analysis or blueprint.", "media_type": "text/markdown"},
+    {"id": "region_geometry", "path": "references/region_geometry.md", "description": "Macro-region classification and measurement rules.", "stages": ["plan"], "when_to_read": "Read while mapping the reference body geometry.", "media_type": "text/markdown"},
+    {"id": "chrome_rules", "path": "references/chrome_rules.md", "description": "Header, decorative chrome, and removable-asset rules.", "stages": ["plan"], "when_to_read": "Read while separating content geometry from decoration.", "media_type": "text/markdown"},
+    {"id": "failure_checks", "path": "references/failure_checks.md", "description": "Reference-blueprint failure checks before approval.", "stages": ["plan"], "when_to_read": "Read before rendering and approving a blueprint.", "media_type": "text/markdown"}
+  ],
+  "outputs": ["reference_style_analysis", "reference_style_blueprint", "reference_style_blueprint_review"]
+}

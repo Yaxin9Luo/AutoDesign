@@ -1,0 +1,275 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Demo Deck — Multi-Agent AI Workflows</title>
+  <style>
+    :root {
+      --ink-900: #1a1612;
+      --ink-700: #2d2620;
+      --ink-500: #6e6557;
+      --ink-300: #d8d1bf;
+      --ink-100: #ede7d6;
+      --ink-50:  #f6f1e6;
+      --accent:  #1d3a2f;
+      --paper:   #fdfbf6;
+      --good:    #2d6a4f;
+      --bad:     #c44;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; padding: 0; background: var(--ink-50); }
+    body {
+      font-family: ui-sans-serif, "Inter", "Helvetica Neue", -apple-system, sans-serif;
+      color: var(--ink-900);
+      line-height: 1.5;
+    }
+    section.slide {
+      width: 100%;
+      max-width: 1280px;
+      margin: 32px auto;
+      background: var(--paper);
+      border: 1px solid var(--ink-300);
+      box-shadow: 0 1px 2px rgba(46,32,16,0.04), 0 6px 18px rgba(46,32,16,0.06);
+      padding: 56px 72px;
+      position: relative;
+      aspect-ratio: 16 / 9;
+      overflow: hidden;
+    }
+    .slide-num {
+      position: absolute;
+      top: 24px;
+      right: 32px;
+      font-size: 11px;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+      color: var(--ink-500);
+      font-family: ui-monospace, "JetBrains Mono", monospace;
+    }
+    h1 {
+      font-family: ui-serif, Georgia, serif;
+      font-size: 44px;
+      line-height: 1.1;
+      margin: 0 0 12px;
+      letter-spacing: -0.01em;
+    }
+    h2 {
+      font-family: ui-serif, Georgia, serif;
+      font-size: 32px;
+      line-height: 1.15;
+      margin: 0 0 16px;
+      letter-spacing: -0.005em;
+    }
+    h3 {
+      font-size: 14px;
+      letter-spacing: 0.16em;
+      text-transform: uppercase;
+      color: var(--ink-500);
+      font-weight: 500;
+      margin: 0 0 16px;
+    }
+    p { font-size: 17px; color: var(--ink-700); margin: 0 0 14px; }
+    .lead { font-size: 19px; color: var(--ink-700); }
+    .authors {
+      margin-top: 60px;
+      display: flex;
+      gap: 32px;
+      font-size: 14px;
+      color: var(--ink-500);
+    }
+    .authors strong { color: var(--ink-900); display: block; font-weight: 500; }
+    .pill {
+      display: inline-block;
+      padding: 4px 10px;
+      border-radius: 999px;
+      background: var(--accent);
+      color: var(--ink-50);
+      font-size: 11px;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+      margin-bottom: 24px;
+    }
+    .stat-row {
+      display: flex;
+      align-items: flex-end;
+      gap: 56px;
+      margin-top: 48px;
+      height: 280px;
+    }
+    .bar {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 12px;
+    }
+    .bar .col {
+      width: 100%;
+      max-width: 100px;
+      border-radius: 4px 4px 0 0;
+    }
+    .bar.good .col   { background: var(--good); }
+    .bar.bad .col    { background: var(--bad); }
+    .bar.fixed .col  { background: var(--accent); }
+    .bar .num {
+      font-family: ui-serif, Georgia, serif;
+      font-size: 32px;
+      font-weight: 600;
+    }
+    .bar .label {
+      font-size: 12px;
+      color: var(--ink-500);
+      text-align: center;
+    }
+    table { width: 100%; border-collapse: collapse; margin-top: 24px; font-size: 14px; }
+    table th, table td {
+      border-bottom: 1px solid var(--ink-300);
+      padding: 10px 12px;
+      text-align: left;
+    }
+    table th { color: var(--ink-500); font-weight: 500; font-size: 11px; letter-spacing: 0.12em; text-transform: uppercase; }
+    .grid-3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 28px; margin-top: 32px; }
+    .card {
+      border: 1px solid var(--ink-300);
+      padding: 20px;
+      background: var(--ink-50);
+    }
+    .card .num {
+      display: inline-flex;
+      width: 26px; height: 26px;
+      align-items: center; justify-content: center;
+      background: var(--accent); color: var(--ink-50);
+      border-radius: 999px;
+      font-size: 11px; font-weight: 600;
+      margin-bottom: 12px;
+    }
+    .card h4 { font-size: 14px; margin: 0 0 6px; }
+    .card p  { font-size: 13px; margin: 0; color: var(--ink-500); }
+    .footer-line {
+      position: absolute; bottom: 24px; left: 72px; right: 72px;
+      display: flex; justify-content: space-between;
+      font-size: 11px; color: var(--ink-500);
+      font-family: ui-monospace, "JetBrains Mono", monospace;
+      letter-spacing: 0.1em;
+    }
+  </style>
+</head>
+<body>
+
+  <section class="slide" id="s1">
+    <div class="slide-num">01</div>
+    <span class="pill">Demo · No agent ran</span>
+    <h3>8511 Machine Learning for Industry</h3>
+    <h1>Empirical Study of Robust Multi-Agent AI Workflows under Unreliable Tool Use</h1>
+    <div class="authors">
+      <div><strong>Yaxin Luo</strong>25010921</div>
+      <div><strong>Xiaofu Chen</strong>25011059</div>
+    </div>
+    <div class="footer-line"><span>AUTODESIGN</span><span>S1 / 6</span></div>
+  </section>
+
+  <section class="slide" id="s2">
+    <div class="slide-num">02</div>
+    <h2>The Problem in One Sentence</h2>
+    <p class="lead">Imagine you ask your Agent to book a flight. It invokes five different tools, but the second one returns an incorrect price. The result? It books a non-existent flight and confidently tells you, "Booking confirmed."</p>
+    <p>This is exactly the failure mode we're studying — silent compounding of upstream tool errors, masked by an agent's own confidence.</p>
+    <div class="footer-line"><span>AUTODESIGN</span><span>S2 / 6</span></div>
+  </section>
+
+  <section class="slide" id="s3">
+    <div class="slide-num">03</div>
+    <h3>One Take-Home Message</h3>
+    <h2>Layered defense restores reliability from 22.5% → 90%.</h2>
+    <p>We found that integrating unreliable tools into multi-agent AI systems causes performance to plummet from 100% to 22.5%; however, through layered defense and LLM validation, we can restore it to 90%.</p>
+    <div class="stat-row">
+      <div class="bar good">
+        <div class="col" style="height: 250px"></div>
+        <div class="num">100%</div>
+        <div class="label">Ideal<br>(no faults)</div>
+      </div>
+      <div class="bar bad">
+        <div class="col" style="height: 56px"></div>
+        <div class="num">22.5%</div>
+        <div class="label">Unreliable tools<br>(naïve agent)</div>
+      </div>
+      <div class="bar fixed">
+        <div class="col" style="height: 225px"></div>
+        <div class="num">90%</div>
+        <div class="label">Layered defense<br>+ LLM Verifier</div>
+      </div>
+    </div>
+    <div class="footer-line"><span>AUTODESIGN</span><span>S3 / 6</span></div>
+  </section>
+
+  <section class="slide" id="s4">
+    <div class="slide-num">04</div>
+    <h2>Public Benchmark Results</h2>
+    <h3>Cross-benchmark defense effectiveness</h3>
+    <table>
+      <thead>
+        <tr><th>Benchmark</th><th>Naïve baseline</th><th>+ Our defense</th><th>Δ</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>GSM8K</td><td>57%</td><td>77%</td><td>+20</td></tr>
+        <tr><td>MATH</td><td>48%</td><td>53%</td><td>+5</td></tr>
+        <tr><td>HotpotQA</td><td>62%</td><td>67%</td><td>+5</td></tr>
+        <tr><td>BBH Arithmetic</td><td>71%</td><td>76%</td><td>+5</td></tr>
+        <tr><td>BBH Tracking</td><td>44%</td><td>44%</td><td>+0</td></tr>
+        <tr><td>BBH Logic</td><td>58%</td><td>58%</td><td>+0</td></tr>
+      </tbody>
+    </table>
+    <p style="margin-top: 24px; font-size: 14px; color: var(--ink-500);">
+      Largest gain on GSM8K (+20). Moderate on MATH/HotpotQA/BBH-Arithmetic. No gain on BBH Tracking or BBH Logic.
+    </p>
+    <div class="footer-line"><span>AUTODESIGN</span><span>S4 / 6</span></div>
+  </section>
+
+  <section class="slide" id="s5">
+    <div class="slide-num">05</div>
+    <h2>The Three Shifts</h2>
+    <p>AI is evolving from single-turn assistants into multi-agent systems (Claude Code, Devin). These systems operate on the assumption of absolute tool reliability, yet in real-world scenarios, tools are prone to errors, timeouts, and inconsistent returns. An early-stage anomaly can trigger a cascading failure, propagating through shared memory to contaminate the entire workflow.</p>
+    <div class="grid-3">
+      <div class="card">
+        <span class="num">1</span>
+        <h4>From Assistants to Agents</h4>
+        <p>Single-turn → multi-turn → autonomous.</p>
+      </div>
+      <div class="card">
+        <span class="num">2</span>
+        <h4>The Flawed Assumption</h4>
+        <p>Tools assumed reliable. They are not.</p>
+      </div>
+      <div class="card">
+        <span class="num">3</span>
+        <h4>The Cascade Effect</h4>
+        <p>One bad call poisons shared memory.</p>
+      </div>
+    </div>
+    <div class="footer-line"><span>AUTODESIGN</span><span>S5 / 6</span></div>
+  </section>
+
+  <section class="slide" id="s6">
+    <div class="slide-num">06</div>
+    <h2>Related Work and Our Positioning</h2>
+    <div class="grid-3">
+      <div class="card">
+        <h4>Tool-use capability</h4>
+        <p>ToolBench, ToolEmu, Hsieh.</p>
+        <p style="margin-top:8px">Evaluate whether agents can use tools — but assume reliable inputs.</p>
+      </div>
+      <div class="card">
+        <h4>Agent security</h4>
+        <p>AgentDojo, AgentSafetyBench, CaMeL, Prompt-Injection Design Patterns.</p>
+        <p style="margin-top:8px">Focus on adversarial inputs, not benign tool failures.</p>
+      </div>
+      <div class="card">
+        <h4>Closest to us</h4>
+        <p>Beyond Success Rate, Benchmarking Robustness in Tool-Using Language Agents, PALADIN.</p>
+        <p style="margin-top:8px">We add a controlled lightweight workflow defense + the LLM Verifier.</p>
+      </div>
+    </div>
+    <div class="footer-line"><span>AUTODESIGN</span><span>S6 / 6</span></div>
+  </section>
+
+</body>
+</html>

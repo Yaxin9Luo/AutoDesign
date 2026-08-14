@@ -1,0 +1,39 @@
+{
+  "developer_saas": [
+    "hero_with_product_or_diagram",
+    "proof_band",
+    "feature_grid",
+    "workflow_or_architecture",
+    "comparison_or_metrics",
+    "cta_footer"
+  ],
+  "product_launch": [
+    "hero_with_product_signal",
+    "benefit_strip",
+    "feature_showcase",
+    "social_or_metric_proof",
+    "cta_footer"
+  ],
+  "research_project": [
+    "hero_with_thesis",
+    "method_overview",
+    "evidence_figures_or_tables",
+    "qualitative_examples",
+    "takeaways_and_links"
+  ],
+  "paper_project_page": [
+    "compact_paper_identity_and_resources",
+    "abstract_and_method_overview",
+    "source_figure_exploration",
+    "results_tables_or_qualitative_evidence",
+    "limitations_when_supported",
+    "citation_and_reproducibility"
+  ],
+  "waitlist": [
+    "hero_with_offer",
+    "problem_solution",
+    "proof_or_preview",
+    "signup_cta",
+    "footer"
+  ]
+}

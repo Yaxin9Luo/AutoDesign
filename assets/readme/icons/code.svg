@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#64748B" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" role="img" aria-labelledby="title desc">
+  <title id="title">Source code</title>
+  <desc id="desc">Outline code brackets used beside source installation.</desc>
+  <path d="m8 9-4 3 4 3M16 9l4 3-4 3M14 5l-4 14"/>
+</svg>

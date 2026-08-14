@@ -1,0 +1,80 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="390" viewBox="0 0 1200 390" role="img" aria-labelledby="title desc">
+  <title id="title">AutoDesign</title>
+  <desc id="desc">AutoDesign turns source documents into editable, source-grounded visual artifacts through authoring and browser validation.</desc>
+
+  <rect width="1200" height="390" rx="28" fill="#F4F1EA"/>
+  <path d="M0 310H1200" stroke="#D8D1C4"/>
+  <path d="M732 0V310" stroke="#D8D1C4"/>
+
+  <g transform="translate(58 48)">
+    <text x="0" y="18" fill="#9B3A32" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="17" font-weight="700" letter-spacing="2">LOCAL-FIRST DESIGN AGENT</text>
+    <text x="0" y="92" fill="#171717" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="72" font-weight="760" letter-spacing="-3">AutoDesign</text>
+    <text x="0" y="143" fill="#3F3B36" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="27" font-weight="520">Source documents in.</text>
+    <text x="0" y="180" fill="#3F3B36" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="27" font-weight="520">Editable visual artifacts out.</text>
+    <g transform="translate(0 218)" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="15" font-weight="650">
+      <rect width="150" height="36" rx="18" fill="#171717"/>
+      <text x="75" y="23" fill="#F8F6F1" text-anchor="middle">SOURCE-GROUNDED</text>
+      <rect x="162" width="103" height="36" rx="18" fill="#E7DFD2"/>
+      <text x="213.5" y="23" fill="#514B43" text-anchor="middle">HTML-FIRST</text>
+      <rect x="277" width="118" height="36" rx="18" fill="#E7DFD2"/>
+      <text x="336" y="23" fill="#514B43" text-anchor="middle">INSPECTABLE</text>
+    </g>
+  </g>
+
+  <g transform="translate(778 35)">
+    <rect width="370" height="240" rx="9" fill="#FFFDF9" stroke="#171717" stroke-width="2"/>
+    <path d="M-12 18H12M0 6V30M358 -12V12M346 0H370M-12 222H12M0 210V234M358 228V252M346 240H370" stroke="#9B3A32" stroke-width="2"/>
+    <rect x="18" y="18" width="334" height="44" rx="3" fill="#171717"/>
+    <rect x="31" y="31" width="146" height="8" rx="4" fill="#FFFDF9"/>
+    <rect x="31" y="45" width="105" height="5" rx="2.5" fill="#A9B8BD"/>
+    <rect x="226" y="29" width="112" height="20" rx="10" fill="#9B3A32"/>
+    <text x="282" y="43" fill="#FFFDF9" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10" text-anchor="middle">SOURCE VERIFIED</text>
+
+    <g transform="translate(18 79)">
+      <rect width="96" height="142" rx="3" fill="#EFEAE1"/>
+      <rect x="9" y="10" width="54" height="7" rx="3.5" fill="#272727"/>
+      <rect x="9" y="25" width="78" height="4" rx="2" fill="#9B948A"/>
+      <rect x="9" y="34" width="69" height="4" rx="2" fill="#9B948A"/>
+      <rect x="9" y="50" width="78" height="43" rx="2" fill="#6D8790"/>
+      <path d="M16 83L32 68L45 76L62 60L80 83" fill="none" stroke="#E9F0F1" stroke-width="3"/>
+      <rect x="9" y="103" width="74" height="4" rx="2" fill="#9B948A"/>
+      <rect x="9" y="112" width="64" height="4" rx="2" fill="#9B948A"/>
+      <rect x="9" y="121" width="70" height="4" rx="2" fill="#9B948A"/>
+    </g>
+    <g transform="translate(128 79)">
+      <rect width="96" height="142" rx="3" fill="#F4EFE7"/>
+      <rect x="9" y="10" width="60" height="7" rx="3.5" fill="#272727"/>
+      <rect x="9" y="26" width="78" height="4" rx="2" fill="#9B948A"/>
+      <rect x="9" y="35" width="74" height="4" rx="2" fill="#9B948A"/>
+      <rect x="9" y="44" width="67" height="4" rx="2" fill="#9B948A"/>
+      <rect x="9" y="58" width="78" height="56" rx="2" fill="#D8CBB9"/>
+      <circle cx="48" cy="85" r="19" fill="none" stroke="#9B3A32" stroke-width="7" stroke-dasharray="43 76" transform="rotate(-90 48 85)"/>
+      <rect x="9" y="124" width="70" height="4" rx="2" fill="#9B948A"/>
+    </g>
+    <g transform="translate(238 79)">
+      <rect width="114" height="142" rx="3" fill="#EFEAE1"/>
+      <rect x="9" y="10" width="70" height="7" rx="3.5" fill="#272727"/>
+      <rect x="9" y="27" width="96" height="55" rx="2" fill="#FFFDF9" stroke="#BEB5A7"/>
+      <path d="M17 68L33 53L49 60L67 39L82 51L97 34" fill="none" stroke="#6D8790" stroke-width="3"/>
+      <circle cx="33" cy="53" r="3" fill="#9B3A32"/>
+      <circle cx="67" cy="39" r="3" fill="#9B3A32"/>
+      <rect x="9" y="94" width="93" height="4" rx="2" fill="#9B948A"/>
+      <rect x="9" y="103" width="84" height="4" rx="2" fill="#9B948A"/>
+      <rect x="9" y="112" width="90" height="4" rx="2" fill="#9B948A"/>
+      <rect x="9" y="121" width="72" height="4" rx="2" fill="#9B948A"/>
+    </g>
+  </g>
+
+  <g transform="translate(58 338)" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="16" font-weight="650">
+    <text x="0" y="0" fill="#171717">paper.pdf</text>
+    <text x="122" y="0" fill="#9B3A32">→</text>
+    <text x="158" y="0" fill="#171717">ingest</text>
+    <text x="234" y="0" fill="#9B3A32">→</text>
+    <text x="270" y="0" fill="#171717">author HTML/CSS</text>
+    <text x="424" y="0" fill="#9B3A32">→</text>
+    <text x="460" y="0" fill="#171717">browser QA</text>
+    <text x="574" y="0" fill="#9B3A32">→</text>
+    <text x="610" y="0" fill="#171717">final/</text>
+    <text x="1084" y="0" fill="#686158" text-anchor="end">WEB UI + CLI</text>
+  </g>
+</svg>

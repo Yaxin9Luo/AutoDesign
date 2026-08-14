@@ -1,0 +1,15 @@
+{
+  "manifest_version": 2,
+  "id": "deck.report2deck_general",
+  "version": "0.2.0",
+  "description": "Source-backed report-to-deck narrative and editable slide guidance.",
+  "applies_to": ["deck"],
+  "stages": ["enhance", "plan", "critique", "repair"],
+  "triggers": ["report", "financial report", "annual report", "industry research", "whitepaper", "case study", "company profile", "business pdf", "财报", "报告", "行业调研", "白皮书", "企业介绍", "商业"],
+  "priority": 85,
+  "enabled_by_default": true,
+  "source": {"kind": "autodesign", "description": "General source-backed report-to-HTML-deck planning skill."},
+  "assets": [],
+  "resources": [{"id": "report_scenario_map", "path": "references/report_scenario_map.json", "description": "Report-type scenarios and deck narrative mappings.", "stages": ["plan", "repair"], "when_to_read": "Read after classifying a report-backed deck request.", "media_type": "application/json"}],
+  "outputs": ["report_outline", "slide_content_plan", "asset_slot_plan", "source_reference_policy"]
+}

@@ -1,0 +1,117 @@
+/* Neubrutalism — thick borders, zero-blur shadows, saturated candy colors. */
+
+:root {
+  --ld-bg: #fef3c7;
+  --ld-bg-alt: #ffffff;
+  --ld-bg-cta: #ff6fb5;
+  --ld-bg-footer: #000000;
+  --ld-fg: #000000;
+  --ld-fg-inverse: #ffffff;
+  --ld-accent: #ff6fb5;
+  --ld-border: 4px solid #000000;
+  --ld-shadow-hard: 8px 8px 0 #000000;
+  --ld-shadow-hard-sm: 4px 4px 0 #000000;
+  --ld-card-1: #fde68a; /* yellow */
+  --ld-card-2: #bef264; /* lime */
+  --ld-card-3: #fda4af; /* coral */
+  --ld-card-4: #7dd3fc; /* sky */
+}
+
+body { background: var(--ld-fg); color: var(--ld-fg); font-family: 'Archivo Black', 'Space Grotesk', system-ui, sans-serif; }
+.ld-landing { background: var(--ld-bg); border: var(--ld-border); }
+
+.ld-section { padding: 96px 64px; gap: 32px; border-bottom: var(--ld-border); }
+.ld-section[data-section-variant="hero"] {
+  background: var(--ld-bg); text-align: center; align-items: center;
+  padding: 140px 64px;
+}
+.ld-section[data-section-variant="features"] {
+  background: var(--ld-bg-alt);
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 24px; padding: 96px 64px;
+}
+.ld-section[data-section-variant="features"] .layer.text {
+  background: var(--ld-card-1);
+  border: var(--ld-border); box-shadow: var(--ld-shadow-hard);
+  padding: 32px; border-radius: 0;
+}
+.ld-section[data-section-variant="features"] .layer.text:nth-of-type(2) { background: var(--ld-card-2); }
+.ld-section[data-section-variant="features"] .layer.text:nth-of-type(3) { background: var(--ld-card-3); }
+.ld-section[data-section-variant="features"] .layer.text:nth-of-type(4) { background: var(--ld-card-4); }
+.ld-section[data-section-variant="cta"] {
+  background: var(--ld-bg-cta); color: var(--ld-fg);
+  text-align: center; align-items: center; padding: 120px 64px;
+  border-top: var(--ld-border); border-bottom: var(--ld-border);
+}
+.ld-section[data-section-variant="footer"] {
+  background: var(--ld-bg-footer); color: var(--ld-fg-inverse);
+  padding: 48px 64px; border: none;
+}
+
+/* Image layers (v1.0 #8.75) — chunky border + hard offset shadow */
+.ld-landing figure.layer.image {
+  margin: 0; padding: 0; width: 100%;
+  border: var(--ld-border); box-shadow: var(--ld-shadow-hard);
+  border-radius: 0; overflow: hidden; background: var(--ld-fg);
+}
+.ld-landing figure.layer.image img {
+  width: 100%; height: auto; display: block;
+  filter: contrast(1.1) saturate(1.2);
+}
+.ld-section[data-section-variant="hero"][data-has-image="true"] {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 48px; align-items: center;
+  text-align: left;
+}
+.ld-section[data-section-variant="hero"][data-has-image="true"] figure.layer.image {
+  aspect-ratio: 1 / 1;
+}
+.ld-section[data-section-variant="features"][data-has-image="true"] figure.layer.image {
+  width: 80px; height: 80px; margin-bottom: 16px;
+}
+
+.ld-landing .layer.text {
+  font-family: 'Archivo Black', 'Space Grotesk', system-ui, sans-serif;
+}
+.ld-section[data-section-variant="hero"] .layer.text:first-of-type,
+.ld-section[data-section-variant="cta"] .layer.text:first-of-type {
+  font-weight: 900; letter-spacing: -0.02em; line-height: 1.0;
+  text-transform: uppercase;
+}
+.ld-section[data-section-variant="features"] .layer.text:first-of-type {
+  font-weight: 900; text-transform: uppercase; line-height: 1.1;
+}
+.ld-landing .layer.text:focus {
+  outline: 3px dashed var(--ld-fg); outline-offset: 6px;
+}
+
+/* v1.3 — top nav: thick candy-bar with hard shadow */
+.ld-header { background: var(--ld-card-2); border: var(--ld-border); border-top: none;
+             padding: 16px 32px; box-shadow: var(--ld-shadow-hard-sm); }
+.ld-nav ul { justify-content: center; gap: 0; flex-wrap: wrap; }
+.ld-nav a { color: var(--ld-fg); font-family: 'Archivo Black', 'Space Grotesk', sans-serif;
+            font-weight: 900; font-size: 14px; letter-spacing: 0.05em;
+            text-transform: uppercase; padding: 10px 18px;
+            border-right: var(--ld-border); transition: background .1s ease; }
+.ld-nav ul li:last-child a { border-right: 0; }
+.ld-nav a:hover { background: var(--ld-bg); }
+.ld-nav a[aria-current="page"] { background: var(--ld-accent); color: var(--ld-fg-inverse); }
+
+/* v1.3 — CTA: brutalist primary-only pattern */
+.ld-cta { font-family: 'Archivo Black', 'Space Grotesk', sans-serif; font-weight: 900;
+          font-size: 17px; letter-spacing: 0.05em; text-transform: uppercase;
+          padding: 18px 32px; border: var(--ld-border); border-radius: 0;
+          transition: transform .1s ease, box-shadow .1s ease; }
+.ld-cta--primary { background: var(--ld-accent); color: var(--ld-fg-inverse);
+                   box-shadow: var(--ld-shadow-hard); }
+.ld-cta--primary:hover { transform: translate(-2px, -2px);
+                         box-shadow: 10px 10px 0 #000000; }
+.ld-cta--primary:active { transform: translate(4px, 4px);
+                          box-shadow: 2px 2px 0 #000000; }
+.ld-cta--secondary { background: var(--ld-card-4); color: var(--ld-fg);
+                     box-shadow: var(--ld-shadow-hard); }
+.ld-cta--secondary:hover { transform: translate(-2px, -2px);
+                           box-shadow: 10px 10px 0 #000000; }
+.ld-cta--ghost { background: var(--ld-bg); color: var(--ld-fg);
+                 box-shadow: var(--ld-shadow-hard-sm); }
+.ld-cta--ghost:hover { background: var(--ld-card-1); }
+.ld-cta:focus-visible { outline: 4px solid var(--ld-accent); outline-offset: 4px; }

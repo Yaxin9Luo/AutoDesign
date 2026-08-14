@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#64748B" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" role="img" aria-labelledby="title desc">
+  <title id="title">Cost-performance trade-off</title>
+  <desc id="desc">Outline balance scale used beside cost and performance analysis.</desc>
+  <path d="M12 3v18M5 6h14M8 21h8"/>
+  <path d="m5 6-3 6h6zM19 6l-3 6h6z"/>
+</svg>

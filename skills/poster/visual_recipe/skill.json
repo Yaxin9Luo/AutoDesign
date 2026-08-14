@@ -1,0 +1,22 @@
+{
+  "manifest_version": 2,
+  "id": "poster.visual_recipe",
+  "version": "0.2.0",
+  "description": "Editable poster scenario, layout, source-evidence, and reference-style guidance.",
+  "applies_to": ["poster"],
+  "stages": ["enhance", "plan", "critique", "repair"],
+  "triggers": [],
+  "priority": 60,
+  "enabled_by_default": true,
+  "source": {"kind": "autodesign", "description": "Poster layout, density, and visual-reference revision playbook."},
+  "assets": ["assets/dense_synthesis_targets.json", "assets/academic_color_palettes.json"],
+  "resources": [
+    {"id": "archetype", "path": "references/archetype.json", "description": "Poster archetypes and intended visual hierarchy.", "stages": ["plan"], "when_to_read": "Read after classifying the poster scenario.", "media_type": "application/json"},
+    {"id": "paper_layout", "path": "references/paper_layout.md", "description": "Academic paper-poster layout, density, and panel-flow rules.", "stages": ["plan", "repair"], "when_to_read": "Read when authoring or repairing an academic paper poster.", "media_type": "text/markdown"},
+    {"id": "source_flow", "path": "references/source_flow.md", "description": "Required source visual placement and local reading-flow rules.", "stages": ["plan", "repair"], "when_to_read": "Read when assigning or repairing source figures and tables.", "media_type": "text/markdown"},
+    {"id": "typography_aesthetics", "path": "references/typography_aesthetics.md", "description": "Poster typography, formula, palette, and anti-slop guidance.", "stages": ["plan", "repair"], "when_to_read": "Read when setting or repairing poster visual treatment.", "media_type": "text/markdown"},
+    {"id": "campaign_event", "path": "references/campaign_event.md", "description": "Campaign, event, social, and product poster treatment.", "stages": ["plan", "repair"], "when_to_read": "Read for non-paper poster scenarios.", "media_type": "text/markdown"},
+    {"id": "reference_mode", "path": "references/reference_mode.md", "description": "Reference-style transfer constraints for poster runs.", "stages": ["plan", "repair"], "when_to_read": "Read when a poster uses a visual reference blueprint.", "media_type": "text/markdown"}
+  ],
+  "outputs": ["poster_archetype", "density_policy", "visual_reference_repair_policy"]
+}

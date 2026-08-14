@@ -1,0 +1,22 @@
+{
+  "manifest_version": 2,
+  "id": "deck.html_ppt_general",
+  "version": "0.4.0",
+  "description": "General HTML-first deck planning, layout, theme, and export guidance.",
+  "applies_to": ["deck"],
+  "stages": ["enhance", "plan", "critique", "repair"],
+  "triggers": ["pitch", "vc", "fundraise", "tech sharing", "technical talk", "weekly report", "monthly report", "product introduction", "product intro", "company profile", "travel itinerary", "industry research", "financial analysis", "course", "training", "speaker notes", "presenter", "ppt", "slides", "deck", "演讲", "路演", "周报", "月报", "课程", "产品介绍", "企业介绍", "旅游攻略", "旅行计划", "行业调研", "财报分析"],
+  "priority": 70,
+  "enabled_by_default": true,
+  "source": {"kind": "external-derived", "name": "html-ppt-skill", "url": "https://github.com/lewislulu/html-ppt-skill", "license": "MIT"},
+  "assets": ["assets/selected-theme-tokens.css", "NOTICE.md", "vendor/html-ppt-skill/LICENSE"],
+  "resources": [
+    {"id": "layout", "path": "references/layout.json", "description": "Deck layout archetypes and intended content forms.", "stages": ["plan", "repair"], "when_to_read": "Read when choosing or varying slide layouts.", "media_type": "application/json"},
+    {"id": "theme", "path": "references/theme.json", "description": "Deck visual profiles and palette/type systems.", "stages": ["plan"], "when_to_read": "Read when selecting a deck visual system.", "media_type": "application/json"},
+    {"id": "scenario", "path": "references/scenario.json", "description": "Scenario-specific deck arcs.", "stages": ["plan"], "when_to_read": "Read after classifying a general deck scenario.", "media_type": "application/json"},
+    {"id": "agent-flow", "path": "references/agent-flow.json", "description": "Expected enhance, plan, critique, and repair flow.", "stages": ["plan", "repair"], "when_to_read": "Read when a stage needs its expected deliverable sequence.", "media_type": "application/json"},
+    {"id": "image-policy", "path": "references/image-policy.json", "description": "Generated mood, source evidence, and no-image deck rules.", "stages": ["plan", "repair"], "when_to_read": "Read when selecting or repairing deck imagery.", "media_type": "application/json"},
+    {"id": "academic_deck_taste_v1", "path": "references/academic_deck_taste_v1.json", "description": "Versioned user-taste contract for formal academic HTML decks.", "stages": ["plan", "repair"], "when_to_read": "Read before styling an academic deck or repairing one that violates the preferred visual direction.", "media_type": "application/json"}
+  ],
+  "outputs": ["html_scenario_arc", "layout_plan", "theme_tokens", "speaker_notes_policy"]
+}

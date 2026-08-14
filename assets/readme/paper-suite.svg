@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="240" viewBox="0 0 1200 240" role="img" aria-labelledby="title desc">
+  <title id="title">AutoDesign Paper All-in-One workflow</title>
+  <desc id="desc">A paper PDF flows through AutoDesign into a webpage, slides, poster, and narrated video.</desc>
+  <rect width="1200" height="240" rx="24" fill="#0a0d0c"/>
+  <path d="M0 5h1200" stroke="#ff6b57" stroke-width="10"/>
+
+  <g font-family="Arial, Helvetica, sans-serif">
+    <text x="44" y="50" fill="#ff8b79" font-size="15" font-weight="700" letter-spacing="2">PAPER ALL-IN-ONE</text>
+
+    <rect x="44" y="76" width="220" height="112" rx="15" fill="#fffaf2"/>
+    <rect x="60" y="94" width="52" height="64" rx="5" fill="#ffffff" stroke="#0a0d0c" stroke-width="2"/>
+    <path d="M97 94v15h15" fill="none" stroke="#0a0d0c" stroke-width="2"/>
+    <path d="M70 122h31M70 133h31M70 144h23" stroke="#0a0d0c" stroke-width="3"/>
+    <text x="130" y="127" fill="#0a0d0c" font-size="26" font-weight="700">Paper</text>
+    <text x="130" y="153" fill="#6b6d69" font-size="16">PDF in</text>
+
+    <path d="M286 132h91" stroke="#ff6b57" stroke-width="5" stroke-linecap="round"/>
+    <path d="m365 120 15 12-15 12" fill="none" stroke="#ff6b57" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+
+    <rect x="401" y="76" width="206" height="112" rx="15" fill="#15201f" stroke="#39c7b5" stroke-width="2"/>
+    <text x="424" y="111" fill="#78e1d4" font-size="14" font-weight="700" letter-spacing="1.5">AUTODESIGN</text>
+    <text x="424" y="143" fill="#ffffff" font-size="24" font-weight="700">One workflow</text>
+    <text x="424" y="168" fill="#b8c2bf" font-size="15">Source-grounded outputs</text>
+
+    <path d="M629 132h77" stroke="#5d87ff" stroke-width="5" stroke-linecap="round"/>
+    <path d="m694 120 15 12-15 12" fill="none" stroke="#5d87ff" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+
+    <g font-size="20" font-weight="700">
+      <rect x="731" y="76" width="200" height="48" rx="12" fill="#fffaf2"/>
+      <circle cx="754" cy="100" r="7" fill="#ff6b57"/>
+      <text x="771" y="107" fill="#0a0d0c">Webpage</text>
+
+      <rect x="946" y="76" width="210" height="48" rx="12" fill="#fffaf2"/>
+      <circle cx="969" cy="100" r="7" fill="#5d87ff"/>
+      <text x="986" y="107" fill="#0a0d0c">Slides</text>
+
+      <rect x="731" y="140" width="200" height="48" rx="12" fill="#fffaf2"/>
+      <circle cx="754" cy="164" r="7" fill="#39c7b5"/>
+      <text x="771" y="171" fill="#0a0d0c">Poster</text>
+
+      <rect x="946" y="140" width="210" height="48" rx="12" fill="#fffaf2"/>
+      <circle cx="969" cy="164" r="7" fill="#ffb347"/>
+      <text x="986" y="171" fill="#0a0d0c">Narrated video</text>
+    </g>
+  </g>
+</svg>

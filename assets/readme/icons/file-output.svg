@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#64748B" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" role="img" aria-labelledby="title desc">
+  <title id="title">Paper suite</title>
+  <desc id="desc">Outline paper flowing into multiple artifact cards.</desc>
+  <path d="M4 3h7l3 3v5H4z"/>
+  <path d="M11 3v3h3M7 15h4v5H7zM15 15h4v5h-4zM12 11v2M9 13h8"/>
+</svg>

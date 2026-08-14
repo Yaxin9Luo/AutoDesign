@@ -1,0 +1,22 @@
+{
+  "campaign_hero": {
+    "use_when": "public campaigns, launches, awareness posters",
+    "structure": ["title_band", "dominant_visual", "three_fact_strip", "footer"],
+    "density": "one hero plus 3-5 compact support units"
+  },
+  "event_editorial": {
+    "use_when": "talks, meetups, workshops, exhibits",
+    "structure": ["date_badge", "large_title", "speaker_or_theme_visual", "schedule_footer"],
+    "density": "high title contrast, sparse body copy, strong metadata"
+  },
+  "paper_dense": {
+    "use_when": "academic paper posters",
+    "structure": ["title_band", "thesis_strip", "method_hero", "evidence_grid", "native_synthesis_panels", "conclusion_footer"],
+    "density": "contract-defined 3x2/4x2/3x3 main panels for A0 with compact source visual, native synthesis, caption, and callout lanes"
+  },
+  "social_card": {
+    "use_when": "shareable square or portrait content posters",
+    "structure": ["hook", "single_visual_metaphor", "numbered_takeaways", "source_footer"],
+    "density": "short copy, high contrast, readable at thumbnail size"
+  }
+}

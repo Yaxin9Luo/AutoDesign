@@ -1,0 +1,51 @@
+{
+  "source_buckets": {
+    "method": {
+      "priority": 1,
+      "examples": ["method diagram", "architecture", "pipeline", "framework", "algorithm overview"],
+      "slot_guidance": "Use for explanation frames, mechanism slides, poster method panels, and landing workflow/proof sections."
+    },
+    "evidence": {
+      "priority": 2,
+      "examples": ["benchmark chart", "main result", "ablation", "scaling curve", "comparison plot"],
+      "slot_guidance": "Use near numeric claims and keep captions/callouts close to the visual."
+    },
+    "table": {
+      "priority": 3,
+      "examples": ["benchmark table", "ablation table", "financial table", "metric comparison"],
+      "slot_guidance": "Subset wide tables into readable editable HTML tables instead of screenshots when possible."
+    },
+    "qualitative": {
+      "priority": 4,
+      "examples": ["example outputs", "case studies", "before/after panels", "screenshots"],
+      "slot_guidance": "Use for proof-of-behavior frames after method/evidence coverage is satisfied."
+    }
+  },
+  "deprioritize_or_exclude": [
+    "logo",
+    "publisher mark",
+    "page header",
+    "page footer",
+    "watermark",
+    "decorative border",
+    "pure equation crop",
+    "duplicate low-information visual"
+  ],
+  "metadata_fields": [
+    "source",
+    "source_id",
+    "page",
+    "caption",
+    "block_id",
+    "visual_role",
+    "visual_score",
+    "curation_reason",
+    "curation_flags"
+  ],
+  "low_caption_confidence": {
+    "policy": "Keep the candidate available; low confidence is a review flag, not a deletion rule.",
+    "claim_support": "Do not use it as the sole support for an important claim unless nearby text, caption, or table evidence confirms it."
+  },
+  "slot_contract": "Reserve layout slots with exact ingest_fig_NN, ingest_fig_NN_panel, or ingest_table_NN ids before final body copy.",
+  "planning_rule": "Use high-score source visuals for method/evidence/table/qualitative slots before generated mood imagery."
+}

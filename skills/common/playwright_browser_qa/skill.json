@@ -1,0 +1,15 @@
+{
+  "manifest_version": 2,
+  "id": "common.playwright_browser_qa",
+  "version": "0.2.0",
+  "description": "Browser-rendered DOM, screenshot, and export-preview QA for HTML artifacts.",
+  "applies_to": ["poster", "deck", "landing"],
+  "stages": ["plan", "critique", "repair"],
+  "triggers": ["browser", "playwright", "html", "dom", "screenshot", "preview"],
+  "priority": 9,
+  "enabled_by_default": true,
+  "source": {"kind": "codex-skill-derived", "name": "playwright", "upstream_skill": "playwright", "description": "Browser automation and DOM/screenshot QA workflow for rendered HTML artifacts."},
+  "assets": [],
+  "resources": [{"id": "browser_checks", "path": "references/browser_checks.md", "description": "Browser screenshot, DOM, and repair checks.", "stages": ["plan", "repair"], "when_to_read": "Read before browser QA or after a browser-layout finding.", "media_type": "text/markdown"}],
+  "outputs": ["browser_qa_policy", "dom_audit_policy", "preview_repair_policy"]
+}

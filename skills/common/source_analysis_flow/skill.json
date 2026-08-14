@@ -1,0 +1,15 @@
+{
+  "manifest_version": 2,
+  "id": "common.source_analysis_flow",
+  "version": "0.2.0",
+  "description": "Staged source analysis for editable, source-grounded HTML artifacts.",
+  "applies_to": ["all"],
+  "stages": ["enhance", "plan", "critique", "repair"],
+  "triggers": ["pdf", "docx", "pptx", "markdown", "source", "document", "report", "素材", "资料", "文档"],
+  "priority": 95,
+  "enabled_by_default": true,
+  "source": {"kind": "autodesign", "description": "Content-source analysis and Sandun-style staged planning discipline for HTML-first artifacts."},
+  "assets": [],
+  "resources": [{"id": "image_policy", "path": "references/image_policy.json", "description": "Source-only, smart-match, and no-image policy map.", "stages": ["plan", "repair"], "when_to_read": "Read when resolving image policy for a source-backed run.", "media_type": "application/json"}],
+  "outputs": ["source_manifest_policy", "outline_plan", "content_plan", "asset_slot_plan"]
+}

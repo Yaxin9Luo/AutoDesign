@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Mock Landing — AutoDesign</title>
+  <style>
+    :root {
+      --ink-900: #1a1612;
+      --ink-500: #6e6557;
+      --cream:   #f6f1e6;
+      --accent:  #1d3a2f;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; padding: 0; }
+    body {
+      font-family: ui-sans-serif, -apple-system, "Inter", "Helvetica Neue", sans-serif;
+      color: var(--ink-900);
+      background: #fff;
+      line-height: 1.5;
+    }
+    nav {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 20px 48px; border-bottom: 1px solid #d8d1bf;
+    }
+    nav .brand { font-weight: 700; font-size: 15px; letter-spacing: -0.01em; }
+    nav .links a {
+      margin-left: 28px; color: var(--ink-500); text-decoration: none;
+      font-size: 13px;
+    }
+    nav .links a:hover { color: var(--ink-900); }
+    .hero {
+      padding: 96px 48px 72px;
+      text-align: center;
+      background: var(--cream);
+    }
+    .hero .eyebrow {
+      font-size: 11px; letter-spacing: 0.18em; text-transform: uppercase;
+      color: var(--ink-500); margin-bottom: 18px;
+    }
+    .hero h1 {
+      font-family: ui-serif, Georgia, serif;
+      font-size: 64px; line-height: 1.05; margin: 0 auto 24px;
+      max-width: 880px; letter-spacing: -0.015em;
+    }
+    .hero p {
+      max-width: 600px; margin: 0 auto 40px; color: var(--ink-500);
+      font-size: 17px;
+    }
+    .cta {
+      display: inline-flex; align-items: center; gap: 8px;
+      background: var(--ink-900); color: #f6f1e6;
+      padding: 14px 24px; border-radius: 10px;
+      text-decoration: none; font-weight: 500; font-size: 14px;
+    }
+    .cta.secondary {
+      background: transparent; color: var(--ink-900);
+      border: 1px solid #d8d1bf; margin-left: 12px;
+    }
+    .features {
+      max-width: 1100px; margin: 0 auto; padding: 80px 48px;
+      display: grid; grid-template-columns: repeat(3, 1fr); gap: 36px;
+    }
+    .feature h3 { font-size: 16px; margin: 0 0 8px; }
+    .feature p  { font-size: 14px; color: var(--ink-500); margin: 0; }
+    .feature .num {
+      display: inline-flex; width: 28px; height: 28px;
+      align-items: center; justify-content: center;
+      background: var(--accent); color: #f6f1e6;
+      border-radius: 999px; font-size: 11px; font-weight: 600;
+      margin-bottom: 14px;
+    }
+    footer {
+      border-top: 1px solid #d8d1bf;
+      padding: 24px 48px; font-size: 12px; color: var(--ink-500);
+      display: flex; justify-content: space-between;
+    }
+    code { font-family: ui-monospace, SFMono-Regular, "JetBrains Mono", monospace;
+           background: var(--cream); padding: 1px 6px; border-radius: 4px; }
+  </style>
+</head>
+<body>
+  <nav>
+    <div class="brand">AutoDesign</div>
+    <div class="links">
+      <a href="#">Product</a><a href="#">Docs</a><a href="#">Pricing</a><a href="#">Sign in</a>
+    </div>
+  </nav>
+
+  <section class="hero">
+    <div class="eyebrow">Mock Backend · Phase A</div>
+    <h1>Design, in a conversation.</h1>
+    <p>This page was served by FastAPI at <code>/api/files/_mock/landing.html</code>.
+       No agent ran — this proves the fetch chain end-to-end.</p>
+    <a class="cta" href="#">Try the demo →</a>
+    <a class="cta secondary" href="#">View on GitHub</a>
+  </section>
+
+  <section class="features">
+    <div class="feature">
+      <span class="num">1</span>
+      <h3>Conversational</h3>
+      <p>Describe an idea, get an editable artifact. No template gallery.</p>
+    </div>
+    <div class="feature">
+      <span class="num">2</span>
+      <h3>Editable output</h3>
+      <p>Real SVG <code>&lt;text&gt;</code>, native PPTX TextFrames, real HTML.
+         Not rasterized.</p>
+    </div>
+    <div class="feature">
+      <span class="num">3</span>
+      <h3>Bring your own model</h3>
+      <p>Multi-provider backend. Kimi, Claude, Gemini — swappable per role.</p>
+    </div>
+  </section>
+
+  <footer>
+    <span>github.com/Yaxin9Luo/AutoDesign</span>
+    <span><code>POST /api/generate { artifact_type: "landing" }</code></span>
+  </footer>
+</body>
+</html>

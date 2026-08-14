@@ -1,0 +1,24 @@
+{
+  "manifest_version": 2,
+  "id": "video.conference_video",
+  "version": "0.1.1",
+  "description": "Strict HTML-first conference paper video authoring and delivery contract.",
+  "applies_to": ["video"],
+  "stages": ["enhance", "plan", "critique", "repair"],
+  "triggers": ["paper video", "conference video", "research video", "paper-to-video", "论文视频", "会议视频"],
+  "priority": 90,
+  "enabled_by_default": true,
+  "source": {"kind": "autodesign", "description": "AutoDesign conference paper video delivery playbook."},
+  "assets": [],
+  "resources": [
+    {
+      "id": "delivery_contract",
+      "path": "references/delivery_contract.json",
+      "description": "Machine-readable scene, narration, subtitle, render, and media acceptance policy.",
+      "stages": ["plan", "repair"],
+      "when_to_read": "Read before planning a video timeline and before accepting a rendered MP4.",
+      "media_type": "application/json"
+    }
+  ],
+  "outputs": ["html_first_timeline", "english_narration", "english_subtitles", "validated_mp4"]
+}

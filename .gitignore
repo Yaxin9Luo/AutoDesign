@@ -1,0 +1,99 @@
+# ---- Secrets ----
+.env
+.env.local
+.env.*.local
+opencode.jsonc
+
+# ---- Python ----
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+
+# ---- Runtime artifacts ----
+out/
+/output/
+sessions/
+tmp/
+.designanything/
+/*.log
+# Playwright CLI scratch logs (console dumps from local browser QA runs)
+.playwright-cli/
+# macOS Finder metadata
+.DS_Store
+# Separate landing-page web project (not part of the design pipeline, ~14MB)
+/landing/
+# One-off QA scratch doc at the repo root
+design-qa.md
+
+# ---- Large generated/reference assets kept local ----
+examples/papers/
+assets/fonts/
+
+# ---- Web build artifacts (tsc -b composite emits these next to vite.config.ts) ----
+web/vite.config.d.ts
+web/vite.config.js
+web/*.tsbuildinfo
+
+# ---- OS ----
+.DS_Store
+Thumbs.db
+
+# ---- IDE ----
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ---- Local dev reference (not redistributed) ----
+data/
+data
+# WeChat blog seed reference — copyright, kept local only
+design_agent_blog.pdf
+# Cloned third-party reference repo, safety net (already moved outside project)
+DesignAnything_Poster/
+
+# ---- Claude Code local state ----
+.claude/
+dataset/
+eval/EvaData/
+# Internal poster calibration data; retained locally but not published.
+/eval/poster_quality_labels.json
+/eval/poster_quality_sets.json
+
+# ---- Private workspace / scratch ----
+.worktrees/
+.superpowers/
+
+# ---- Local-only development documentation ----
+/docs/
+/AGENTS.md
+/CLAUDE.md
+/web/README.md
+/assets/academic_identity/README.md
+/assets/design-systems/README.md
+/assets/marketing/autodesign-brief.md
+
+# ---- Optional local provider adapters ----
+/autodesign/agents/anthropic_openai_image_proxy.py
+/tests/test_anthropic_openai_image_proxy.py
+
+# ---- Local-only harness helpers ----
+/scripts/render_poster_headless.py
+
+# iCloud / Finder duplicates (macOS creates `foo 2.py` / `bar 3.png` when a
+# file is synced mid-read OR Cmd-D'd in Finder — they diverge from canonical
+# and survive renames as orphans, e.g. `longcatdesign-brief 2.md` lingered
+# after a prior product rename. Catch all extensions.
+* [0-9].*
+# One-off scratch file left at repo root; harmless but not product surface.
+/design
+.gstack/

@@ -1,0 +1,61 @@
+{
+  "layout_plan_contract": {
+    "canvas": "All slot bboxes use 1920x1080 canvas pixel coordinates, never normalized 0-1 coordinates.",
+    "wiring": "Every substantive top-level block must set slot_id to a declared layout_plan slot, or be nested in a group whose block_id or slot_id matches that slot.",
+    "visual_readout": "Every non-decorative image or table needs a concise caption or explanatory readout in the same slot or group.",
+    "sequence": "Declare named slots first, then place and wire concrete blocks. Empty slots arrays are invalid for substantial slides.",
+    "visible_content": "Keep authoring intent in frame.speaker_notes, never in visible blocks. Metric and takeaway cards need substantive claims or values with context; bare ordinal placeholders are invalid."
+  },
+  "cover": {
+    "purpose": "Open the deck with a strong title, subtitle, context badge, and optional brand/hero visual.",
+    "autodesign": {"role": "cover", "archetype": "cover_editorial"}
+  },
+  "agenda": {
+    "purpose": "Show 3-6 chapters before a talk or workshop.",
+    "autodesign": {"role": "content", "recommended_children": ["title", "numbered chapter list"], "academic_policy": "Use a flat chapter list or timeline, not a card grid."}
+  },
+  "section_divider": {
+    "purpose": "Separate major chapters in talks and reports.",
+    "autodesign": {"role": "section_divider", "archetype": "section_divider"}
+  },
+  "two_column": {
+    "purpose": "Compare concept vs example, problem vs solution, before vs after.",
+    "autodesign": {"role": "content", "recommended_children": ["title", "left body", "right body or visual"]}
+  },
+  "kpi_grid": {
+    "purpose": "Show 3-4 key metrics with deltas.",
+    "autodesign": {"role": "content", "archetype": "evidence_snapshot", "academic_policy": "Use only for source-backed metrics; prefer a native result table or figure when available."}
+  },
+  "flow_diagram": {
+    "purpose": "Show pipelines, systems, or process steps.",
+    "autodesign": {"role": "content_with_figure", "archetype": "pipeline_horizontal"}
+  },
+  "comparison": {
+    "purpose": "Before/after, pros/cons, competitor comparison.",
+    "autodesign": {"role": "content", "archetype": "tension_two_column"}
+  },
+  "timeline": {
+    "purpose": "Roadmaps, release history, migration plans.",
+    "autodesign": {"role": "content", "recommended_children": ["title", "milestone row"]}
+  },
+  "table": {
+    "purpose": "Dense comparisons where exact values matter.",
+    "autodesign": {"role": "content_with_table", "layer_kind": "table"}
+  },
+  "academic_evidence_split": {
+    "purpose": "Pair one dominant paper figure with a concise source-grounded interpretation.",
+    "autodesign": {"role": "content_with_figure", "archetype": "formal_evidence_split"}
+  },
+  "academic_results_table": {
+    "purpose": "Show one native comparison table with one local result readout.",
+    "autodesign": {"role": "content_with_table", "archetype": "formal_results_table"}
+  },
+  "academic_chapter_checkpoint": {
+    "purpose": "Re-orient the audience between major chapters without repeating the cover.",
+    "autodesign": {"role": "section_divider", "archetype": "flat_chapter_outline"}
+  },
+  "thanks": {
+    "purpose": "Close with takeaways, contact, and next step.",
+    "autodesign": {"role": "closing", "archetype": "thanks_qa"}
+  }
+}
