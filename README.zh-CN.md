@@ -15,6 +15,10 @@
 </p>
 
 <p align="center">
+  <a href="https://arxiv.org/abs/2608.13560"><kbd>论文 · arXiv:2608.13560 ↗</kbd></a>
+</p>
+
+<p align="center">
   <a href="https://autodesign.designanything.ai/"><strong>✦ 探索 AutoDesign 的完整故事 ↗</strong></a>
   &nbsp;&nbsp;·&nbsp;&nbsp;
   <a href="https://designanything.ai/"><strong>打开演示页面 ↗</strong></a>

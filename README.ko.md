@@ -15,6 +15,10 @@
 </p>
 
 <p align="center">
+  <a href="https://arxiv.org/abs/2608.13560"><kbd>논문 · arXiv:2608.13560 ↗</kbd></a>
+</p>
+
+<p align="center">
   <a href="https://autodesign.designanything.ai/"><strong>✦ AutoDesign 이야기 살펴보기 ↗</strong></a>
   &nbsp;&nbsp;·&nbsp;&nbsp;
   <a href="https://designanything.ai/"><strong>데모 페이지 열기 ↗</strong></a>

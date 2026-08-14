@@ -15,6 +15,10 @@
 </p>
 
 <p align="center">
+  <a href="https://arxiv.org/abs/2608.13560"><kbd>Paper · arXiv:2608.13560 ↗</kbd></a>
+</p>
+
+<p align="center">
   <a href="https://autodesign.designanything.ai/"><strong>✦ Explore the AutoDesign story ↗</strong></a>
   &nbsp;&nbsp;·&nbsp;&nbsp;
   <a href="https://designanything.ai/"><strong>Open the Demo Page ↗</strong></a>
