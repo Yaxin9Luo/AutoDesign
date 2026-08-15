@@ -25,6 +25,7 @@ from .config import (
     codex_binary_candidates,
     code_editor_command_for_harness,
     designer_author_command_for_harness,
+    inspect_deepseek_harness_binary,
     resolve_harness_binary,
 )
 from .util.io import atomic_write_json, sha256_file
@@ -33,6 +34,7 @@ from .util.io import atomic_write_json, sha256_file
 CODING_HARNESSES: tuple[str, ...] = (
     "codex",
     "claude",
+    "deepseek",
     "opencode",
     "kimi",
     "mimo",
@@ -44,6 +46,7 @@ _MODEL_SELECTION_MODE: dict[str, str] = {
     "custom": "explicit_command",
     "codex": "cli_flag",
     "claude": "cli_flag",
+    "deepseek": "config_overlay",
     "opencode": "cli_flag",
     "kimi": "cli_flag",
     "mimo": "cli_flag",
@@ -54,6 +57,7 @@ _MODEL_SELECTION_MODE: dict[str, str] = {
 _HARNESS_BINARY: dict[str, tuple[str, Path | None]] = {
     "codex": ("codex", None),
     "claude": ("claude", None),
+    "deepseek": ("dsh", None),
     "opencode": ("opencode", None),
     "kimi": ("kimi", None),
     "mimo": ("mimo", None),
@@ -70,6 +74,14 @@ _PI_DESIGNER_AUTHOR_BINARY_ENV_KEYS: tuple[str, ...] = (
 _PI_CODE_EDITOR_BINARY_ENV_KEYS: tuple[str, ...] = (
     "AUTODESIGN_CODE_EDITOR_PI_BIN",
     "DESIGN_ANYTHING_CODE_EDITOR_PI_BIN",
+)
+
+_DEEPSEEK_BINARY_ENV_KEYS: tuple[str, ...] = (
+    "AUTODESIGN_DESIGNER_AUTHOR_DEEPSEEK_BIN",
+    "DESIGN_ANYTHING_DESIGNER_AUTHOR_DEEPSEEK_BIN",
+    "DESIGN_ANYTHING_PLANNER_AUTHOR_DEEPSEEK_BIN",
+    "AUTODESIGN_CODE_EDITOR_DEEPSEEK_BIN",
+    "DESIGN_ANYTHING_CODE_EDITOR_DEEPSEEK_BIN",
 )
 
 _TERMINAL_ROW_STATUSES = {"completed", "cancelled", "error"}
@@ -102,6 +114,7 @@ def build_coding_harness_capabilities(settings: Settings | None = None) -> dict[
     capabilities: dict[str, dict[str, Any]] = {}
     for harness in CODING_HARNESSES:
         binary_name, fallback_path = _HARNESS_BINARY[harness]
+        runtime_details: dict[str, Any] = {}
         if harness == "codex":
             codex_candidates = codex_binary_candidates()
             binary_path = str(codex_candidates[0]["binary"]) if codex_candidates else ""
@@ -117,6 +130,10 @@ def build_coding_harness_capabilities(settings: Settings | None = None) -> dict[
                 if path_binary
                 else "missing"
             )
+        if harness == "deepseek" and binary_path:
+            runtime_details = inspect_deepseek_harness_binary(binary_path)
+            if not runtime_details["available"]:
+                source = "incompatible"
         if not binary_path and fallback_path is not None and fallback_path.exists():
             binary_path = str(fallback_path)
             source = "fallback_path"
@@ -126,16 +143,22 @@ def build_coding_harness_capabilities(settings: Settings | None = None) -> dict[
             "id": harness,
             "binary": binary_path or binary_name,
             "binary_source": source,
-            "available": bool(binary_path),
+            "available": bool(binary_path) and (
+                harness != "deepseek" or bool(runtime_details.get("available"))
+            ),
             "model_selection_mode": _MODEL_SELECTION_MODE[harness],
             "supports_hard_model_arg": _MODEL_SELECTION_MODE[harness] == "cli_flag",
             "notes": _harness_notes(harness),
+            "binary_version": runtime_details.get("version", ""),
+            "capabilities": runtime_details.get("capabilities", {}),
+            "missing": runtime_details.get("missing", []),
+            "errors": runtime_details.get("errors", []),
             "surfaces": {
                 "designer_author": {
                     "model": designer_model or "",
                     "cmd": (
                         designer_author_command_for_harness(harness, designer_model)
-                        if binary_path
+                        if binary_path and (harness != "deepseek" or runtime_details.get("available"))
                         else ""
                     ),
                 },
@@ -143,7 +166,7 @@ def build_coding_harness_capabilities(settings: Settings | None = None) -> dict[
                     "model": code_model or "",
                     "cmd": (
                         code_editor_command_for_harness(harness, code_model)
-                        if binary_path
+                        if binary_path and (harness != "deepseek" or runtime_details.get("available"))
                         else ""
                     ),
                 },
@@ -153,9 +176,13 @@ def build_coding_harness_capabilities(settings: Settings | None = None) -> dict[
 
 
 def _configured_harness_binary(harness: str) -> str:
-    if harness != "pi":
+    if harness == "pi":
+        env_keys = (*_PI_DESIGNER_AUTHOR_BINARY_ENV_KEYS, *_PI_CODE_EDITOR_BINARY_ENV_KEYS)
+    elif harness == "deepseek":
+        env_keys = _DEEPSEEK_BINARY_ENV_KEYS
+    else:
         return ""
-    for env_key in (*_PI_DESIGNER_AUTHOR_BINARY_ENV_KEYS, *_PI_CODE_EDITOR_BINARY_ENV_KEYS):
+    for env_key in env_keys:
         value = str(os.environ.get(env_key) or "").strip()
         if value:
             return value
@@ -618,6 +645,12 @@ def _initial_row(
     spec: HarnessMatrixCellSpec,
 ) -> dict[str, Any]:
     requested_model = (spec.model or "").strip()
+    selection_mode = _MODEL_SELECTION_MODE[spec.harness]
+    effective_model_note = {
+        "cli_flag": "model is passed as a CLI flag",
+        "config_overlay": "model is selected with an invocation-local config overlay",
+        "locked_config": "model is selected under a config lock and restored after the invocation",
+    }[selection_mode]
     return {
         "matrix_id": matrix_id,
         "paper_id": paper.parent.name,
@@ -625,12 +658,8 @@ def _initial_row(
         "template": template,
         "harness": spec.harness,
         "requested_model": requested_model,
-        "effective_model_note": (
-            "model is passed as a CLI flag"
-            if _MODEL_SELECTION_MODE[spec.harness] == "cli_flag"
-            else "model is selected under a config lock and restored after the invocation"
-        ),
-        "model_selection_mode": _MODEL_SELECTION_MODE[spec.harness],
+        "effective_model_note": effective_model_note,
+        "model_selection_mode": selection_mode,
         "attempt_budget": attempts,
         "timeout_s": timeout_s,
         "status": "pending",
@@ -665,6 +694,8 @@ def _normalize_cell_spec(spec: HarnessMatrixCellSpec) -> HarnessMatrixCellSpec:
     aliases = {
         "claude-code": "claude",
         "cloud-code": "claude",
+        "deepseek-harness": "deepseek",
+        "dsh": "deepseek",
         "open-code": "opencode",
         "kimi-code": "kimi",
         "mimo-code": "mimo",
@@ -692,6 +723,8 @@ def _assert_unique_harnesses(specs: list[HarnessMatrixCellSpec]) -> None:
 
 
 def _harness_notes(harness: str) -> str:
+    if harness == "deepseek":
+        return "DeepSeek Harness selects the requested model with an invocation-local config overlay; the user's global DSH settings are unchanged."
     if harness == "zcode":
         return "ZCode headless CLI does not expose a stable --model flag; the wrapper selects its config under a lock and restores it afterward."
     if harness == "custom":

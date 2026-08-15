@@ -39,6 +39,7 @@ export type AgentId =
 export type CodingHarness =
   | "codex"
   | "claude"
+  | "deepseek"
   | "opencode"
   | "kimi"
   | "mimo"
@@ -71,8 +72,9 @@ export interface HarnessConfig {
   code_editor?: CodingHarness;
   code_editor_model?: string;
   /** Optional explicit API key for the harness CLI subprocess (claude →
-   *  ANTHROPIC_API_KEY, codex → OPENAI_API_KEY). Distinct from the pipeline
-   *  provider keys — only authenticates the coding-agent CLI. */
+   *  ANTHROPIC_API_KEY, codex → OPENAI_API_KEY, deepseek → DEEPSEEK_API_KEY).
+   *  Distinct from the pipeline provider keys — only authenticates the
+   *  coding-agent CLI. */
   harness_api_key?: string;
 }
 
@@ -250,6 +252,7 @@ function prunePipelineModels(raw: Partial<PipelineModelConfig>): PipelineModelCo
 const CODING_HARNESSES = new Set<CodingHarness>([
   "codex",
   "claude",
+  "deepseek",
   "opencode",
   "kimi",
   "mimo",

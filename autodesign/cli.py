@@ -169,12 +169,12 @@ def main(argv: list[str] | None = None) -> int:
         "--designer-author-harness",
         "--planner-author-harness",
         dest="designer_author_harness",
-        choices=("custom", "codex", "claude", "claude-code", "cloud-code", "opencode", "kimi", "mimo", "pi", "zcode"),
+        choices=("custom", "codex", "claude", "claude-code", "cloud-code", "deepseek", "deepseek-harness", "dsh", "opencode", "kimi", "mimo", "pi", "zcode"),
         default=None,
         help=(
             "Preset command for --designer-author external. custom keeps "
             "--designer-author-cmd / AUTODESIGN_DESIGNER_AUTHOR_CMD behavior; "
-            "opencode, kimi, mimo, pi, and zcode adapt their CLI semantics to the "
+            "deepseek, opencode, kimi, mimo, pi, and zcode adapt their CLI semantics to the "
             "designer-author stdin/file contract."
         ),
     )
@@ -227,7 +227,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     run_p.add_argument(
         "--identity-logo-agent-harness",
-        choices=("custom", "codex", "claude", "claude-code", "cloud-code", "opencode", "kimi", "mimo", "pi", "zcode"),
+        choices=("custom", "codex", "claude", "claude-code", "cloud-code", "deepseek", "deepseek-harness", "dsh", "opencode", "kimi", "mimo", "pi", "zcode"),
         default=None,
         help="Deprecated no-op compatibility flag for the removed identity logo stage.",
     )

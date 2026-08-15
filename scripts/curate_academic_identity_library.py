@@ -136,7 +136,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--target-set", default=TARGET_SET_ID, choices=(TARGET_SET_ID,))
     parser.add_argument("--out-dir", type=Path, default=None)
     parser.add_argument("--identity-logo-agent", choices=("auto", "off", "required"), default="off")
-    parser.add_argument("--identity-logo-agent-harness", choices=("custom", "codex", "claude", "opencode", "kimi", "mimo", "zcode"), default=None)
+    parser.add_argument("--identity-logo-agent-harness", choices=("custom", "codex", "claude", "deepseek", "opencode", "kimi", "mimo", "zcode"), default=None)
     parser.add_argument("--identity-logo-agent-cmd", default=None)
     parser.add_argument("--identity-logo-agent-model", default=None)
     parser.add_argument("--identity-logo-agent-timeout", type=int, default=None)

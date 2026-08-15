@@ -56,6 +56,7 @@ from autodesign.config import (
     Settings,
     authoring_max_attempts_for,
     clear_harness_login_marker,
+    coding_agent_smoke_command_for_harness,
     code_editor_command_for_harness,
     designer_author_command_for_harness,
     harness_auth_dir,
@@ -66,6 +67,7 @@ from autodesign.config import (
     mark_harness_login,
     normalize_model_id,
     resolve_codex_runtime,
+    resolve_deepseek_harness_runtime,
     resolve_harness_binary,
     resolve_template,
 )
@@ -739,7 +741,7 @@ class OpenResearchProjectAck(BaseModel):
 
 
 class HarnessMatrixHarnessRequest(BaseModel):
-    id: Literal["codex", "claude", "opencode", "kimi", "mimo", "pi", "zcode"]
+    id: Literal["codex", "claude", "deepseek", "opencode", "kimi", "mimo", "pi", "zcode"]
     model: str | None = None
 
 
@@ -3295,13 +3297,13 @@ _PAPER_POSTER_WEB_DESIGNER_AUTHOR_ARGS = (
 _PAPER_POSTER_WEB_DESIGNER_AUTHOR_MISSING_MESSAGE = (
     "Paper poster generation needs a local coding-agent CLI reachable from the "
     "AutoDesign backend. Install the CLI in the same shell/runtime, put "
-    "`codex`/`claude`/`opencode` on that PATH, or set "
+    "`codex`/`claude`/`dsh`/`opencode` on that PATH, or set "
     "AUTODESIGN_DESIGNER_AUTHOR_CMD in .env and restart the backend."
 )
 _CODE_EDITOR_MISSING_MESSAGE = (
     "Poster revision needs a local coding-agent CLI reachable from the AutoDesign "
     "backend. Install the CLI in the same shell/runtime, put "
-    "`codex`/`claude`/`opencode` on that PATH, or set AUTODESIGN_CODE_EDITOR_CMD "
+    "`codex`/`claude`/`dsh`/`opencode` on that PATH, or set AUTODESIGN_CODE_EDITOR_CMD "
     "in .env and restart the backend."
 )
 _OPENRESEARCH_WEB_SUBMITTER_ARGS = (
@@ -3428,6 +3430,7 @@ def _harness_binary_source(harness: str, binary: str) -> str:
 _HARNESS_BINARY_NAMES: dict[str, str] = {
     "codex": "codex",
     "claude": "claude",
+    "deepseek": "dsh",
     "opencode": "opencode",
     "kimi": "kimi",
     "mimo": "mimo",
@@ -3470,6 +3473,33 @@ def _known_harness_binary_status(
     return {"available": False, "source": "missing", "binary": binary_name}
 
 
+def _deepseek_binary_status(*, env_keys: tuple[str, ...]) -> dict[str, Any]:
+    runtime = resolve_deepseek_harness_runtime(configured_env_keys=env_keys)
+    if runtime["available"]:
+        message = ""
+    elif runtime["source"] == "incompatible":
+        version = f" {runtime['version']}" if runtime.get("version") else ""
+        message = (
+            f"Installed DeepSeek Harness{version} does not expose the released "
+            "headless profile. Upgrade with: npm install -g @deepseek-ai/dsh@latest"
+        )
+    else:
+        message = (
+            "DeepSeek Harness CLI was not found. Install it with: "
+            "npm install -g @deepseek-ai/dsh@latest"
+        )
+    return {
+        "available": bool(runtime["available"]),
+        "source": runtime["source"],
+        "binary": runtime["binary"],
+        "binary_version": runtime.get("version", ""),
+        "capabilities": runtime.get("capabilities", {}),
+        "missing": runtime.get("missing", []),
+        "rejected_candidates": runtime.get("rejected_candidates", []),
+        "message": message,
+    }
+
+
 def _designer_author_binary_status(harness: str) -> dict[str, Any]:
     if harness == "codex":
         return _known_harness_binary_status(
@@ -3490,6 +3520,12 @@ def _designer_author_binary_status(harness: str) -> dict[str, Any]:
                 "DESIGN_ANYTHING_PLANNER_AUTHOR_CLAUDE_BIN",
             ),
         )
+    if harness == "deepseek":
+        return _deepseek_binary_status(env_keys=(
+            "AUTODESIGN_DESIGNER_AUTHOR_DEEPSEEK_BIN",
+            "DESIGN_ANYTHING_DESIGNER_AUTHOR_DEEPSEEK_BIN",
+            "DESIGN_ANYTHING_PLANNER_AUTHOR_DEEPSEEK_BIN",
+        ))
     if harness == "opencode":
         return _known_harness_binary_status(
             harness,
@@ -3541,6 +3577,11 @@ def _code_editor_binary_status(harness: str) -> dict[str, Any]:
             harness,
             env_keys=("AUTODESIGN_CODE_EDITOR_CLAUDE_BIN", "DESIGN_ANYTHING_CODE_EDITOR_CLAUDE_BIN"),
         )
+    if harness == "deepseek":
+        return _deepseek_binary_status(env_keys=(
+            "AUTODESIGN_CODE_EDITOR_DEEPSEEK_BIN",
+            "DESIGN_ANYTHING_CODE_EDITOR_DEEPSEEK_BIN",
+        ))
     if harness == "opencode":
         return _known_harness_binary_status(
             harness,
@@ -3588,10 +3629,9 @@ def _paper_poster_author_cmd_resolution(settings: Settings | None) -> dict[str, 
         binary = _designer_author_binary_status(harness)
         if not binary["available"]:
             return {
-                "available": False,
-                "source": "missing",
+                **binary,
                 "cmd": "",
-                "message": _PAPER_POSTER_WEB_DESIGNER_AUTHOR_MISSING_MESSAGE,
+                "message": binary.get("message") or _PAPER_POSTER_WEB_DESIGNER_AUTHOR_MISSING_MESSAGE,
             }
         cmd = designer_author_command_for_harness(
             harness,
@@ -3600,6 +3640,7 @@ def _paper_poster_author_cmd_resolution(settings: Settings | None) -> dict[str, 
         )
         if cmd:
             return {
+                **binary,
                 "available": True,
                 "source": "configured" if configured else binary["source"],
                 "cmd": cmd,
@@ -3655,10 +3696,9 @@ def _code_editor_cmd_resolution(settings: Settings | None) -> dict[str, Any]:
         binary = _code_editor_binary_status(harness)
         if not configured and not binary["available"]:
             return {
-                "available": False,
-                "source": "missing",
+                **binary,
                 "cmd": "",
-                "message": _CODE_EDITOR_MISSING_MESSAGE,
+                "message": binary.get("message") or _CODE_EDITOR_MISSING_MESSAGE,
             }
         cmd = code_editor_command_for_harness(
             harness,
@@ -3667,6 +3707,7 @@ def _code_editor_cmd_resolution(settings: Settings | None) -> dict[str, Any]:
         )
         if cmd:
             return {
+                **binary,
                 "available": True,
                 "source": "configured" if configured else binary["source"],
                 "cmd": cmd,
@@ -3820,6 +3861,22 @@ def _coding_agent_smoke_cmd_resolution(settings: Settings | None) -> dict[str, A
         settings_cmd = str(getattr(settings, "code_editor_cmd", "") or "").strip()
     env_cmd = _first_env_value("AUTODESIGN_CODE_EDITOR_CMD", "DESIGN_ANYTHING_CODE_EDITOR_CMD")
     configured = env_cmd or (settings_cmd if harness == "custom" else "")
+
+    if harness == "deepseek" and not configured:
+        binary = _code_editor_binary_status(harness)
+        if not binary["available"]:
+            return {
+                **binary,
+                "cmd": "",
+                "message": binary.get("message") or _CODE_EDITOR_MISSING_MESSAGE,
+            }
+        cmd = coding_agent_smoke_command_for_harness(harness, model)
+        return {
+            **binary,
+            "available": True,
+            "cmd": cmd,
+            "message": "",
+        }
 
     if harness == "claude" and not configured:
         binary = _code_editor_binary_status(harness)
@@ -4549,7 +4606,13 @@ def _initial_harness_matrix_snapshot(
                 "matrix_id": matrix_id,
                 "harness": h.id,
                 "requested_model": h.model or "",
-                "model_selection_mode": "locked_config" if h.id == "zcode" else "cli_flag",
+                "model_selection_mode": (
+                    "locked_config"
+                    if h.id == "zcode"
+                    else "config_overlay"
+                    if h.id == "deepseek"
+                    else "cli_flag"
+                ),
                 "status": "pending",
                 "outcome_class": "",
                 "terminal_status": "",

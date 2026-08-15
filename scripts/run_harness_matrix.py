@@ -26,7 +26,7 @@ def main(argv: list[str] | None = None) -> int:
         action="append",
         choices=CODING_HARNESSES,
         default=[],
-        help="Harness to run. Repeatable. Defaults to all six harnesses.",
+        help="Harness to run. Repeatable. Defaults to all named harnesses.",
     )
     parser.add_argument(
         "--model",

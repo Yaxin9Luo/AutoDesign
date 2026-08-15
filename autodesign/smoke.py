@@ -19545,6 +19545,7 @@ def check_external_designer_author_no_api() -> None:
         "AUTODESIGN_DESIGNER_AUTHOR_MAX_ATTEMPTS",
         "AUTODESIGN_DESIGNER_AUTHOR_POSTER_STABLE_SECONDS",
         "AUTODESIGN_DESIGNER_AUTHOR_CLAUDE_BIN",
+        "AUTODESIGN_DESIGNER_AUTHOR_DEEPSEEK_BIN",
         "AUTODESIGN_DESIGNER_AUTHOR_OPENCODE_BIN",
         "AUTODESIGN_DESIGNER_AUTHOR_OPENCODE_SKIP_PERMISSIONS",
         "AUTODESIGN_DESIGNER_AUTHOR_KIMI_BIN",
@@ -19554,7 +19555,9 @@ def check_external_designer_author_no_api() -> None:
         "AUTODESIGN_DESIGNER_AUTHOR_ZCODE_MODE",
         "AUTODESIGN_DESIGNER_AUTHOR_ZCODE_CMD",
         "AUTODESIGN_CODE_EDITOR_CLAUDE_BIN",
+        "AUTODESIGN_CODE_EDITOR_DEEPSEEK_BIN",
         "DESIGN_ANYTHING_IDENTITY_LOGO_AGENT_CLAUDE_BIN",
+        "DESIGN_ANYTHING_IDENTITY_LOGO_AGENT_DEEPSEEK_BIN",
         "MAX_CRITIQUE_ITERS",
     ]
     old_env = {key: os.environ.get(key) for key in env_keys}
@@ -19635,6 +19638,48 @@ def check_external_designer_author_no_api() -> None:
             identity_logo_agent_command_for_harness("claude", model="sonnet"),
             "fake-logo-claude",
         )
+
+        os.environ["AUTODESIGN_DESIGNER_AUTHOR_HARNESS"] = "dsh"
+        os.environ["AUTODESIGN_DESIGNER_AUTHOR_MODEL"] = "deepseek-v4-pro"
+        os.environ["AUTODESIGN_DESIGNER_AUTHOR_DEEPSEEK_BIN"] = "fake-dsh"
+        parsed_deepseek = load_settings()
+        if parsed_deepseek.designer_author_harness != "deepseek":
+            _fail(
+                "deepseek designer author harness did not parse: "
+                f"{parsed_deepseek.designer_author_harness}"
+            )
+        deepseek_parts = shlex.split(parsed_deepseek.designer_author_cmd)
+        for needle in (
+            "deepseek_harness_agent.py",
+            "--dsh-bin",
+            "fake-dsh",
+            "--prompt-file",
+            "designer_author_prompt.md",
+            "--target-file",
+            "poster.html",
+            "--done-file",
+            "designer_author_done.json",
+            "--model",
+            "deepseek-v4-pro",
+        ):
+            if not any(needle in part for part in deepseek_parts):
+                _fail(f"deepseek designer author command missed {needle!r}: {deepseek_parts}")
+
+        os.environ["AUTODESIGN_CODE_EDITOR_DEEPSEEK_BIN"] = "fake-editor-dsh"
+        deepseek_editor_parts = shlex.split(
+            code_editor_command_for_harness("deepseek", model="deepseek-v4-flash")
+        )
+        for needle in ("fake-editor-dsh", "edit_prompt.md", "poster.html", "code_editor_done.json"):
+            if needle not in deepseek_editor_parts:
+                _fail(f"deepseek code editor command missed {needle!r}: {deepseek_editor_parts}")
+
+        os.environ["DESIGN_ANYTHING_IDENTITY_LOGO_AGENT_DEEPSEEK_BIN"] = "fake-logo-dsh"
+        deepseek_logo_parts = shlex.split(
+            identity_logo_agent_command_for_harness("deepseek", model="deepseek-v4-flash")
+        )
+        for needle in ("fake-logo-dsh", "identity_logo_prompt.md", "identity_logo_candidates.json"):
+            if needle not in deepseek_logo_parts:
+                _fail(f"deepseek identity logo command missed {needle!r}: {deepseek_logo_parts}")
 
         os.environ["AUTODESIGN_DESIGNER_AUTHOR_HARNESS"] = "opencode"
         os.environ["AUTODESIGN_DESIGNER_AUTHOR_MODEL"] = "zhipuai/glm-5.2"
@@ -25712,9 +25757,14 @@ def check_harness_matrix_no_api() -> None:
     out_root.mkdir(parents=True, exist_ok=True)
 
     capabilities = build_coding_harness_capabilities(None)
-    for harness in ("codex", "claude", "opencode", "kimi", "mimo", "zcode"):
+    for harness in ("codex", "claude", "deepseek", "opencode", "kimi", "mimo", "zcode"):
         if harness not in capabilities:
             _fail(f"harness capability missing: {harness}")
+    if capabilities["deepseek"]["model_selection_mode"] != "config_overlay":
+        _fail(
+            "deepseek model selection should use an invocation-local overlay: "
+            f"{capabilities['deepseek']}"
+        )
     if capabilities["zcode"]["model_selection_mode"] != "locked_config":
         _fail(f"zcode model selection should use locked config: {capabilities['zcode']}")
     if capabilities["kimi"]["model_selection_mode"] != "cli_flag":
