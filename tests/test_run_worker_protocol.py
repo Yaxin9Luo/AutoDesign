@@ -478,7 +478,11 @@ class RunWorkerProtocolTests(unittest.TestCase):
     def test_settings_json_round_trip_preserves_paths_headers_and_models(self) -> None:
         with tempfile.TemporaryDirectory() as raw_tmp:
             root = Path(raw_tmp)
-            settings = _settings(root)
+            settings = replace(
+                _settings(root),
+                allow_private_network=False,
+                allow_remote_image_urls=False,
+            )
             request = PipelineWorkerRequest(
                 job_kind="pipeline",
                 run_id="round-trip",
@@ -499,6 +503,8 @@ class RunWorkerProtocolTests(unittest.TestCase):
             self.assertEqual(decoded.settings.anthropic_custom_headers, settings.anthropic_custom_headers)
             self.assertEqual(decoded.settings.designer_model, "designer/model:v1")
             self.assertEqual(decoded.settings.code_editor_model, "editor/model")
+            self.assertFalse(decoded.settings.allow_private_network)
+            self.assertFalse(decoded.settings.allow_remote_image_urls)
             self.assertEqual(
                 set(asdict(decoded.settings)),
                 {field.name for field in fields(Settings)},
