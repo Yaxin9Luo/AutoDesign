@@ -34,6 +34,7 @@ import socket
 import subprocess
 import sys
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlsplit
@@ -56,6 +57,14 @@ _CODEX_CONFIGURED_BINARY_ENV_KEYS: tuple[str, ...] = (
     "AUTODESIGN_DESIGNER_AUTHOR_CODEX_BIN",
     "DESIGN_ANYTHING_DESIGNER_AUTHOR_CODEX_BIN",
     "DESIGN_ANYTHING_PLANNER_AUTHOR_CODEX_BIN",
+)
+
+_DEEPSEEK_CONFIGURED_BINARY_ENV_KEYS: tuple[str, ...] = (
+    "AUTODESIGN_CODE_EDITOR_DEEPSEEK_BIN",
+    "DESIGN_ANYTHING_CODE_EDITOR_DEEPSEEK_BIN",
+    "AUTODESIGN_DESIGNER_AUTHOR_DEEPSEEK_BIN",
+    "DESIGN_ANYTHING_DESIGNER_AUTHOR_DEEPSEEK_BIN",
+    "DESIGN_ANYTHING_PLANNER_AUTHOR_DEEPSEEK_BIN",
 )
 
 _PROXY_ENV_NAMES: tuple[str, ...] = (
@@ -154,10 +163,10 @@ ProviderChoice = Literal["auto", "anthropic", "openai_compat"]
 ImageProviderChoice = Literal["auto", "gemini", "openrouter", "openai_compat"]
 SectionNumberPolicy = Literal["renumber", "strip", "preserve"]
 DesignerAuthorMode = Literal["internal", "external"]
-DesignerAuthorHarness = Literal["custom", "codex", "claude", "opencode", "kimi", "mimo", "pi", "zcode"]
-CodeEditorHarness = Literal["custom", "codex", "claude", "opencode", "kimi", "mimo", "pi", "zcode"]
+DesignerAuthorHarness = Literal["custom", "codex", "claude", "deepseek", "opencode", "kimi", "mimo", "pi", "zcode"]
+CodeEditorHarness = Literal["custom", "codex", "claude", "deepseek", "opencode", "kimi", "mimo", "pi", "zcode"]
 IdentityLogoAgentMode = Literal["auto", "off", "required"]
-IdentityLogoAgentHarness = Literal["custom", "codex", "claude", "opencode", "kimi", "mimo", "pi", "zcode"]
+IdentityLogoAgentHarness = Literal["custom", "codex", "claude", "deepseek", "opencode", "kimi", "mimo", "pi", "zcode"]
 OpenResearchSubmitterMode = Literal["off", "custom"]
 
 POSTER_HARNESS_MODES = frozenset({"cheap", "standard", "quality", "dogfood"})
@@ -398,6 +407,8 @@ def resolve_harness_binary(harness: str) -> str | None:
     if harness == "codex":
         candidates = codex_binary_candidates()
         return str(candidates[0]["binary"]) if candidates else None
+    if harness == "deepseek":
+        return shutil.which("dsh")
     return shutil.which(harness)
 
 
@@ -532,6 +543,95 @@ def resolve_codex_runtime(*, required: tuple[str, ...] = ()) -> dict[str, Any]:
     }
 
 
+@lru_cache(maxsize=8)
+def inspect_deepseek_harness_binary(binary: str) -> dict[str, Any]:
+    """Probe a DSH executable for the released non-interactive profile."""
+
+    version = ""
+    help_text = ""
+    errors: list[str] = []
+    for command, output_key in (
+        ([binary, "--version"], "version"),
+        ([binary, "--profile", "headless", "--help"], "headless_help"),
+    ):
+        try:
+            completed = subprocess.run(
+                command,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            errors.append(f"{output_key}: {type(exc).__name__}: {exc}")
+            continue
+        output = ((completed.stdout or "") + (completed.stderr or "")).strip()
+        if completed.returncode != 0:
+            errors.append(f"{output_key}: exit {completed.returncode}")
+            continue
+        if output_key == "version":
+            version = output.splitlines()[0] if output else ""
+        else:
+            help_text = output
+
+    headless_profile = (
+        "usage: dsh --profile headless" in help_text.lower()
+        and "task" in help_text.lower()
+    )
+    missing = [] if headless_profile else ["--profile headless"]
+    return {
+        "binary": binary,
+        "version": version,
+        "available": bool(version and headless_profile and not errors),
+        "capabilities": {"headless_profile": headless_profile},
+        "missing": missing,
+        "errors": errors,
+    }
+
+
+def resolve_deepseek_harness_runtime(
+    *,
+    configured_env_keys: tuple[str, ...] = _DEEPSEEK_CONFIGURED_BINARY_ENV_KEYS,
+) -> dict[str, Any]:
+    """Select the first configured/PATH DSH with the released headless profile."""
+
+    candidates: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for env_key in configured_env_keys:
+        binary = os.getenv(env_key, "").strip()
+        if binary and binary not in seen:
+            seen.add(binary)
+            candidates.append((binary, "configured"))
+    path_binary = resolve_harness_binary("deepseek")
+    if path_binary and path_binary not in seen:
+        candidates.append((path_binary, "path"))
+
+    rejected: list[dict[str, Any]] = []
+    for binary, source in candidates:
+        details = {**inspect_deepseek_harness_binary(binary), "source": source}
+        if details["available"]:
+            return {**details, "rejected_candidates": rejected}
+        rejected.append(details)
+
+    if rejected:
+        return {
+            **rejected[0],
+            "available": False,
+            "source": "incompatible",
+            "rejected_candidates": rejected,
+        }
+    return {
+        "binary": "dsh",
+        "version": "",
+        "available": False,
+        "source": "missing",
+        "capabilities": {"headless_profile": False},
+        "missing": ["dsh"],
+        "errors": [],
+        "rejected_candidates": [],
+    }
+
+
 def mark_harness_login(harness: str, *, config_dir: Path | None = None) -> None:
     """Record that `harness` has a connected account in its isolated dir.
 
@@ -576,7 +676,7 @@ def harness_subprocess_env(
     api_key: str | None = None,
     config_dir: str | None = None,
 ) -> dict[str, str]:
-    """Build the env for a claude/codex harness subprocess.
+    """Build the env for a managed coding-harness subprocess.
 
     - When `config_dir` is given (e.g. the login endpoint), it is used
       verbatim. Otherwise an isolated `harness_auth_dir` is used iff we are
@@ -584,6 +684,8 @@ def harness_subprocess_env(
     - For claude, when managing auth, strip the gateway env vars (see
       `_CLAUDE_GATEWAY_ENV_VARS`) and inject `ANTHROPIC_API_KEY` when given.
     - For codex, inject `OPENAI_API_KEY` when given.
+    - For DeepSeek Harness, inject `DEEPSEEK_API_KEY` and an isolated
+      `DSH_HOME` when given, while preserving ambient DeepSeek setup otherwise.
     - When we are NOT managing auth (no key, no login, no explicit dir) the
       env is returned unchanged so existing setups keep working.
     """
@@ -610,6 +712,15 @@ def harness_subprocess_env(
     harness = (harness or "").strip().lower()
     api_key = (api_key or "").strip()
     explicit_dir = (config_dir or "").strip()
+    if harness == "deepseek":
+        env.setdefault("DSH_PERMISSION_MODE", "workspace-write")
+        env.setdefault("DSH_TELEMETRY_DISABLED", "1")
+        if api_key:
+            env["DEEPSEEK_API_KEY"] = api_key
+            env["DSH_HOME"] = explicit_dir or str(harness_auth_dir(harness))
+        elif explicit_dir:
+            env["DSH_HOME"] = explicit_dir
+        return env
     if harness not in {"claude", "codex"}:
         return env
 
@@ -691,6 +802,9 @@ def _parse_designer_author_harness(
         "claude": "claude",
         "claude-code": "claude",
         "cloud-code": "claude",
+        "deepseek": "deepseek",
+        "deepseek-harness": "deepseek",
+        "dsh": "deepseek",
         "opencode": "opencode",
         "open-code": "opencode",
         "kimi": "kimi",
@@ -825,6 +939,36 @@ def _kimi_code_agent_command(
     return shlex.join(cmd)
 
 
+def _deepseek_harness_agent_command(
+    *,
+    env_prefix: str | tuple[str, ...],
+    model: str,
+    prompt_file: str,
+    task: str,
+    target_files: list[str],
+    done_file: str = "",
+) -> str:
+    wrapper = REPO_ROOT / "autodesign" / "agents" / "deepseek_harness_agent.py"
+    prefixes = (env_prefix,) if isinstance(env_prefix, str) else env_prefix
+    cmd = [
+        sys.executable,
+        str(wrapper),
+        "--dsh-bin",
+        _resolve_cmd_binary(tuple(f"{prefix}_DEEPSEEK_BIN" for prefix in prefixes), "dsh"),
+        "--prompt-file",
+        prompt_file,
+        "--task",
+        task,
+    ]
+    for target_file in target_files:
+        cmd.extend(["--target-file", target_file])
+    if done_file:
+        cmd.extend(["--done-file", done_file])
+    if model:
+        cmd.extend(["--model", model])
+    return shlex.join(cmd)
+
+
 def _zcode_code_agent_command(
     *,
     env_prefix: str | tuple[str, ...],
@@ -940,6 +1084,24 @@ def _default_model_for_code_harness(harness: str) -> str:
     return ""
 
 
+def coding_agent_smoke_command_for_harness(
+    harness: str | None,
+    model: str | None = None,
+) -> str:
+    """Return a staged-file command for harnesses needing a smoke adapter."""
+
+    resolved_harness = _parse_designer_author_harness(harness)
+    if resolved_harness != "deepseek":
+        return ""
+    return _deepseek_harness_agent_command(
+        env_prefix=("AUTODESIGN_CODE_EDITOR", "DESIGN_ANYTHING_CODE_EDITOR"),
+        model=(model or "").strip(),
+        prompt_file="coding_agent_smoke_prompt.md",
+        task="AutoDesign coding-agent smoke test",
+        target_files=["coding_agent_smoke_output.json"],
+    )
+
+
 def designer_author_command_for_harness(
     harness: str | None,
     model: str | None = None,
@@ -988,6 +1150,19 @@ def designer_author_command_for_harness(
                 "claude",
             ),
             model=model,
+        )
+    if resolved_harness == "deepseek":
+        return _deepseek_harness_agent_command(
+            env_prefix=(
+                "AUTODESIGN_DESIGNER_AUTHOR",
+                "DESIGN_ANYTHING_DESIGNER_AUTHOR",
+                "DESIGN_ANYTHING_PLANNER_AUTHOR",
+            ),
+            model=model,
+            prompt_file="designer_author_prompt.md",
+            task="AutoDesign external designer-author poster generation",
+            target_files=["poster.html"],
+            done_file="designer_author_done.json",
         )
     if resolved_harness == "opencode":
         wrapper = REPO_ROOT / "autodesign" / "agents" / "opencode_designer_author.py"
@@ -1126,6 +1301,15 @@ def artifact_author_command_for_harness(
         "DESIGN_ANYTHING_DESIGNER_AUTHOR",
         "DESIGN_ANYTHING_PLANNER_AUTHOR",
     )
+    if resolved_harness == "deepseek":
+        return _deepseek_harness_agent_command(
+            env_prefix=env_prefixes,
+            model=resolved_model,
+            prompt_file=prompt_file,
+            task=task,
+            target_files=target_files,
+            done_file="designer_author_done.json",
+        )
     if resolved_harness == "kimi":
         return _kimi_code_agent_command(
             env_prefix=env_prefixes,
@@ -1231,6 +1415,15 @@ def code_editor_command_for_harness(
             ),
             model=model,
         )
+    if resolved_harness == "deepseek":
+        return _deepseek_harness_agent_command(
+            env_prefix=("AUTODESIGN_CODE_EDITOR", "DESIGN_ANYTHING_CODE_EDITOR"),
+            model=model,
+            prompt_file="edit_prompt.md",
+            task="AutoDesign paper-poster code-editor revision",
+            target_files=["poster.html"],
+            done_file="code_editor_done.json",
+        )
     if resolved_harness == "opencode":
         wrapper = REPO_ROOT / "autodesign" / "agents" / "opencode_code_editor.py"
         cmd = [
@@ -1324,6 +1517,14 @@ def identity_logo_agent_command_for_harness(
         return _claude_prompt_file_command(
             _resolve_cmd_binary("DESIGN_ANYTHING_IDENTITY_LOGO_AGENT_CLAUDE_BIN", "claude"),
             model=model,
+        )
+    if resolved_harness == "deepseek":
+        return _deepseek_harness_agent_command(
+            env_prefix="DESIGN_ANYTHING_IDENTITY_LOGO_AGENT",
+            model=model,
+            prompt_file="identity_logo_prompt.md",
+            task="AutoDesign identity-logo candidate discovery",
+            target_files=["identity_logo_candidates.json"],
         )
     if resolved_harness == "opencode":
         wrapper = REPO_ROOT / "autodesign" / "agents" / "opencode_identity_logo_agent.py"

@@ -37,7 +37,7 @@ type AuthStatusCheck = {
 };
 
 const CODING_HARNESSES: Array<{
-  id: Extract<CodingHarness, "codex" | "claude" | "opencode" | "pi">;
+  id: Extract<CodingHarness, "codex" | "claude" | "deepseek" | "opencode" | "pi">;
   label: string;
   detail: string;
 }> = [
@@ -50,6 +50,11 @@ const CODING_HARNESSES: Array<{
     id: "claude",
     label: "Claude Code",
     detail: "Uses the claude CLI with bypass permissions.",
+  },
+  {
+    id: "deepseek",
+    label: "DeepSeek Harness",
+    detail: "Uses the official DSH CLI in released headless mode.",
   },
   {
     id: "opencode",
@@ -771,6 +776,7 @@ function HarnessesTab({
   };
 
   const supportsAccount = selectedHarness === "claude" || selectedHarness === "codex";
+  const supportsHarnessKey = supportsAccount || selectedHarness === "deepseek";
 
   useEffect(() => {
     if (!supportsAccount) {
@@ -941,7 +947,7 @@ function HarnessesTab({
         </label>
       )}
 
-      {supportsAccount && (
+      {supportsHarnessKey && (
         <label className="mt-3 block rounded-md border border-ink-300/70 bg-surface-raised p-4">
           <span className="eyebrow text-ink-400">{t("Harness API key")}</span>
           <div className="mt-2 flex items-center gap-2">
@@ -964,7 +970,9 @@ function HarnessesTab({
             </button>
           </div>
           <p className="mt-2 text-[11px] leading-relaxed text-ink-500">
-            {t("Optional. Pay-per-token API key for the coding agent CLI (claude → ANTHROPIC_API_KEY, codex → OPENAI_API_KEY). Leave blank to use a connected account below.")}
+            {selectedHarness === "deepseek"
+              ? t("Optional. Passed to DeepSeek Harness as DEEPSEEK_API_KEY. Leave blank to use the backend environment.")
+              : t("Optional. Pay-per-token API key for the coding agent CLI (claude → ANTHROPIC_API_KEY, codex → OPENAI_API_KEY). Leave blank to use a connected account below.")}
           </p>
         </label>
       )}
@@ -997,7 +1005,7 @@ function HarnessesTab({
           <div className="mt-2 grid grid-cols-2 gap-3">
             <div>
               <p className="text-[10px] uppercase tracking-[0.12em] text-ink-400">
-                {t("Codex CLI")}
+                {t("Coding agent CLI")}
               </p>
               <p className={`mt-1 text-[11px] ${environment?.coding_agent.ready === false ? "text-amber-900" : "text-ink-800"}`}>
                 {environment
@@ -1146,6 +1154,8 @@ function defaultHarnessModelLabel(harness: CodingHarness): string {
       return "Codex default GPT";
     case "claude":
       return "Claude Code default";
+    case "deepseek":
+      return "DeepSeek Harness default";
     case "opencode":
       return "OpenCode CLI default";
     case "kimi":
@@ -1165,6 +1175,8 @@ function harnessCardDescription(harness: CodingHarness): string {
       return "Codex with selectable GPT model";
     case "claude":
       return "Claude Code with selectable Claude model";
+    case "deepseek":
+      return "Official DeepSeek Harness with selectable DeepSeek model";
     case "opencode":
       return "OpenCode with custom model id";
     case "kimi":
@@ -1184,6 +1196,8 @@ function modelOptionsForHarness(harness: CodingHarness): string[] {
       return ["gpt-5.4", "gpt-5.4-nano", "gpt-5.5", "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"];
     case "claude":
       return ["claude-opus-4-8", "claude-opus-4-7", "claude-sonnet-4-6", "claude-haiku-4-5"];
+    case "deepseek":
+      return ["deepseek-v4-flash", "deepseek-v4-pro"];
     default:
       return [];
   }
@@ -1293,6 +1307,8 @@ function missingCommandNextAction(
       return t("Next: install Claude Code and put claude on PATH.");
     case "opencode":
       return t("Next: install OpenCode and put opencode on PATH.");
+    case "deepseek":
+      return t("Next: install or upgrade DeepSeek Harness with npm install -g @deepseek-ai/dsh@latest, then restart AutoDesign.");
     case "pi":
       return t("Next: install Pi and put pi on PATH.");
     default:

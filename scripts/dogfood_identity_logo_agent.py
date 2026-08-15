@@ -65,7 +65,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--identity-logo-agent-harness",
-        choices=("custom", "codex", "claude", "opencode", "kimi", "mimo", "zcode"),
+        choices=("custom", "codex", "claude", "deepseek", "opencode", "kimi", "mimo", "zcode"),
         default=None,
         help="Coding-agent harness used for missing logos.",
     )

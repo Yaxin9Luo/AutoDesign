@@ -5,11 +5,23 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from autodesign.harness_matrix import classify_run_dir
+from autodesign.harness_matrix import (
+    CODING_HARNESSES,
+    HarnessMatrixCellSpec,
+    _normalize_cell_spec,
+    classify_run_dir,
+)
 from autodesign.util.io import sha256_file
 
 
 class HarnessMatrixClassificationTests(unittest.TestCase):
+    def test_deepseek_is_a_named_matrix_harness_with_dsh_alias(self) -> None:
+        self.assertIn("deepseek", CODING_HARNESSES)
+        self.assertEqual(
+            _normalize_cell_spec(HarnessMatrixCellSpec("dsh")).harness,
+            "deepseek",
+        )
+
     def test_fallback_manifest_must_match_final_poster_bytes(self) -> None:
         cases = ("missing_final", "missing_hash", "mismatched_hash")
         for case in cases:

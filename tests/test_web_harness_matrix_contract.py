@@ -16,6 +16,133 @@ from scripts.web_server import HarnessMatrixRequest
 
 
 class WebHarnessMatrixContractTests(unittest.TestCase):
+    def _write_fake_dsh(self, root: Path, *, compatible: bool = True) -> Path:
+        root.mkdir(parents=True, exist_ok=True)
+        binary = root / "dsh"
+        binary.write_text(
+            "#!/bin/sh\n"
+            "if [ \"${1:-}\" = \"--version\" ]; then\n"
+            f"  echo '{'0.1.0-rc.6' if compatible else '0.0.1'}'\n"
+            "  exit 0\n"
+            "fi\n"
+            "if [ \"${1:-}\" = \"--profile\" ] && "
+            "[ \"${2:-}\" = \"headless\" ] && [ \"${3:-}\" = \"--help\" ]; then\n"
+            + (
+                "  echo 'Usage: dsh --profile headless [options] [task...]'\n"
+                "  echo 'Answer one task, print the final assistant message, and exit.'\n"
+                if compatible
+                else "  echo 'Usage: dsh [options] [command]'\n"
+            )
+            + "  exit 0\n"
+            "fi\n"
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        binary.chmod(0o755)
+        return binary
+
+    def test_deepseek_runtime_distinguishes_released_and_preview_cli(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            root = Path(raw_tmp)
+            released = self._write_fake_dsh(root / "released", compatible=True)
+            preview = self._write_fake_dsh(root / "preview", compatible=False)
+
+            released_result = config.inspect_deepseek_harness_binary(str(released))
+            preview_result = config.inspect_deepseek_harness_binary(str(preview))
+
+        self.assertTrue(released_result["available"])
+        self.assertEqual(released_result["version"], "0.1.0-rc.6")
+        self.assertTrue(released_result["capabilities"]["headless_profile"])
+        self.assertFalse(preview_result["available"])
+        self.assertEqual(preview_result["version"], "0.0.1")
+        self.assertIn("--profile headless", preview_result["missing"])
+
+    def test_deepseek_capability_and_web_resolvers_use_configured_released_cli(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            root = Path(raw_tmp)
+            binary = self._write_fake_dsh(root, compatible=True)
+            settings = SimpleNamespace(
+                designer_author_harness="deepseek",
+                designer_author_model="deepseek-v4-pro",
+                designer_author_cmd="",
+                code_editor_harness="deepseek",
+                code_editor_model="deepseek-v4-pro",
+                code_editor_cmd="",
+            )
+            with patch.dict(
+                os.environ,
+                {
+                    "PATH": "",
+                    "AUTODESIGN_DESIGNER_AUTHOR_DEEPSEEK_BIN": str(binary),
+                    "AUTODESIGN_CODE_EDITOR_DEEPSEEK_BIN": str(binary),
+                },
+                clear=True,
+            ):
+                capability = build_coding_harness_capabilities(settings)["deepseek"]
+                author = web_server._paper_poster_author_cmd_resolution(settings)
+                editor = web_server._code_editor_cmd_resolution(settings)
+                smoke = web_server._coding_agent_smoke_cmd_resolution(settings)
+
+        self.assertTrue(capability["available"])
+        self.assertEqual(capability["binary"], str(binary))
+        self.assertEqual(capability["binary_version"], "0.1.0-rc.6")
+        self.assertEqual(capability["model_selection_mode"], "config_overlay")
+        self.assertTrue(capability["capabilities"]["headless_profile"])
+        for resolution in (author, editor, smoke):
+            self.assertTrue(resolution["available"], resolution)
+            self.assertEqual(resolution["binary_version"], "0.1.0-rc.6")
+            self.assertIn(str(binary), resolution["cmd"])
+        self.assertIn("coding_agent_smoke_prompt.md", smoke["cmd"])
+        self.assertIn("coding_agent_smoke_output.json", smoke["cmd"])
+
+    def test_deepseek_preview_cli_is_reported_as_incompatible(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            binary = self._write_fake_dsh(Path(raw_tmp), compatible=False)
+            settings = SimpleNamespace(
+                designer_author_harness="deepseek",
+                designer_author_model=None,
+                designer_author_cmd="",
+                code_editor_harness="deepseek",
+                code_editor_model=None,
+                code_editor_cmd="",
+            )
+            with patch.dict(
+                os.environ,
+                {
+                    "PATH": "",
+                    "AUTODESIGN_DESIGNER_AUTHOR_DEEPSEEK_BIN": str(binary),
+                    "AUTODESIGN_CODE_EDITOR_DEEPSEEK_BIN": str(binary),
+                },
+                clear=True,
+            ):
+                capability = build_coding_harness_capabilities(settings)["deepseek"]
+                smoke = web_server._coding_agent_smoke_cmd_resolution(settings)
+
+        self.assertFalse(capability["available"])
+        self.assertEqual(capability["binary_source"], "incompatible")
+        self.assertEqual(capability["binary_version"], "0.0.1")
+        self.assertFalse(smoke["available"])
+        self.assertEqual(smoke["source"], "incompatible")
+        self.assertIn("npm install -g @deepseek-ai/dsh@latest", smoke["message"])
+
+    def test_web_matrix_request_accepts_deepseek_with_overlay_metadata(self) -> None:
+        request = HarnessMatrixRequest(
+            paper_path="paper.pdf",
+            prompt="Create a poster.",
+            harnesses=[{"id": "deepseek", "model": "deepseek-v4-pro"}],
+        )
+
+        snapshot = web_server._initial_harness_matrix_snapshot(
+            "matrix-deepseek",
+            request,
+            matrix_dir=Path("matrix-deepseek"),
+        )
+
+        self.assertEqual(snapshot["rows"][0]["harness"], "deepseek")
+        self.assertEqual(snapshot["rows"][0]["model_selection_mode"], "config_overlay")
+
     def test_missing_codex_does_not_advertise_a_bare_command_template(self) -> None:
         with (
             patch.dict(os.environ, {"PATH": ""}, clear=True),

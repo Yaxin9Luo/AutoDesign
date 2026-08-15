@@ -6,6 +6,9 @@ from pathlib import Path
 import subprocess
 import sys
 import unittest
+from unittest.mock import patch
+
+from autodesign import config
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -307,6 +310,41 @@ print(json.dumps({key: bool(captured.get(key)) for key in keys}, sort_keys=True)
             msg=f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
         )
         self.assertTrue(all(json.loads(completed.stdout).values()))
+
+    def test_deepseek_harness_key_uses_isolated_home_and_preserves_base_url(self) -> None:
+        auth_dir = Path("/tmp/autodesign-deepseek-auth")
+        with patch.object(config, "harness_auth_dir", return_value=auth_dir):
+            child_env = config.harness_subprocess_env(
+                {
+                    "DEEPSEEK_BASE_URL": "https://api.deepseek.example/v1",
+                    "DEEPSEEK_API_KEY": "ambient-key",
+                },
+                harness="deepseek",
+                api_key="explicit-key",
+            )
+
+        self.assertEqual(child_env["DEEPSEEK_API_KEY"], "explicit-key")
+        self.assertEqual(child_env["DEEPSEEK_BASE_URL"], "https://api.deepseek.example/v1")
+        self.assertEqual(child_env["DSH_HOME"], str(auth_dir))
+        self.assertEqual(child_env["DSH_PERMISSION_MODE"], "workspace-write")
+        self.assertEqual(child_env["DSH_TELEMETRY_DISABLED"], "1")
+
+    def test_deepseek_harness_without_explicit_key_preserves_ambient_setup(self) -> None:
+        child_env = config.harness_subprocess_env(
+            {
+                "DEEPSEEK_API_KEY": "ambient-key",
+                "DEEPSEEK_BASE_URL": "https://api.deepseek.example/v1",
+                "DSH_HOME": "/tmp/existing-dsh-home",
+                "DSH_PERMISSION_MODE": "danger-full-access",
+                "DSH_TELEMETRY_DISABLED": "custom",
+            },
+            harness="deepseek",
+        )
+
+        self.assertEqual(child_env["DEEPSEEK_API_KEY"], "ambient-key")
+        self.assertEqual(child_env["DSH_HOME"], "/tmp/existing-dsh-home")
+        self.assertEqual(child_env["DSH_PERMISSION_MODE"], "danger-full-access")
+        self.assertEqual(child_env["DSH_TELEMETRY_DISABLED"], "custom")
 
     def test_utility_env_reads_use_canonical_precedence(self) -> None:
         script = r"""
