@@ -4,10 +4,12 @@
   <a href="./README.ko.md">한국어</a>
 </p>
 
-<p align="center">
-  <sub><strong>动态</strong></sub><br>
-  <sub><strong>2026-08-15</strong> · <a href="https://github.com/Yaxin9Luo/AutoDesign/pull/2">正式支持 DeepSeek Harness 作为 Coding Agent</a> &nbsp;·&nbsp; <strong>2026-08-14</strong> · <a href="https://github.com/Yaxin9Luo/AutoDesign/commit/55586f66fa4a126997f0d252e070701c4ae68920">首次公开发布</a></sub>
-</p>
+### 动态
+
+| 日期 | 更新 |
+| :--- | :--- |
+| **2026-08-15** | [正式支持 DeepSeek Harness 作为 Coding Agent](https://github.com/Yaxin9Luo/AutoDesign/pull/2) |
+| **2026-08-14** | [首次公开发布](https://github.com/Yaxin9Luo/AutoDesign/commit/55586f66fa4a126997f0d252e070701c4ae68920) |
 
 <p align="center">
   <img src="./assets/readme/hero-research-product.zh-CN.webp" width="100%" alt="AutoDesign 围绕固定模型优化设计系统，并生成可编辑的海报、幻灯片、网页和视频">
