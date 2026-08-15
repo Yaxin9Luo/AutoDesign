@@ -48,6 +48,18 @@ uv sync --extra ocr
 - [`benchmark_manifest.jsonl`](benchmark_manifest.jsonl) — 标题、作者、标识符、官方落地页、访问策略和预期 SHA-256
 - [`small_subset_ids.json`](small_subset_ids.json) — 每个学科固定两篇、共 10 篇的子集
 
+同一份仅含元数据的 release 也已发布到 Hugging Face，可直接加载：
+
+```python
+from datasets import load_dataset
+
+posterbench = load_dataset("YaxinLuo/PosterBench", split="test")
+posterbench_mini = load_dataset("YaxinLuo/PosterBench-mini", split="test")
+```
+
+dataset repository 的许可证只覆盖 benchmark 元数据、benchmark 专用标注和文档，
+不授予底层论文的任何权利，也不会重新分发论文内容。
+
 无需访问网络，即可用下载器验证 Manifest 并检查本地语料：
 
 ```bash

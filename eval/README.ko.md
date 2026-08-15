@@ -48,6 +48,19 @@ Judge 경로에 필요한 제공자 자격 증명을 설정하세요. 지원되�
 - [`benchmark_manifest.jsonl`](benchmark_manifest.jsonl) — 제목, 저자, 식별자, 공식 랜딩 페이지, 접근 정책, 예상 SHA-256
 - [`small_subset_ids.json`](small_subset_ids.json) — 분야별 두 편으로 고정된 10편 하위 집합
 
+동일한 메타데이터 전용 release를 Hugging Face에서도 직접 불러올 수 있습니다.
+
+```python
+from datasets import load_dataset
+
+posterbench = load_dataset("YaxinLuo/PosterBench", split="test")
+posterbench_mini = load_dataset("YaxinLuo/PosterBench-mini", split="test")
+```
+
+dataset repository의 라이선스는 benchmark 메타데이터, benchmark 전용 주석,
+문서에만 적용됩니다. 원문 논문에 대한 권리를 부여하거나 논문 콘텐츠를
+재배포하지 않습니다.
+
 네트워크 요청 없이 다운로드 도구로 Manifest를 검증하고 로컬 코퍼스를 확인할 수 있습니다.
 
 ```bash

@@ -16,6 +16,10 @@
 
 <p align="center">
   <a href="https://arxiv.org/abs/2608.13560"><kbd>논문 · arXiv:2608.13560 ↗</kbd></a>
+  &nbsp;&nbsp;·&nbsp;&nbsp;
+  <a href="https://huggingface.co/datasets/YaxinLuo/PosterBench"><kbd>데이터셋 · PosterBench ↗</kbd></a>
+  &nbsp;&nbsp;·&nbsp;&nbsp;
+  <a href="https://huggingface.co/datasets/YaxinLuo/PosterBench-mini"><kbd>데이터셋 · PosterBench-mini ↗</kbd></a>
 </p>
 
 <p align="center">
@@ -274,6 +278,12 @@ A1에서 잘린 분석 영역을 찾고, A3는 전체 fit을 복원하며, A5는
 ## <img src="./assets/readme/icons/trophy.svg" width="26" alt="" align="absmiddle"> PosterBench 리더보드
 
 **PosterBench**는 논문 100편의 대규모 세트와 고정된 논문 10편의 소규모 세트를 포함합니다. AI/ML, 생의학과 건강, 기후와 지구 환경, 경제와 정책, 물리와 천문학의 다섯 분야를 다루며, 모든 시스템 출력은 채점 전에 공통 포스터 형식으로 렌더링됩니다.
+
+메타데이터 전용 benchmark manifest는 Hugging Face의
+[`YaxinLuo/PosterBench`](https://huggingface.co/datasets/YaxinLuo/PosterBench)와
+[`YaxinLuo/PosterBench-mini`](https://huggingface.co/datasets/YaxinLuo/PosterBench-mini)에
+공개되어 있습니다. 원문 논문 PDF를 재배포하지 않고 직접 다운로드하거나
+`datasets`로 불러올 수 있습니다.
 
 일곱 차원은 **Faithfulness, Coverage, Density, Visual Evidence, Layout, Readability, Aesthetics**이며 가중치는 **10/10/15/10/20/25/10**입니다. 프로그램 기반 근거와 원문 조건부 VLM 판단을 먼저 집계한 다음, 심각한 레이아웃 손상, 부족한 presentation viability, 확인된 가시적 실패, 보호된 render integrity 가운데 가장 엄격한 활성 점수 상한을 각 포스터에 적용합니다.
 

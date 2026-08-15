@@ -16,6 +16,10 @@
 
 <p align="center">
   <a href="https://arxiv.org/abs/2608.13560"><kbd>论文 · arXiv:2608.13560 ↗</kbd></a>
+  &nbsp;&nbsp;·&nbsp;&nbsp;
+  <a href="https://huggingface.co/datasets/YaxinLuo/PosterBench"><kbd>数据集 · PosterBench ↗</kbd></a>
+  &nbsp;&nbsp;·&nbsp;&nbsp;
+  <a href="https://huggingface.co/datasets/YaxinLuo/PosterBench-mini"><kbd>数据集 · PosterBench-mini ↗</kbd></a>
 </p>
 
 <p align="center">
@@ -270,6 +274,12 @@ Human-in-the-loop 指导是可选的。用户可以向 planner 提供观察或�
 ## <img src="./assets/readme/icons/trophy.svg" width="26" alt="" align="absmiddle"> PosterBench 排行榜
 
 **PosterBench** 包含 100 篇论文的大规模集合和固定的 10 篇论文小规模集合，覆盖 AI/ML、生物医学与健康、气候与地球环境、经济与政策、物理与天文五个学科。所有系统的输出都会先被渲染为统一海报格式再评分。
+
+仅包含元数据的 benchmark manifest 已发布到 Hugging Face：
+[`YaxinLuo/PosterBench`](https://huggingface.co/datasets/YaxinLuo/PosterBench)
+和
+[`YaxinLuo/PosterBench-mini`](https://huggingface.co/datasets/YaxinLuo/PosterBench-mini)。
+用户可以直接下载或通过 `datasets` 加载，底层论文 PDF 不会被重新分发。
 
 七个维度为 **Faithfulness、Coverage、Density、Visual Evidence、Layout、Readability、Aesthetics**，权重依次为 **10/10/15/10/20/25/10**。程序化证据与基于原文的 VLM 判断先完成聚合，然后对每张海报应用最严格的有效分数上限：严重布局损坏、展示可用性不足、已确认的可见失败，或受保护的渲染完整性。
 

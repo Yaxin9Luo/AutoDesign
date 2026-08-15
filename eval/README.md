@@ -65,6 +65,20 @@ The repository publishes metadata for the 100-paper benchmark and the fixed
 - [`small_subset_ids.json`](small_subset_ids.json) — the fixed two-per-discipline
   10-paper subset
 
+The same metadata-only releases are available from Hugging Face and can be
+loaded directly:
+
+```python
+from datasets import load_dataset
+
+posterbench = load_dataset("YaxinLuo/PosterBench", split="test")
+posterbench_mini = load_dataset("YaxinLuo/PosterBench-mini", split="test")
+```
+
+The dataset repository license covers only the benchmark metadata,
+benchmark-specific annotations, and documentation. It does not grant rights in
+or redistribute the underlying papers.
+
 Use the downloader to validate the manifests and inspect your local corpus
 without making network requests:
 

@@ -16,6 +16,10 @@
 
 <p align="center">
   <a href="https://arxiv.org/abs/2608.13560"><kbd>Paper · arXiv:2608.13560 ↗</kbd></a>
+  &nbsp;&nbsp;·&nbsp;&nbsp;
+  <a href="https://huggingface.co/datasets/YaxinLuo/PosterBench"><kbd>Dataset · PosterBench ↗</kbd></a>
+  &nbsp;&nbsp;·&nbsp;&nbsp;
+  <a href="https://huggingface.co/datasets/YaxinLuo/PosterBench-mini"><kbd>Dataset · PosterBench-mini ↗</kbd></a>
 </p>
 
 <p align="center">
@@ -322,6 +326,13 @@ valid layout and source-derived content survive across revisions.
 across AI/ML, biomedicine and health, climate and earth environment, economics
 and policy, and physics and astronomy. Every output is rendered to a common
 poster format before scoring.
+
+The metadata-only manifests are released on Hugging Face as
+[`YaxinLuo/PosterBench`](https://huggingface.co/datasets/YaxinLuo/PosterBench)
+and
+[`YaxinLuo/PosterBench-mini`](https://huggingface.co/datasets/YaxinLuo/PosterBench-mini).
+They can be downloaded or loaded directly with `datasets` without
+redistributing the underlying paper PDFs.
 
 The seven dimensions are **Faithfulness, Coverage, Density, Visual Evidence,
 Layout, Readability, and Aesthetics**, weighted
