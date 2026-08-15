@@ -5,6 +5,11 @@
 </p>
 
 <p align="center">
+  <sub><strong>NEWS</strong></sub><br>
+  <sub><strong>2026-08-15</strong> · <a href="https://github.com/Yaxin9Luo/AutoDesign/pull/2">Added official DeepSeek Harness support for coding agents</a> &nbsp;·&nbsp; <strong>2026-08-14</strong> · <a href="https://github.com/Yaxin9Luo/AutoDesign/commit/55586f66fa4a126997f0d252e070701c4ae68920">Initial public release</a></sub>
+</p>
+
+<p align="center">
   <img src="./assets/readme/hero-research-product.webp" width="100%" alt="AutoDesign improves the harness around a fixed model and ships editable posters, slides, webpages, and videos">
 </p>
 
