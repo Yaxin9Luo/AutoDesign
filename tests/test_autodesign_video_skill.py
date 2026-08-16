@@ -234,8 +234,15 @@ def _fake_runtime(
     fail_stage: str = "",
     stale_render: bool = False,
     subtitle_css_override: bool = False,
+    subtitle_effective_opacity: float = 1.0,
+    subtitle_intersection_width: int = 640,
+    subtitle_intersection_height: int = 80,
     control_count: int = 1,
     controls_exercised: int = 1,
+    control_results: list[dict[str, object]] | None = None,
+    quiescence_ms: int = 500,
+    late_activity: list[str] | None = None,
+    pending_timers: int = 0,
 ) -> dict[str, str]:
     bin_dir = root / "fake-bin"
     bin_dir.mkdir(parents=True)
@@ -313,6 +320,35 @@ def _fake_runtime(
     browser = _make_executable(bin_dir / "chrome-headless-shell", "raise SystemExit(0)")
     hidden_display = "block" if subtitle_css_override else "none"
     hidden_extent = 640 if subtitle_css_override else 0
+    fake_control_results = control_results
+    if fake_control_results is None:
+        fake_control_results = [
+            {
+                "identity": {
+                    "token": f"control-{index + 1}",
+                    "tag": "button",
+                    "id": "",
+                    "type": "button",
+                    "role": "",
+                    "name": "",
+                    "aria_label": "",
+                    "text": "Control",
+                },
+                "kind": "button",
+                "operation": "click",
+                "result": "ok",
+            }
+            for index in range(control_count)
+        ]
+    fake_checkpoints = [
+        {
+            "label": f"checkpoint-{index + 1}",
+            "waited_ms": quiescence_ms,
+            "pending_timers": pending_timers,
+            "late_activity": list(late_activity or []),
+        }
+        for index in range(control_count + 3)
+    ]
     node = _make_executable(
         bin_dir / "node",
         """
@@ -327,14 +363,27 @@ def _fake_runtime(
           'after_second_click': {'aria_pressed': 'false', 'overlay_hidden': True},
           'computed_states': {
             'initial': {'display': %r, 'visibility': 'visible',
-                        'width': %d, 'height': %d, 'visible': %r},
+                        'width': %d, 'height': %d, 'visible': %r,
+                        'effective_opacity': %r,
+                        'intersection_width': %d, 'intersection_height': %d},
             'after_first_click': {'display': 'block', 'visibility': 'visible',
-                                  'width': 640, 'height': 80, 'visible': True},
+                                  'width': 640, 'height': 80, 'visible': True,
+                                  'effective_opacity': %r,
+                                  'intersection_width': %d, 'intersection_height': %d},
             'after_second_click': {'display': %r, 'visibility': 'visible',
-                                   'width': %d, 'height': %d, 'visible': %r},
+                                   'width': %d, 'height': %d, 'visible': %r,
+                                   'effective_opacity': %r,
+                                   'intersection_width': %d, 'intersection_height': %d},
           },
           'control_count': %d,
           'controls_exercised': %d,
+          'control_results': %r,
+          'quiescence': {
+            'minimum_wait_ms': %d,
+            'checkpoints': %r,
+            'late_activity': %r,
+            'pending_timers': %d,
+          },
           'blocked_requests': [],
           'page_errors': [],
           'cue_count': len(cues),
@@ -348,12 +397,26 @@ def _fake_runtime(
             hidden_extent,
             80 if subtitle_css_override else 0,
             subtitle_css_override,
+            subtitle_effective_opacity,
+            hidden_extent,
+            80 if subtitle_css_override else 0,
+            subtitle_effective_opacity,
+            subtitle_intersection_width,
+            subtitle_intersection_height,
             hidden_display,
             hidden_extent,
             80 if subtitle_css_override else 0,
             subtitle_css_override,
+            subtitle_effective_opacity,
+            hidden_extent,
+            80 if subtitle_css_override else 0,
             control_count,
             controls_exercised,
+            fake_control_results,
+            quiescence_ms,
+            fake_checkpoints,
+            late_activity or [],
+            pending_timers,
         ),
     )
     return {
@@ -795,6 +858,81 @@ class AutoDesignVideoSkillTests(unittest.TestCase):
         self.assertEqual(report["failed_stage"], "browser_preflight")
         self.assertIn("computed", report["error"].lower())
 
+    def test_subtitle_toggle_requires_paint_visible_opacity_and_viewport_intersection(self) -> None:
+        """Catches overlays with valid bounds that are transparent or fully clipped."""
+        harness = self._require(self.harness, HARNESS_PATH)
+        plan = _plan()
+        for label, runtime_options in (
+            ("transparent", {"subtitle_effective_opacity": 0.0}),
+            ("clipped", {"subtitle_intersection_width": 0}),
+        ):
+            with self.subTest(label=label):
+                project = _write_project(self.root / label, plan)
+                runtime = _fake_runtime(
+                    self.root / f"{label}-runtime",
+                    **runtime_options,
+                )
+                report = harness.deliver_project(
+                    project,
+                    plan,
+                    runtime,
+                    claims=_claims(plan),
+                    smoke=True,
+                )
+                self.assertFalse(report["passed"], label)
+                self.assertEqual(report["failed_stage"], "browser_preflight")
+                self.assertIn("paint", report["error"].lower())
+
+    def test_browser_preflight_requires_identity_results_for_every_control(self) -> None:
+        """Catches count-only preflights that never prove which controls were operated."""
+        harness = self._require(self.harness, HARNESS_PATH)
+        plan = _plan()
+        project = _write_project(self.root, plan, bad="secondary-control")
+        report = harness.deliver_project(
+            project,
+            plan,
+            _fake_runtime(
+                self.root,
+                control_count=2,
+                controls_exercised=2,
+                control_results=[
+                    {
+                        "identity": "subtitle-toggle",
+                        "kind": "button",
+                        "operation": "toggle-twice",
+                        "result": "ok",
+                    }
+                ],
+            ),
+            claims=_claims(plan),
+            smoke=True,
+        )
+        self.assertFalse(report["passed"])
+        self.assertEqual(report["failed_stage"], "browser_preflight")
+        self.assertIn("identity", report["error"].lower())
+
+    def test_browser_preflight_fails_closed_on_late_activity_or_short_quiescence(self) -> None:
+        """Catches delayed requests, timers, and checks shorter than the 500 ms bound."""
+        harness = self._require(self.harness, HARNESS_PATH)
+        plan = _plan()
+        for label, runtime_options in (
+            ("late-request", {"late_activity": ["request:https://example.com/late"]}),
+            ("pending-timer", {"pending_timers": 1}),
+            ("short-wait", {"quiescence_ms": 499}),
+        ):
+            with self.subTest(label=label):
+                project = _write_project(self.root / label, plan)
+                report = harness.deliver_project(
+                    project,
+                    plan,
+                    _fake_runtime(self.root / f"{label}-runtime", **runtime_options),
+                    claims=_claims(plan),
+                    smoke=True,
+                )
+                self.assertFalse(report["passed"], label)
+                self.assertEqual(report["failed_stage"], "browser_preflight")
+                self.assertIn("quiescence", report["error"].lower())
+
     def test_source_visual_binding_rejects_missing_hash_symlink_and_hardlink(self) -> None:
         harness = self._require(self.harness, HARNESS_PATH)
         plan = _plan()
@@ -1157,6 +1295,10 @@ class AutoDesignVideoSkillTests(unittest.TestCase):
             list((run / "attempts" / attempt_id).glob(".artifact.stage-*")),
             [],
         )
+        crashed_stage = run / "attempts" / attempt_id / ".artifact.stage-recovery"
+        shutil.copytree(project, crashed_stage)
+        artifact.rmdir()
+        (run / "attempts" / attempt_id / ".artifact.empty-recovery").mkdir()
         result = harness.record_attempt_delivery(
             run,
             attempt_id,
@@ -1165,6 +1307,50 @@ class AutoDesignVideoSkillTests(unittest.TestCase):
             claims=_claims(plan),
         )
         self.assertTrue(result["passed"], result)
+        idempotent_paths = harness._copy_tree_allowlist(
+            project,
+            artifact,
+            report["publish_allowlist"],
+        )
+        self.assertEqual(
+            idempotent_paths,
+            [f"artifact/{path}" for path in report["publish_allowlist"]],
+        )
+
+    def test_publish_promotion_is_windows_safe_and_recovers_interrupted_transaction(self) -> None:
+        """Catches replacing a pre-created directory, which fails on Windows."""
+        harness = self._require(self.harness, HARNESS_PATH)
+        source = self.root / "publish-source"
+        (source / "nested").mkdir(parents=True)
+        (source / "index.html").write_text("ready\n", encoding="utf-8")
+        (source / "nested" / "asset.bin").write_bytes(b"grounded")
+        expected = ["index.html", "nested/asset.bin"]
+        destination = self.root / "attempt" / "artifact"
+        destination.mkdir(parents=True)
+        original_replace = os.replace
+
+        def windows_replace(source_path: Path | str, destination_path: Path | str) -> None:
+            if Path(destination_path).exists():
+                raise PermissionError("Windows refuses to replace an existing directory")
+            original_replace(source_path, destination_path)
+
+        with mock.patch.object(harness.os, "replace", side_effect=windows_replace):
+            paths = harness._copy_tree_allowlist(source, destination, expected)
+        self.assertEqual(paths, ["artifact/index.html", "artifact/nested/asset.bin"])
+        self.assertEqual(harness._actual_project_files(destination), expected)
+
+        interrupted = self.root / "interrupted" / "artifact"
+        interrupted.parent.mkdir(parents=True)
+        crashed_stage = interrupted.parent / ".artifact.stage-crashed"
+        shutil.copytree(source, crashed_stage)
+        crashed_backup = interrupted.parent / ".artifact.empty-crashed"
+        crashed_backup.mkdir()
+        with mock.patch.object(harness.os, "replace", side_effect=windows_replace):
+            paths = harness._copy_tree_allowlist(source, interrupted, expected)
+        self.assertEqual(paths, ["artifact/index.html", "artifact/nested/asset.bin"])
+        self.assertEqual(harness._actual_project_files(interrupted), expected)
+        self.assertFalse(crashed_stage.exists())
+        self.assertFalse(crashed_backup.exists())
 
     def test_stale_render_output_cannot_satisfy_delivery(self) -> None:
         harness = self._require(self.harness, HARNESS_PATH)
@@ -1569,10 +1755,37 @@ class AutoDesignVideoSkillTests(unittest.TestCase):
             stage for stage in evidence["report"]["stages"]
             if stage["id"] == "browser_preflight"
         )
-        self.assertEqual(browser["control_count"], 2)
-        self.assertEqual(browser["controls_exercised"], 2)
+        self.assertEqual(browser["control_count"], 10)
+        self.assertEqual(browser["controls_exercised"], 10)
+        self.assertTrue(
+            {
+                "button",
+                "input:checkbox",
+                "input:radio",
+                "input:range",
+                "select",
+                "textarea",
+                "summary",
+                "anchor",
+                "role:button",
+            }.issubset({result["kind"] for result in browser["control_results"]})
+        )
+        self.assertTrue(all(result["result"] == "ok" for result in browser["control_results"]))
+        quiescence = browser["quiescence"]
+        self.assertGreaterEqual(len(quiescence["checkpoints"]), 13)
+        self.assertTrue(all(item["waited_ms"] >= 500 for item in quiescence["checkpoints"]))
+        self.assertEqual(quiescence["late_activity"], [])
+        self.assertEqual(quiescence["pending_timers"], 0)
         self.assertFalse(browser["computed_states"]["initial"]["visible"])
         self.assertTrue(browser["computed_states"]["after_first_click"]["visible"])
+        self.assertGreater(
+            browser["computed_states"]["after_first_click"]["effective_opacity"],
+            0.001,
+        )
+        self.assertGreater(
+            browser["computed_states"]["after_first_click"]["intersection_width"],
+            0,
+        )
         self.assertFalse(browser["computed_states"]["after_second_click"]["visible"])
 
 

@@ -91,10 +91,15 @@ scripts, styles, media, iframes, executable downloads, dynamic `new Image`,
 URLs that are absolute, encoded escapes, or traverse `..`. Every project path
 stays inside the project and is neither a symlink nor hard link. Rendering runs
 without provider credentials. A real Chromium preflight blocks non-project
-requests and exercises every enabled interactive control. It clicks the
-subtitle control twice, proving `aria-pressed`, computed
-`display`/`visibility`, and nonzero rendered bounds transition off → on → off
-against cues from the locally generated VTT.
+requests and enumerates every visible enabled native or ARIA control, including
+buttons, supported inputs, selects, textareas, summaries, anchors, and custom
+roles. It operates each one and records a unique identity, operation, and
+result. After initial load, each operation, and the complete sequence, it waits
+at least 500 ms and fails closed on pending timers or late requests,
+navigations, popups, and page errors. It clicks the subtitle control twice,
+proving `aria-pressed`, computed `display`/`visibility`, effective opacity
+through all ancestors, clipped viewport intersection, and nonzero painted
+bounds transition off → on → off against cues from the locally generated VTT.
 
 ## Non-negotiable delivery order
 
@@ -150,5 +155,10 @@ review context, and reviewer verdict still matches its recorded hash. Before
 publishing, the project must equal the plan-derived allowlist exactly. Hidden
 files, `.env`, logs, render scratch files, and unreferenced assets are rejected,
 not copied. Allowlisted files are copied into a same-parent staging directory
-and atomically promoted only after the staged set is complete; a failed copy
-leaves the live artifact empty and an exact retry remains idempotent.
+and atomically promoted only after the staged set is complete. Because portable
+run creation pre-creates an empty `artifact/`, promotion first atomically moves
+that placeholder to a same-parent empty backup, then renames the complete stage
+into the now-absent destination; this works on Windows, where replacing an
+existing directory is forbidden. Matching interrupted stages and empty backups
+are recovered or cleaned without following links. A failed copy leaves the live
+artifact empty and an exact retry remains idempotent.

@@ -72,16 +72,20 @@ Run `python "$SKILL_ROOT/scripts/video_harness.py" --help` and
    `deliver PROJECT RUN/plan.json --run RUN --attempt ID --claims claims.json`.
    The harness enforces this order: structural validation; per-scene
    HyperFrames/Kokoro TTS and timed WAV mix; transcript/SRT/VTT and metadata;
-   strict offline Chromium interaction of every enabled control, including
-   computed visibility and bounds for the subtitle toggle; full real
+   strict offline Chromium interaction of every visible enabled native or ARIA
+   control, with identity/result evidence and at least 500 ms of timer,
+   request, navigation, and popup quiescence after every operation. Subtitle
+   checks include ancestor opacity and clipped viewport intersection; full real
    HyperFrames lint; strict real HyperFrames render; subtitle mux; exact
    ffprobe; representative frames and contact sheet. ffmpeg may mix audio, mux
    subtitles, and extract frames; it must never replace HyperFrames as the final
    renderer. A stale or invalid MP4 is deleted and cannot pass. Publishing uses
    an exact generated allowlist through a sibling staging directory and atomic
-   promotion: copy failures are retryable and never expose a partial live
-   artifact. Hidden files, `.env`, debug files, and unreferenced assets fail
-   instead of leaking into the artifact.
+   promotion. The promotion moves the pre-created empty destination aside for
+   Windows compatibility and recovers interrupted stage/backup transactions;
+   copy failures are retryable and never expose a partial live artifact. Hidden
+   files, `.env`, debug files, and unreferenced assets fail instead of leaking
+   into the artifact.
 7. Run `review-context RUN ID`. Give the exact MP4, narration WAV, contact sheet,
    and all six individual frames to a fresh vision- and audio-capable host or
    subagent that did not author the project. The returned context exposes

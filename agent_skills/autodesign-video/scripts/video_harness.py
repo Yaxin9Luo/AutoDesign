@@ -1124,15 +1124,69 @@ const inside = value => value === projectRoot || value.startsWith(projectRoot + 
     headless: true,
     args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
   });
-    const blocked = [];
-    const pageErrors = [];
+  const blocked = [];
+  const pageErrors = [];
+  const lateActivity = [];
+  const checkpoints = [];
+  let activityArmed = false;
+  let activeControl = null;
   try {
     const page = await browser.newPage();
     await page.setViewport({width: 1920, height: 1080, deviceScaleFactor: 1});
+    await page.evaluateOnNewDocument(() => {
+      const timeoutIds = new Set();
+      const intervalIds = new Set();
+      const nativeSetTimeout = globalThis.setTimeout.bind(globalThis);
+      const nativeClearTimeout = globalThis.clearTimeout.bind(globalThis);
+      const nativeSetInterval = globalThis.setInterval.bind(globalThis);
+      const nativeClearInterval = globalThis.clearInterval.bind(globalThis);
+      const invoke = (callback, args) => typeof callback === 'function'
+        ? callback(...args)
+        : globalThis.eval(String(callback));
+      globalThis.setTimeout = (callback, delay, ...args) => {
+        let id;
+        id = nativeSetTimeout(() => {
+          timeoutIds.delete(id);
+          invoke(callback, args);
+        }, delay);
+        timeoutIds.add(id);
+        return id;
+      };
+      globalThis.clearTimeout = id => {
+        timeoutIds.delete(id);
+        intervalIds.delete(id);
+        return nativeClearTimeout(id);
+      };
+      globalThis.setInterval = (callback, delay, ...args) => {
+        const id = nativeSetInterval(() => invoke(callback, args), delay);
+        intervalIds.add(id);
+        return id;
+      };
+      globalThis.clearInterval = id => {
+        intervalIds.delete(id);
+        timeoutIds.delete(id);
+        return nativeClearInterval(id);
+      };
+      Object.defineProperty(globalThis, '__autodesignPendingTimers', {
+        configurable: false,
+        value: () => ({timeouts: timeoutIds.size, intervals: intervalIds.size}),
+        writable: false,
+      });
+    });
     await page.setRequestInterception(true);
     page.on('request', request => {
       try {
         const url = request.url();
+        if (activityArmed) {
+          lateActivity.push({
+            type: 'request',
+            url,
+            control: activeControl && activeControl.identity || null,
+          });
+          blocked.push(url);
+          request.abort();
+          return;
+        }
         if (!url.startsWith('file:')) {
           blocked.push(url); request.abort(); return;
         }
@@ -1147,15 +1201,85 @@ const inside = value => value === projectRoot || value.startsWith(projectRoot + 
     });
     page.on('pageerror', error => pageErrors.push(String(error && error.message || error)));
     page.on('popup', popup => {
-      blocked.push(`popup:${popup.url()}`);
+      const url = popup.url();
+      blocked.push(`popup:${url}`);
+      if (activityArmed) {
+        lateActivity.push({
+          type: 'popup',
+          url,
+          control: activeControl && activeControl.identity || null,
+        });
+      }
       popup.close().catch(() => {});
     });
+    page.on('framenavigated', frame => {
+      if (!activityArmed || frame !== page.mainFrame()) return;
+      const url = frame.url();
+      const expectedUrl = activeControl && activeControl.kind === 'anchor'
+        ? new URL(activeControl.identity.href, pathToFileURL(indexPath).href).href
+        : null;
+      if (expectedUrl && url === expectedUrl) {
+        activeControl.navigation = url;
+        return;
+      }
+      lateActivity.push({
+        type: 'navigation',
+        url,
+        control: activeControl && activeControl.identity || null,
+      });
+    });
     await page.goto(pathToFileURL(indexPath).href, {waitUntil: 'load', timeout: 30000});
+    activityArmed = true;
+    const quiesce = async label => {
+      const started = Date.now();
+      const activityOffset = lateActivity.length;
+      await new Promise(resolve => setTimeout(resolve, 500));
+      const pending = await page.evaluate(() => {
+        const inspect = globalThis.__autodesignPendingTimers;
+        return typeof inspect === 'function' ? inspect() : {timeouts: -1, intervals: -1};
+      });
+      const checkpoint = {
+        label,
+        waited_ms: Date.now() - started,
+        pending_timers: Number(pending.timeouts) + Number(pending.intervals),
+        late_activity: lateActivity.slice(activityOffset),
+      };
+      checkpoints.push(checkpoint);
+      return checkpoint;
+    };
+    await quiesce('initial-load');
     const state = async () => page.$eval('[data-subtitle-toggle]', button => {
       const overlay = document.getElementById(button.getAttribute('aria-controls'));
       if (!overlay) throw new Error('subtitle overlay is missing');
       const style = getComputedStyle(overlay);
       const bounds = overlay.getBoundingClientRect();
+      let effectiveOpacity = 1;
+      let rendered = true;
+      let clipLeft = 0;
+      let clipTop = 0;
+      let clipRight = innerWidth;
+      let clipBottom = innerHeight;
+      for (let current = overlay; current; current = current.parentElement) {
+        const currentStyle = getComputedStyle(current);
+        const opacity = Number.parseFloat(currentStyle.opacity);
+        effectiveOpacity *= Number.isFinite(opacity) ? opacity : 1;
+        if (currentStyle.display === 'none' || ['hidden', 'collapse'].includes(currentStyle.visibility)) {
+          rendered = false;
+        }
+        if (current !== overlay) {
+          const currentBounds = current.getBoundingClientRect();
+          if (['hidden', 'clip', 'scroll', 'auto'].includes(currentStyle.overflowX)) {
+            clipLeft = Math.max(clipLeft, currentBounds.left);
+            clipRight = Math.min(clipRight, currentBounds.right);
+          }
+          if (['hidden', 'clip', 'scroll', 'auto'].includes(currentStyle.overflowY)) {
+            clipTop = Math.max(clipTop, currentBounds.top);
+            clipBottom = Math.min(clipBottom, currentBounds.bottom);
+          }
+        }
+      }
+      const intersectionWidth = Math.max(0, Math.min(bounds.right, clipRight) - Math.max(bounds.left, clipLeft));
+      const intersectionHeight = Math.max(0, Math.min(bounds.bottom, clipBottom) - Math.max(bounds.top, clipTop));
       return {
         semantic: {aria_pressed: button.getAttribute('aria-pressed'), overlay_hidden: overlay.hidden},
         computed: {
@@ -1163,8 +1287,11 @@ const inside = value => value === projectRoot || value.startsWith(projectRoot + 
           visibility: style.visibility,
           width: bounds.width,
           height: bounds.height,
-          visible: style.display !== 'none' && !['hidden', 'collapse'].includes(style.visibility)
-            && bounds.width > 0 && bounds.height > 0,
+          effective_opacity: effectiveOpacity,
+          intersection_width: intersectionWidth,
+          intersection_height: intersectionHeight,
+          visible: rendered && effectiveOpacity > 0.001
+            && intersectionWidth > 0 && intersectionHeight > 0,
         },
       };
     });
@@ -1177,19 +1304,147 @@ const inside = value => value === projectRoot || value.startsWith(projectRoot + 
       };
     });
     await page.click('[data-subtitle-toggle]');
+    await quiesce('subtitle-on');
     const afterFirstState = await state();
     await page.click('[data-subtitle-toggle]');
+    await quiesce('subtitle-off');
     const afterSecondState = await state();
-    const controls = await page.$$('button:not([disabled]), input[type="button"]:not([disabled]), input[type="submit"]:not([disabled]), [role="button"]:not([aria-disabled="true"]), a[href^="#"]');
+    const controls = await page.evaluate(() => {
+      const selectors = [
+        'button', 'input:not([type="hidden"])', 'select', 'textarea', 'summary',
+        'a[href]', '[contenteditable="true"]', '[tabindex]:not([tabindex="-1"])',
+        '[role="button"]', '[role="link"]', '[role="checkbox"]', '[role="radio"]',
+        '[role="switch"]', '[role="slider"]', '[role="menuitem"]', '[role="tab"]',
+        '[role="combobox"]', '[role="textbox"]', '[role="spinbutton"]',
+      ];
+      const visible = element => {
+        const bounds = element.getBoundingClientRect();
+        let opacity = 1;
+        let rendered = true;
+        let left = 0;
+        let top = 0;
+        let right = innerWidth;
+        let bottom = innerHeight;
+        for (let current = element; current; current = current.parentElement) {
+          const style = getComputedStyle(current);
+          const component = Number.parseFloat(style.opacity);
+          opacity *= Number.isFinite(component) ? component : 1;
+          if (style.display === 'none' || ['hidden', 'collapse'].includes(style.visibility)) {
+            rendered = false;
+          }
+          if (current !== element) {
+            const ancestorBounds = current.getBoundingClientRect();
+            if (['hidden', 'clip', 'scroll', 'auto'].includes(style.overflowX)) {
+              left = Math.max(left, ancestorBounds.left);
+              right = Math.min(right, ancestorBounds.right);
+            }
+            if (['hidden', 'clip', 'scroll', 'auto'].includes(style.overflowY)) {
+              top = Math.max(top, ancestorBounds.top);
+              bottom = Math.min(bottom, ancestorBounds.bottom);
+            }
+          }
+        }
+        const width = Math.max(0, Math.min(bounds.right, right) - Math.max(bounds.left, left));
+        const height = Math.max(0, Math.min(bounds.bottom, bottom) - Math.max(bounds.top, top));
+        return rendered && opacity > 0.001 && width > 0 && height > 0;
+      };
+      return Array.from(document.querySelectorAll(selectors.join(',')))
+        .filter(element => !element.matches(':disabled')
+          && element.getAttribute('aria-disabled') !== 'true'
+          && visible(element))
+        .map((element, index) => {
+          const token = `control-${index + 1}`;
+          element.setAttribute('data-autodesign-preflight-control', token);
+          const tag = element.tagName.toLowerCase();
+          const type = (element.getAttribute('type') || '').toLowerCase();
+          const role = (element.getAttribute('role') || '').toLowerCase();
+          const kind = element.tagName.toLowerCase() === 'a'
+            ? 'anchor'
+            : role ? `role:${role}` : tag === 'input' ? `input:${type || 'text'}` : tag;
+          return {
+            token,
+            kind,
+            identity: {
+              token,
+              tag,
+              id: element.id || '',
+              type,
+              role,
+              name: element.getAttribute('name') || '',
+              aria_label: element.getAttribute('aria-label') || '',
+              href: tag === 'a' ? element.getAttribute('href') || '' : '',
+              text: (element.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 160),
+            },
+          };
+        });
+    });
+    const controlResults = [];
     let controlsExercised = 0;
-    for (const control of controls) {
-      const isSubtitle = await control.evaluate(element => element.hasAttribute('data-subtitle-toggle'));
-      if (!isSubtitle) {
-        await control.click();
-        await new Promise(resolve => setTimeout(resolve, 50));
+    for (const descriptor of controls) {
+      const selector = `[data-autodesign-preflight-control="${descriptor.token}"]`;
+      const control = await page.$(selector);
+      const isSubtitle = control && await control.evaluate(element => element.hasAttribute('data-subtitle-toggle'));
+      const record = {
+        identity: descriptor.identity,
+        kind: descriptor.kind,
+        operation: isSubtitle ? 'toggle-twice' : 'click',
+        result: 'ok',
+      };
+      activeControl = descriptor;
+      try {
+        if (!control) throw new Error('control disappeared before it could be exercised');
+        if (!isSubtitle) {
+          if (descriptor.kind === 'select') {
+            const value = await control.evaluate(element => {
+              const option = Array.from(element.options).find(item => !item.disabled && item.value !== element.value);
+              return option ? option.value : null;
+            });
+            if (value === null) {
+              await control.focus();
+              await page.keyboard.press('Tab');
+              record.operation = 'focus-tab';
+            } else {
+              await page.select(selector, value);
+              record.operation = 'select-option';
+            }
+          } else if (
+            descriptor.kind === 'textarea'
+            || descriptor.kind === 'input:text'
+            || descriptor.kind === 'input:email'
+            || descriptor.kind === 'input:search'
+            || descriptor.kind === 'input:url'
+            || descriptor.kind === 'input:tel'
+            || descriptor.kind === 'input:number'
+            || descriptor.kind === 'role:textbox'
+            || descriptor.kind === 'role:spinbutton'
+            || descriptor.kind === 'role:combobox'
+          ) {
+            await control.focus();
+            await page.keyboard.press('Tab');
+            record.operation = 'focus-tab';
+          } else if (descriptor.kind === 'input:range' || descriptor.kind === 'role:slider') {
+            await control.focus();
+            await page.keyboard.press('ArrowRight');
+            record.operation = 'increment';
+          } else {
+            await control.click();
+          }
+        }
+        controlsExercised += 1;
+      } catch (error) {
+        record.result = `error:${String(error && error.message || error)}`;
+        pageErrors.push(`control ${descriptor.token}: ${record.result}`);
       }
-      controlsExercised += 1;
+      if (!isSubtitle) await quiesce(`control:${descriptor.token}`);
+      if (descriptor.navigation) record.navigation = descriptor.navigation;
+      activeControl = null;
+      controlResults.push(record);
     }
+    await quiesce('all-controls');
+    const pendingTimers = checkpoints.reduce(
+      (maximum, checkpoint) => Math.max(maximum, checkpoint.pending_timers),
+      0,
+    );
     process.stdout.write(JSON.stringify({
       passed: blocked.length === 0 && pageErrors.length === 0,
       initial: initialState.semantic,
@@ -1202,6 +1457,13 @@ const inside = value => value === projectRoot || value.startsWith(projectRoot + 
       },
       control_count: controls.length,
       controls_exercised: controlsExercised,
+      control_results: controlResults,
+      quiescence: {
+        minimum_wait_ms: 500,
+        checkpoints,
+        late_activity: lateActivity,
+        pending_timers: pendingTimers,
+      },
       blocked_requests: blocked,
       page_errors: pageErrors,
       subtitle_source: subtitle.source,
@@ -1251,12 +1513,21 @@ const inside = value => value === projectRoot || value.startsWith(projectRoot + 
         visible = computed.get("visible")
         width = computed.get("width")
         height = computed.get("height")
+        effective_opacity = computed.get("effective_opacity")
+        intersection_width = computed.get("intersection_width")
+        intersection_height = computed.get("intersection_height")
         if (
             not isinstance(visible, bool)
             or isinstance(width, bool)
             or not isinstance(width, (int, float))
             or isinstance(height, bool)
             or not isinstance(height, (int, float))
+            or isinstance(effective_opacity, bool)
+            or not isinstance(effective_opacity, (int, float))
+            or isinstance(intersection_width, bool)
+            or not isinstance(intersection_width, (int, float))
+            or isinstance(intersection_height, bool)
+            or not isinstance(intersection_height, (int, float))
         ):
             raise StageError("browser_preflight", f"computed subtitle state is invalid at {key}", failure_class="runtime")
         if visible is not expected_visible:
@@ -1270,10 +1541,13 @@ const inside = value => value === projectRoot || value.startsWith(projectRoot + 
             or computed.get("visibility") in {"hidden", "collapse"}
             or float(width) <= 0
             or float(height) <= 0
+            or float(effective_opacity) <= 0.001
+            or float(intersection_width) <= 0
+            or float(intersection_height) <= 0
         ):
             raise StageError(
                 "browser_preflight",
-                f"computed subtitle bounds failed at {key}",
+                f"computed subtitle paint visibility failed at {key}",
                 failure_class="authoring",
             )
     control_count = payload.get("control_count")
@@ -1289,6 +1563,89 @@ const inside = value => value === projectRoot || value.startsWith(projectRoot + 
         raise StageError(
             "browser_preflight",
             "every enabled interactive control must be exercised offline",
+            failure_class="authoring",
+        )
+    control_results = payload.get("control_results")
+    if not isinstance(control_results, list) or len(control_results) != control_count:
+        raise StageError(
+            "browser_preflight",
+            "control identity results must cover every exercised control",
+            failure_class="authoring",
+        )
+    control_tokens: set[str] = set()
+    for result in control_results:
+        if not isinstance(result, Mapping):
+            raise StageError("browser_preflight", "control identity result is invalid", failure_class="runtime")
+        identity = result.get("identity")
+        token = identity.get("token") if isinstance(identity, Mapping) else None
+        if (
+            not isinstance(token, str)
+            or not token
+            or token in control_tokens
+            or not isinstance(result.get("kind"), str)
+            or not result.get("kind")
+            or not isinstance(result.get("operation"), str)
+            or not result.get("operation")
+        ):
+            raise StageError(
+                "browser_preflight",
+                "control identity results must be unique and complete",
+                failure_class="authoring",
+            )
+        if result.get("result") != "ok":
+            raise StageError(
+                "browser_preflight",
+                f"control operation failed for {token}",
+                failure_class="authoring",
+            )
+        control_tokens.add(token)
+    quiescence = payload.get("quiescence")
+    checkpoints = quiescence.get("checkpoints") if isinstance(quiescence, Mapping) else None
+    minimum_wait_ms = quiescence.get("minimum_wait_ms") if isinstance(quiescence, Mapping) else None
+    pending_timers = quiescence.get("pending_timers") if isinstance(quiescence, Mapping) else None
+    late_activity = quiescence.get("late_activity") if isinstance(quiescence, Mapping) else None
+    if (
+        isinstance(minimum_wait_ms, bool)
+        or not isinstance(minimum_wait_ms, (int, float))
+        or minimum_wait_ms < 500
+        or not isinstance(checkpoints, list)
+        or len(checkpoints) < control_count + 3
+        or isinstance(pending_timers, bool)
+        or not isinstance(pending_timers, int)
+        or not isinstance(late_activity, list)
+    ):
+        raise StageError(
+            "browser_preflight",
+            "bounded 500 ms quiescence evidence is incomplete",
+            failure_class="runtime",
+        )
+    for checkpoint in checkpoints:
+        waited_ms = checkpoint.get("waited_ms") if isinstance(checkpoint, Mapping) else None
+        checkpoint_timers = checkpoint.get("pending_timers") if isinstance(checkpoint, Mapping) else None
+        checkpoint_activity = checkpoint.get("late_activity") if isinstance(checkpoint, Mapping) else None
+        if (
+            isinstance(waited_ms, bool)
+            or not isinstance(waited_ms, (int, float))
+            or waited_ms < 500
+            or isinstance(checkpoint_timers, bool)
+            or not isinstance(checkpoint_timers, int)
+            or not isinstance(checkpoint_activity, list)
+        ):
+            raise StageError(
+                "browser_preflight",
+                "bounded 500 ms quiescence checkpoint is invalid",
+                failure_class="runtime",
+            )
+        if checkpoint_timers or checkpoint_activity:
+            raise StageError(
+                "browser_preflight",
+                "quiescence observed pending timers or late browser activity",
+                failure_class="authoring",
+            )
+    if pending_timers or late_activity:
+        raise StageError(
+            "browser_preflight",
+            "quiescence observed pending timers or late browser activity",
             failure_class="authoring",
         )
     if payload.get("blocked_requests") or payload.get("page_errors"):
@@ -1776,6 +2133,29 @@ def _remove_tree_no_follow(path: Path) -> None:
     path.rmdir()
 
 
+def _tree_matches_allowlist_source(
+    candidate: Path,
+    source: Path,
+    expected: Sequence[str],
+) -> bool:
+    if candidate.is_symlink() or not candidate.is_dir():
+        return False
+    try:
+        if _actual_project_files(candidate) != list(expected):
+            return False
+        return all(
+            sha256_file(_safe_project_file(candidate, relative_text))
+            == sha256_file(_safe_project_file(source, relative_text))
+            for relative_text in expected
+        )
+    except (OSError, VideoContractError):
+        return False
+
+
+def _publish_transaction_paths(parent: Path, prefix: str) -> list[Path]:
+    return sorted(parent.glob(f"{prefix}*"), key=lambda path: path.name)
+
+
 def _copy_tree_allowlist(source: Path, destination: Path, allowlist: Sequence[str]) -> list[str]:
     if source.is_symlink() or not source.is_dir():
         raise VideoContractError("delivered project must be a regular directory")
@@ -1789,27 +2169,50 @@ def _copy_tree_allowlist(source: Path, destination: Path, allowlist: Sequence[st
         )
     if destination.is_symlink() or (destination.exists() and not destination.is_dir()):
         raise VideoContractError("attempt artifact destination must be a regular directory")
+    stages = _publish_transaction_paths(destination.parent, ".artifact.stage-")
+    backups = _publish_transaction_paths(destination.parent, ".artifact.empty-")
     if destination.exists() and any(destination.iterdir()):
-        if _actual_project_files(destination) != expected or any(
-            sha256_file(_safe_project_file(destination, relative_text))
-            != sha256_file(_safe_project_file(source, relative_text))
-            for relative_text in expected
-        ):
+        if not _tree_matches_allowlist_source(destination, source, expected):
             raise VideoContractError("attempt artifact directory contains a partial or stale delivery")
+        for transaction_path in [*stages, *backups]:
+            _remove_tree_no_follow(transaction_path)
         return [f"artifact/{relative_text}" for relative_text in expected]
 
-    staging = destination.parent / f".artifact.stage-{uuid.uuid4().hex}"
-    staging.mkdir(mode=0o700)
+    reusable_stages = [
+        stage for stage in stages
+        if _tree_matches_allowlist_source(stage, source, expected)
+    ]
+    staging = reusable_stages[0] if reusable_stages else (
+        destination.parent / f".artifact.stage-{uuid.uuid4().hex}"
+    )
+    for abandoned in stages:
+        if abandoned != staging:
+            _remove_tree_no_follow(abandoned)
+    if not reusable_stages:
+        staging.mkdir(mode=0o700)
+        try:
+            for relative_text in expected:
+                path = _safe_project_file(source, relative_text)
+                core.atomic_write_bytes(staging / relative_text, path.read_bytes())
+            if not _tree_matches_allowlist_source(staging, source, expected):
+                raise VideoContractError("staged artifact set differs from the publish allowlist")
+        except Exception:
+            _remove_tree_no_follow(staging)
+            raise
+
+    backup = destination.parent / f".artifact.empty-{uuid.uuid4().hex}"
     try:
-        for relative_text in expected:
-            path = _safe_project_file(source, relative_text)
-            core.atomic_write_bytes(staging / relative_text, path.read_bytes())
-        if _actual_project_files(staging) != expected:
-            raise VideoContractError("staged artifact set differs from the publish allowlist")
+        if destination.exists():
+            os.replace(destination, backup)
         os.replace(staging, destination)
     except Exception:
-        _remove_tree_no_follow(staging)
+        if not destination.exists() and backup.exists():
+            os.replace(backup, destination)
+        if staging.exists() or staging.is_symlink():
+            _remove_tree_no_follow(staging)
         raise
+    for transaction_path in [backup, *backups]:
+        _remove_tree_no_follow(transaction_path)
     return [f"artifact/{relative_text}" for relative_text in expected]
 
 
@@ -1834,7 +2237,7 @@ def record_attempt_delivery(
         raise VideoContractError("delivery report claim binding differs from recorded claims")
     attempt = core.safe_path(run / "attempts", attempt_id, must_exist=True)
     runtime_failure_marker = core.safe_path(attempt, "qa/runtime-failure.json")
-    artifact = core.safe_path(attempt, "artifact", must_exist=True)
+    artifact = core.safe_path(attempt, "artifact")
     project = Path(project_dir).absolute()
     persisted_report = _read_json(project / "delivery-report.json")
     expected_report = {key: value for key, value in report.items() if key != "delivery_report_sha256"}
@@ -2045,11 +2448,14 @@ html,body{{margin:0;width:1920px;height:1080px;overflow:hidden;background:#10182
 h1{{font-size:120px;margin:20px 0}}p{{font-size:34px}}.subtitle-overlay[hidden]{{display:none}}
 [data-subtitle-toggle]{{position:absolute;right:48px;bottom:40px;z-index:100;padding:16px 20px}}
 #smoke-details{{position:absolute;left:48px;bottom:40px;z-index:100;padding:16px 20px}}
+#smoke-controls{{position:absolute;left:48px;right:48px;top:24px;z-index:101;display:flex;align-items:center;gap:12px;background:#ffffffee;color:#132238;padding:10px 14px;border-radius:12px}}
+#smoke-controls textarea{{width:120px;height:28px;resize:none}}#smoke-controls details{{min-width:80px}}#smoke-controls a,#smoke-controls [role=button]{{color:#132238;border:1px solid #132238;padding:6px 10px;border-radius:6px}}
 .subtitle-overlay{{position:absolute;left:20%;right:20%;bottom:100px;z-index:99;background:#000c;padding:20px}}
 </style></head><body><main data-composition-id="smoke" data-start="0" data-duration="{plan["duration_s"]}" data-width="1920" data-height="1080" data-no-timeline>
 {''.join(sections)}<audio id="narration" class="clip" src="assets/narration.wav" data-start="0" data-duration="{plan["duration_s"]}" data-track-index="2" data-media-start="0"></audio>
+<div id="smoke-controls"><input type="checkbox" aria-label="Evidence checkbox"><input type="radio" name="smoke-radio" aria-label="Method radio"><input type="range" min="0" max="2" value="1" aria-label="Scene range"><select aria-label="Local option"><option value="a">A</option><option value="b">B</option></select><textarea aria-label="Local note">Note</textarea><details><summary>More</summary><span>Local detail</span></details><a href="#scene_01">Start</a><div id="smoke-role-button" role="button" tabindex="0">Local action</div></div>
 <button type="button" data-subtitle-toggle aria-pressed="false" aria-controls="subtitles">CC</button><button type="button" id="smoke-details">Details</button><div id="subtitles" class="subtitle-overlay" data-subtitle-source="narration/subtitles.en.vtt" hidden>{''.join(f'<span data-subtitle-cue>{html.escape(scene["narration"])}</span>' for scene in plan["scenes"])}</div></main>
-<script>document.querySelector('[data-subtitle-toggle]').addEventListener('click',event=>{{const button=event.currentTarget;const target=document.getElementById('subtitles');const shown=button.getAttribute('aria-pressed')==='true';button.setAttribute('aria-pressed',String(!shown));target.hidden=shown;}});document.getElementById('smoke-details').addEventListener('click',event=>event.currentTarget.setAttribute('data-exercised','true'));</script></body></html>'''
+<script>document.querySelector('[data-subtitle-toggle]').addEventListener('click',event=>{{const button=event.currentTarget;const target=document.getElementById('subtitles');const shown=button.getAttribute('aria-pressed')==='true';button.setAttribute('aria-pressed',String(!shown));target.hidden=shown;}});document.getElementById('smoke-details').addEventListener('click',event=>event.currentTarget.setAttribute('data-exercised','true'));document.getElementById('smoke-role-button').addEventListener('click',event=>event.currentTarget.setAttribute('data-exercised','true'));</script></body></html>'''
     _write_text(project / "index.html", html_text)
     _write_json(project / "hyperframes.json", {"version": 1, "entry": "index.html"})
     return project
