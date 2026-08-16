@@ -19,6 +19,7 @@ import subprocess
 import tempfile
 import unicodedata
 from collections import Counter
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -44,8 +45,14 @@ _SECRET_ASSIGNMENT = re.compile(
 )
 _BEARER = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+")
 _SK_TOKEN = re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b")
+_SENSITIVE_HEADER = re.compile(
+    r"(?im)^(?P<name>Cookie|Set-Cookie|Authorization)\s*:\s*[^\r\n]*$"
+)
 _WORD = re.compile(r"[A-Za-z][A-Za-z0-9_-]{1,}")
-_NUMBER = re.compile(r"(?<![A-Za-z])[-+]?\d+(?:\.\d+)?%?")
+_NUMBER = re.compile(
+    r"(?<![A-Za-z0-9_.])[-+]?(?:(?:\d{1,3}(?:,\d{3})+)|\d+)"
+    r"(?:\.\d+)?(?:[eE][-+]?\d+)?%?"
+)
 _STOPWORDS = {
     "about", "after", "also", "among", "and", "are", "because", "been",
     "before", "being", "between", "both", "but", "can", "could", "does",
@@ -197,7 +204,17 @@ def redact_secrets(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [redact_secrets(item) for item in value]
     if isinstance(value, str):
-        text = _SECRET_ASSIGNMENT.sub(lambda match: f"{match.group(1)}=[REDACTED]", value)
+        text = _SENSITIVE_HEADER.sub(
+            lambda match: f"{match.group('name')}: [REDACTED]", value
+        )
+        text = _SECRET_ASSIGNMENT.sub(
+            lambda match: (
+                match.group(0)
+                if match.group(2) == "[REDACTED]"
+                else f"{match.group(1)}=[REDACTED]"
+            ),
+            text,
+        )
         text = _BEARER.sub("Bearer [REDACTED]", text)
         return _SK_TOKEN.sub("[REDACTED]", text)
     return value
@@ -274,8 +291,20 @@ def _write_run(run_dir: Path, state: dict[str, Any]) -> None:
 
 def _load_run(run_dir: Path | str) -> tuple[Path, dict[str, Any]]:
     root = Path(run_dir).absolute()
-    if root.is_symlink() or (root / "run.json").is_symlink():
-        raise PathSafetyError(f"run state must not traverse a symlink: {root}")
+    if root.is_symlink() or not root.is_dir():
+        raise PathSafetyError(f"run directory must be a regular directory: {root}")
+    for current, directories, files in os.walk(root, followlinks=False):
+        current_path = Path(current)
+        for name in directories:
+            if (current_path / name).is_symlink():
+                raise PathSafetyError(
+                    f"run tree must not contain symlinks: {current_path / name}"
+                )
+        for name in files:
+            if (current_path / name).is_symlink():
+                raise PathSafetyError(
+                    f"run tree must not contain symlinks: {current_path / name}"
+                )
     state = _read_json(root / "run.json")
     return root, state
 
@@ -299,7 +328,11 @@ def initialize_run(
         raise PathSafetyError("run directory must be outside the installed Skill")
     if run.exists():
         if (run / "run.json").is_file():
-            verify_skill_snapshot(run, skill_root=skill)
+            manifest = verify_skill_snapshot(run, skill_root=skill)
+            if manifest.get("release_version") != release_version:
+                raise IntegrityError("requested release version differs from the run snapshot")
+            if manifest.get("archive_sha256") != archive_sha256:
+                raise IntegrityError("requested archive hash differs from the run snapshot")
             return _read_json(run / "run.json")
         if any(run.iterdir()):
             raise StateError(f"run directory is not empty: {run}")
@@ -370,6 +403,14 @@ def verify_skill_snapshot(run_dir: Path | str, *, skill_root: Path | str | None 
             raise IntegrityError(str(error)) from error
         if snapshot.is_symlink() or sha256_file(snapshot) != entry.get("sha256"):
             raise IntegrityError(f"Skill snapshot file hash mismatch: {relative}")
+    snapshot_root = run / "skill_snapshot" / "files"
+    actual_files = {
+        path.relative_to(snapshot_root).as_posix()
+        for path in snapshot_root.rglob("*")
+        if path.is_file()
+    }
+    if actual_files != seen:
+        raise IntegrityError("Skill snapshot contains unlisted or missing files")
     if skill_root is not None:
         skill = Path(skill_root).absolute()
         current = {
@@ -414,6 +455,9 @@ def save_plan(run_dir: Path | str, plan: Mapping[str, Any]) -> dict[str, Any]:
     """Persist a non-empty plan and advance initialized -> planned."""
 
     run, state = _load_run(run_dir)
+    source_manifest = _verify_source_contract(run, state)
+    if source_manifest.get("status") != "ready":
+        raise StateError("planning requires a fully prepared source")
     if state.get("state") == "planned" and (run / "plan.json").is_file():
         existing = _read_json(run / "plan.json")
         if existing != dict(plan):
@@ -533,17 +577,59 @@ def _visual_record(
     *,
     origin: str,
     page: int | None = None,
+    pdf_image_num: int | None = None,
 ) -> dict[str, Any]:
     eligible = origin == "explicit_asset"
     style_only = origin == "style_reference"
     return {
         "id": visual_id, "path": relative_path, "sha256": digest, "origin": origin,
-        "page": page, "bbox": None, "caption_evidence_id": None,
+        "page": page, "pdf_image_num": pdf_image_num, "bbox": None,
+        "caption_evidence_id": None,
         "crop": False, "compound": False, "vlm_review": None,
         "eligibility": "eligible" if eligible else ("style_only" if style_only else "review_required"),
         "allowed_content_roles": list(_DEFAULT_VISUAL_ROLES) if eligible else [],
         "max_reuse": 1,
     }
+
+
+def _clear_stale_source_outputs(run: Path) -> None:
+    for directory, pattern in (
+        (run / "evidence" / "pages", "*"),
+        (run / "evidence" / "assets", "pdf-image*"),
+    ):
+        for path in directory.glob(pattern):
+            if path.is_symlink():
+                raise PathSafetyError(f"source output must not be a symlink: {path}")
+            if path.is_dir():
+                shutil.rmtree(path)
+            else:
+                path.unlink()
+    for name in (
+        "source.txt",
+        "pdfinfo.txt",
+        "pdfimages-list.txt",
+        "host-vlm-visual-review.json",
+    ):
+        path = run / "evidence" / name
+        if path.is_symlink():
+            raise PathSafetyError(f"source output must not be a symlink: {path}")
+        path.unlink(missing_ok=True)
+
+
+def _parse_pdfimages_list(text: str) -> list[tuple[int, int]]:
+    mappings: list[tuple[int, int]] = []
+    for line in text.splitlines():
+        fields = line.split()
+        if len(fields) < 3:
+            continue
+        try:
+            page = int(fields[0])
+            number = int(fields[1])
+        except ValueError:
+            continue
+        if page > 0 and number >= 0:
+            mappings.append((page, number))
+    return mappings
 
 
 def prepare_source(
@@ -559,6 +645,10 @@ def prepare_source(
     run, state = _load_run(run_dir)
     if state.get("state") not in {"initialized", "blocked"}:
         raise StateError("source preparation must occur before planning")
+    existing_manifest = _read_json(run / "evidence" / "source_manifest.json")
+    if state.get("state") == "initialized" and existing_manifest.get("status") == "ready":
+        raise StateError("a ready source cannot be replaced; initialize a new run")
+    _clear_stale_source_outputs(run)
     source = Path(source_path).absolute()
     if source.is_symlink() or not source.is_file():
         raise PathSafetyError(f"source must be a regular non-symlink file: {source}")
@@ -632,9 +722,45 @@ def prepare_source(
             return manifest
         text = text_path.read_text(encoding="utf-8", errors="replace")
         evidence = _pdf_evidence(text)
-        for index, image in enumerate(sorted((run / "evidence" / "assets").glob("pdf-image*")), start=1):
+        image_mappings = _parse_pdfimages_list(image_list.stdout)
+        extracted_images = [
+            path
+            for path in sorted((run / "evidence" / "assets").glob("pdf-image*"))
+            if path.is_file() and not path.is_symlink()
+        ]
+        if len(extracted_images) != len(image_mappings):
+            manifest.update(
+                {"status": "blocked", "failed_commands": ["pdfimages_mapping"]}
+            )
+            _write_evidence(run, evidence)
+            atomic_write_json(
+                run / "evidence" / "source_visuals.json",
+                {"format_version": FORMAT_VERSION, "visuals": []},
+            )
+            _persist_source_manifest(run, manifest)
+            mark_side_state(
+                run,
+                "blocked",
+                reason="PDF image extraction could not be mapped to page/object metadata",
+            )
+            return manifest
+        for index, image in enumerate(extracted_images, start=1):
             if image.is_file() and not image.is_symlink():
-                visuals.append(_visual_record(f"vis-{index:03d}", f"assets/{image.name}", sha256_file(image), origin="pdf_extracted"))
+                page, pdf_image_num = (
+                    image_mappings[index - 1]
+                    if index <= len(image_mappings)
+                    else (None, None)
+                )
+                visuals.append(
+                    _visual_record(
+                        f"vis-{index:03d}",
+                        f"assets/{image.name}",
+                        sha256_file(image),
+                        origin="pdf_extracted",
+                        page=page,
+                        pdf_image_num=pdf_image_num,
+                    )
+                )
 
     for asset in extra_assets:
         source_asset = Path(asset).absolute()
@@ -734,7 +860,8 @@ def _verify_source_contract(run: Path, state: Mapping[str, Any]) -> dict[str, An
 def load_evidence(run_dir: Path | str) -> list[dict[str, Any]]:
     """Load and validate the append-free evidence JSONL contract."""
 
-    path = Path(run_dir) / "evidence" / "evidence.jsonl"
+    run, _state = _load_run(run_dir)
+    path = run / "evidence" / "evidence.jsonl"
     evidence: list[dict[str, Any]] = []
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
@@ -795,10 +922,31 @@ def _normalized_text(text: str) -> str:
 
 
 def _numbers(text: str) -> set[str]:
-    return {
-        token.lstrip("+").removesuffix("%")
-        for token in _NUMBER.findall(unicodedata.normalize("NFKC", text))
-    }
+    values: set[str] = set()
+    for token in _NUMBER.findall(unicodedata.normalize("NFKC", text)):
+        try:
+            values.add(_canonical_number(token))
+        except InvalidOperation:
+            continue
+    return values
+
+
+def _canonical_number(token: str) -> str:
+    normalized = unicodedata.normalize("NFKC", token).strip()
+    percent = normalized.endswith("%")
+    numeric = normalized.removesuffix("%").replace(",", "")
+    value = Decimal(numeric)
+    if not value.is_finite():
+        raise InvalidOperation
+    if value == value.to_integral():
+        result = str(int(value))
+    else:
+        result = format(value.normalize(), "f")
+    return result + ("%" if percent else "")
+
+
+def _number_without_unit(value: str) -> str:
+    return value.removesuffix("%")
 
 
 def _evaluate_arithmetic(expression: str) -> float:
@@ -887,15 +1035,22 @@ def validate_grounding(
             ):
                 errors.append({"claim_id": claim_id, "code": "invalid_derived_formula"})
             else:
-                inputs = {str(value).lstrip("+") for value in formula["inputs"]}
+                try:
+                    inputs = {_canonical_number(str(value)) for value in formula["inputs"]}
+                    result = _canonical_number(str(formula["result"]))
+                except (InvalidOperation, ValueError):
+                    inputs = set()
+                    result = ""
                 if not inputs or not inputs.issubset(supported_numbers):
                     errors.append({"claim_id": claim_id, "code": "unsupported_formula_input"})
                 expression_numbers = _numbers(str(formula["expression"]))
-                result = str(formula["result"]).lstrip("+")
+                expression_values = {_number_without_unit(value) for value in expression_numbers}
                 if (
                     not result
-                    or result not in expression_numbers
-                    or not inputs.issubset(expression_numbers)
+                    or _number_without_unit(result) not in expression_values
+                    or not {
+                        _number_without_unit(value) for value in inputs
+                    }.issubset(expression_values)
                     or not _formula_is_correct(str(formula["expression"]), result)
                 ):
                     errors.append({"claim_id": claim_id, "code": "invalid_derived_formula"})
@@ -917,13 +1072,20 @@ def _load_visuals(run: Path) -> dict[str, Any]:
 def bind_host_vlm_visuals(run_dir: Path | str, review: Mapping[str, Any]) -> dict[str, Any]:
     """Bind PDF visual candidates to caption evidence after host-VLM inspection."""
 
-    run = Path(run_dir).absolute()
+    run, state = _load_run(run_dir)
+    _verify_source_contract(run, state)
     if review.get("reviewer_mode") not in {"fresh_host_vlm", "fresh_subagent"}:
         raise ContractError("visual review requires a fresh vision-capable reviewer")
+    source_manifest_sha256 = sha256_file(run / "evidence" / "source_manifest.json")
+    source_visuals_sha256 = sha256_file(run / "evidence" / "source_visuals.json")
+    if review.get("source_manifest_sha256") != source_manifest_sha256:
+        raise ContractError("visual review is bound to a different source manifest")
+    if review.get("source_visuals_sha256") != source_visuals_sha256:
+        raise ContractError("visual review is bound to a different visual catalog")
     matches = review.get("matches")
     if not isinstance(matches, list) or not matches:
         raise ContractError("visual review requires matches")
-    evidence_ids = {item["id"] for item in load_evidence(run)}
+    evidence_by_id = {item["id"]: item for item in load_evidence(run)}
     contract = _load_visuals(run)
     by_id = {item.get("id"): item for item in contract["visuals"]}
     for match in matches:
@@ -932,11 +1094,18 @@ def bind_host_vlm_visuals(run_dir: Path | str, review: Mapping[str, Any]) -> dic
         visual_id = match.get("visual_id")
         visual = by_id.get(visual_id)
         caption_id = match.get("caption_evidence_id")
+        caption = evidence_by_id.get(caption_id)
         confidence = match.get("confidence")
         roles = match.get("allowed_content_roles")
         if visual is None or visual.get("origin") != "pdf_extracted":
             raise ContractError(f"unknown PDF visual: {visual_id}")
-        if caption_id not in evidence_ids or not isinstance(confidence, (int, float)) or confidence < 0.8:
+        if (
+            caption is None
+            or match.get("visual_sha256") != visual.get("sha256")
+            or match.get("caption_evidence_sha256") != caption.get("sha256")
+            or not isinstance(confidence, (int, float))
+            or confidence < 0.8
+        ):
             raise ContractError(f"insufficient visual-caption binding: {visual_id}")
         if not isinstance(roles, list) or not roles or any(role not in _DEFAULT_VISUAL_ROLES for role in roles):
             raise ContractError(f"invalid visual roles: {visual_id}")
@@ -949,9 +1118,7 @@ def bind_host_vlm_visuals(run_dir: Path | str, review: Mapping[str, Any]) -> dic
             }
         )
     sidecar = {"format_version": FORMAT_VERSION, **redact_secrets(dict(review))}
-    sidecar["source_visuals_sha256_before_binding"] = sha256_file(
-        run / "evidence" / "source_visuals.json"
-    )
+    sidecar["source_visuals_sha256_before_binding"] = source_visuals_sha256
     atomic_write_json(run / "evidence" / "host-vlm-visual-review.json", sidecar)
     atomic_write_json(run / "evidence" / "source_visuals.json", contract)
     manifest = _read_json(run / "evidence" / "source_manifest.json")
@@ -967,7 +1134,7 @@ def validate_visual_plan(
 ) -> dict[str, Any]:
     """Validate eligible visual roles and per-visual reuse limits."""
 
-    run = Path(run_dir).absolute()
+    run, _state = _load_run(run_dir)
     visuals = _load_visuals(run)["visuals"]
     by_id = {item.get("id"): item for item in visuals}
     counts: Counter[str] = Counter()
@@ -1004,6 +1171,7 @@ def write_source_map(
         "authoring", "deterministic_passed", "semantic_passed"
     }:
         raise StateError("source map must target the active attempt")
+    _verify_source_contract(run, state)
     clean_claims = [dict(claim) for claim in claims]
     grounding = validate_grounding(clean_claims, load_evidence(run))
     if not grounding["valid"]:
@@ -1016,7 +1184,8 @@ def write_source_map(
         "claims": clean_claims,
         "grounding": grounding,
     }
-    destination = run / "provenance" / "source-map.json"
+    attempt = safe_path(run / "attempts", attempt_id, must_exist=True)
+    destination = safe_path(attempt, "provenance/source-map.json")
     if destination.exists():
         existing = _read_json(destination)
         if existing != contract:
@@ -1074,12 +1243,16 @@ def record_deterministic_result(
     return report
 
 
-def _validate_deterministic_report(run: Path, attempt_id: str) -> dict[str, Any]:
+def _validate_deterministic_report(
+    run: Path, attempt_id: str, *, require_pass: bool = True
+) -> dict[str, Any]:
     attempt = safe_path(run / "attempts", attempt_id, must_exist=True)
     report = _read_json(attempt / "qa" / "deterministic.json")
     if report.get("format_version") != FORMAT_VERSION or report.get("attempt_id") != attempt_id:
         raise IntegrityError("deterministic report attempt mismatch")
-    if report.get("passed") is not True:
+    if not isinstance(report.get("passed"), bool):
+        raise IntegrityError("deterministic report has no boolean verdict")
+    if require_pass and report.get("passed") is not True:
         raise IntegrityError("deterministic report is not passing")
     artifacts = report.get("artifact_hashes")
     previews = report.get("previews")
@@ -1197,6 +1370,16 @@ def _apply_semantic_review_state(run: Path, value: Mapping[str, Any]) -> None:
         mark_side_state(run, "failed", reason="semantic review failed")
 
 
+def _read_validated_semantic_review(run: Path, attempt_id: str) -> dict[str, Any]:
+    context = _validate_review_context(run, attempt_id)
+    review_path = safe_path(
+        run / "attempts" / attempt_id,
+        "qa/semantic-review.json",
+        must_exist=True,
+    )
+    return _validate_semantic_review_value(context, attempt_id, _read_json(review_path))
+
+
 def record_semantic_review(
     run_dir: Path | str,
     attempt_id: str,
@@ -1250,6 +1433,33 @@ def _verify_delivery(directory: Path) -> dict[str, Any]:
     files = manifest.get("files")
     if manifest.get("format_version") != FORMAT_VERSION or not isinstance(files, dict) or not files:
         raise IntegrityError("invalid delivery manifest")
+    actual_files: set[str] = set()
+    actual_directories: set[str] = set()
+    for current, directories, names in os.walk(directory, followlinks=False):
+        current_path = Path(current)
+        for name in directories:
+            path = current_path / name
+            if path.is_symlink():
+                raise PathSafetyError(f"delivery directory contains a symlink: {path}")
+            actual_directories.add(path.relative_to(directory).as_posix())
+        for name in names:
+            path = current_path / name
+            if path.is_symlink() or not path.is_file():
+                raise PathSafetyError(f"delivery contains a non-regular file: {path}")
+            relative = path.relative_to(directory).as_posix()
+            if relative != "delivery-manifest.json":
+                actual_files.add(relative)
+    expected_files = set(files)
+    if actual_files != expected_files:
+        raise IntegrityError("delivery contents do not exactly match the manifest")
+    expected_directories: set[str] = set()
+    for relative in expected_files:
+        parent = Path(relative).parent
+        while parent != Path("."):
+            expected_directories.add(parent.as_posix())
+            parent = parent.parent
+    if actual_directories != expected_directories:
+        raise IntegrityError("delivery contains unlisted directories")
     for relative, digest in files.items():
         if sha256_file(safe_path(directory, relative, must_exist=True)) != digest:
             raise IntegrityError(f"final delivery hash mismatch: {relative}")
@@ -1269,6 +1479,7 @@ def finalize_attempt(
     """Stage and atomically promote a verified attempt without overwriting final."""
 
     run, state = _load_run(run_dir)
+    _verify_source_contract(run, state)
     final = run / "final"
     if final.exists() or final.is_symlink():
         manifest = _verify_final(run)
@@ -1281,18 +1492,12 @@ def finalize_attempt(
     if state.get("active_attempt") != attempt_id or state.get("state") not in {"semantic_passed", "needs_visual_review"}:
         raise StateError("finalization requires the active reviewed attempt")
     if state["state"] == "semantic_passed":
-        _validate_review_context(run, attempt_id)
-        review = _read_json(
-            safe_path(run / "attempts" / attempt_id, "qa/semantic-review.json", must_exist=True)
-        )
+        review = _read_validated_semantic_review(run, attempt_id)
         if review.get("verdict") != "pass" or review.get("blockers"):
             raise IntegrityError("semantic review is not passing")
         status = "verified"
     else:
-        _validate_review_context(run, attempt_id)
-        review = _read_json(
-            safe_path(run / "attempts" / attempt_id, "qa/semantic-review.json", must_exist=True)
-        )
+        review = _read_validated_semantic_review(run, attempt_id)
         if review.get("verdict") != "needs_visual_review":
             raise IntegrityError("visual-review delivery lacks the matching review verdict")
         status = "needs_visual_review"
@@ -1310,18 +1515,22 @@ def finalize_attempt(
                 target = safe_path(stage, relative)
                 target.parent.mkdir(parents=True, exist_ok=True)
                 atomic_write_bytes(target, source.read_bytes())
-        source_map = run / "provenance" / "source-map.json"
-        if source_map.is_file():
-            source_map_contract = _read_json(source_map)
-            if source_map_contract.get("attempt_id") != attempt_id:
-                raise IntegrityError("source map targets the wrong attempt")
-            if source_map_contract.get("source_manifest_sha256") != sha256_file(
-                run / "evidence" / "source_manifest.json"
-            ):
-                raise IntegrityError("source map source binding is stale")
-            target = stage / "provenance" / "source-map.json"
-            target.parent.mkdir(parents=True, exist_ok=True)
-            atomic_write_bytes(target, source_map.read_bytes())
+        source_map = safe_path(
+            run / "attempts" / attempt_id,
+            "provenance/source-map.json",
+        )
+        if not source_map.is_file():
+            raise IntegrityError("finalization requires the active attempt source map")
+        source_map_contract = _read_json(source_map)
+        if source_map_contract.get("attempt_id") != attempt_id:
+            raise IntegrityError("source map targets the wrong attempt")
+        if source_map_contract.get("source_manifest_sha256") != sha256_file(
+            run / "evidence" / "source_manifest.json"
+        ):
+            raise IntegrityError("source map source binding is stale")
+        target = stage / "provenance" / "source-map.json"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_bytes(target, source_map.read_bytes())
         if fail_at == "after_copy":
             raise SimulatedCrash("after final staging copy")
         manifest = _delivery_manifest(stage, attempt_id, status)
@@ -1351,6 +1560,11 @@ def resume_run(
     run, state = _load_run(run_dir)
     verify_skill_snapshot(run, skill_root=skill_root)
     _verify_source_contract(run, state)
+    if state.get("state") in {"semantic_passed", "needs_visual_review"}:
+        active_review_attempt = state.get("active_attempt")
+        if not isinstance(active_review_attempt, str):
+            raise IntegrityError("reviewed state has no active attempt")
+        _read_validated_semantic_review(run, active_review_attempt)
     if (run / "final").exists():
         manifest = _verify_final(run)
         if state.get("active_attempt") and manifest.get("attempt_id") != state.get("active_attempt"):
@@ -1391,11 +1605,17 @@ def resume_run(
     attempt = safe_path(run / "attempts", attempt_id, must_exist=True)
     deterministic = attempt / "qa" / "deterministic.json"
     if current == "authoring" and deterministic.is_file():
-        _validate_deterministic_report(run, attempt_id)
-        state["state"] = "deterministic_passed"
-        _write_run(run, state)
-        _event(run, "crash_recovered", boundary="deterministic_qa_write")
-        current = "deterministic_passed"
+        report = _validate_deterministic_report(run, attempt_id, require_pass=False)
+        if report["passed"]:
+            state["state"] = "deterministic_passed"
+            _write_run(run, state)
+            _event(run, "crash_recovered", boundary="deterministic_qa_write")
+            current = "deterministic_passed"
+        else:
+            mark_side_state(run, "failed", reason="deterministic checks failed")
+            state = _read_json(run / "run.json")
+            _event(run, "crash_recovered", boundary="failed_deterministic_qa_write")
+            return {**state, "next_action": "repair"}
     if current == "authoring":
         has_artifact = any(path.is_file() for path in (attempt / "artifact").rglob("*"))
         return {**state, "next_action": "validate" if has_artifact else "author"}

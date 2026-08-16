@@ -10,20 +10,26 @@ Do not invent evidence IDs or treat a citation ID as proof by itself.
 2. Prepare the user's source. Text and Markdown receive stable section/line
    anchors. Fully verified PDF preparation requires `pdftotext`, `pdfinfo`,
    `pdftoppm`, and `pdfimages`; a missing or failing command is `blocked`.
+   A blocked preparation may be retried after stale partial PDF outputs are
+   cleared. A ready source is immutable; use a new run for another source.
 3. Read `evidence/evidence.jsonl` and retrieve relevant entries lexically before
    drafting claims. Preserve the cited IDs in the artifact source map.
 4. Validate claims before deterministic artifact QA. A direct quote must be a
    normalized substring of quote-safe cited evidence. Every visible number must
    occur in cited evidence or be the result of an explicit formula whose inputs
-   occur there. Other claims need meaningful lexical overlap. Semantic review
-   remains responsible for paraphrase fidelity.
+   occur there. Percent values remain distinct from unitless values; commas and
+   scientific notation normalize without discarding units. Other claims need
+   meaningful lexical overlap. Semantic review remains responsible for
+   paraphrase fidelity.
 
 ## Visual evidence
 
 `evidence/source_visuals.json` is the only visual catalog. Explicit attached
 images begin eligible. PDF-extracted candidates remain `review_required` until
 a fresh host-VLM or reviewer sidecar binds the visual to caption evidence with
-adequate confidence and declares allowed content roles. Plans must respect each
+adequate confidence and declares allowed content roles. The sidecar repeats the
+source-manifest, visual-catalog, visual-file, and caption-evidence hashes, so a
+review from another source cannot authorize reuse. Plans must respect each
 visual's role allowlist and reuse limit.
 
 Reference images are style-only. Never copy their text, logos, claims, figures,
@@ -37,3 +43,5 @@ or frame set, source-manifest hash, and rubric hash. Reject stale, partial,
 wrong-attempt, or incomplete reviews. Finalization stages one passing attempt,
 atomically promotes it, never overwrites an existing delivery, and labels a
 vision-unreviewed delivery `needs_visual_review` rather than verified.
+Source maps live under their attempt directory; finalization promotes only the
+selected attempt's map and preserves all earlier attempt history.

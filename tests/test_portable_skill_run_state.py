@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -48,8 +49,25 @@ class PortableSkillRunStateTests(unittest.TestCase):
 
     def _begin_attempt(self) -> str:
         self._initialize()
+        source = self.root / f"default-source-{self.run.name}.txt"
+        source.write_text(
+            "Grounded poster source reports 85% accuracy.\n", encoding="utf-8"
+        )
+        core.prepare_source(self.run, source)
         core.save_plan(self.run, {"artifact_type": "poster", "visual_allocations": []})
-        return core.begin_attempt(self.run)
+        attempt = core.begin_attempt(self.run)
+        core.write_source_map(
+            self.run,
+            attempt,
+            [
+                {
+                    "id": "default-claim",
+                    "text": "The source reports 85% accuracy.",
+                    "source_ids": ["ev-001"],
+                }
+            ],
+        )
+        return attempt
 
     def _deterministic_attempt(self) -> tuple[str, dict[str, object]]:
         attempt = self._begin_attempt()
@@ -94,6 +112,64 @@ class PortableSkillRunStateTests(unittest.TestCase):
         stored = core.record_semantic_review(self.run, attempt, review)
         return attempt, stored
 
+    def _fake_poppler(
+        self,
+        name: str,
+        *,
+        text: str = "Sparse routing reaches 85% accuracy.\n",
+        page_count: int = 1,
+        image_rows: tuple[tuple[int, int], ...] = ((1, 0),),
+        extracted_image_count: int | None = None,
+        fail_extract: bool = False,
+    ) -> dict[str, Path]:
+        bin_dir = self.root / name
+        bin_dir.mkdir()
+        script = f'''#!/usr/bin/env python3
+import sys
+from pathlib import Path
+
+name = Path(sys.argv[0]).name
+if name == "pdfinfo":
+    print("Pages: {page_count}")
+elif name == "pdftotext":
+    Path(sys.argv[-1]).write_text({text!r}, encoding="utf-8")
+elif name == "pdftoppm":
+    for page in range(1, {page_count} + 1):
+        Path(sys.argv[-1] + f"-{{page}}.png").write_bytes(f"page-{{page}}".encode())
+elif name == "pdfimages" and "-list" in sys.argv:
+    print("page num type width height color comp bpc enc interp object ID x-ppi y-ppi size ratio")
+    for page, number in {image_rows!r}:
+        print(f"{{page}} {{number}} image 10 10 rgb 3 8 image no {{number}} 0 72 72 1B 1%")
+elif name == "pdfimages":
+    for index in range({len(image_rows) if extracted_image_count is None else extracted_image_count}):
+        Path(sys.argv[-1] + f"-{{index:03d}}.png").write_bytes(f"image-{{index}}".encode())
+    if {fail_extract!r}:
+        raise SystemExit(1)
+'''
+        tools: dict[str, Path] = {}
+        for tool_name in ("pdftotext", "pdfinfo", "pdftoppm", "pdfimages"):
+            executable = bin_dir / tool_name
+            executable.write_text(script, encoding="utf-8")
+            executable.chmod(0o755)
+            tools[tool_name] = executable
+        return tools
+
+    def _prepare_pdf(
+        self,
+        *,
+        run: Path | None = None,
+        source_bytes: bytes = b"%PDF-1.4\nfixture\n",
+        tools: dict[str, Path] | None = None,
+    ) -> dict[str, object]:
+        target_run = run or self.run
+        source = self.root / f"paper-{target_run.name}.pdf"
+        source.write_bytes(source_bytes)
+        return core.prepare_source(
+            target_run,
+            source,
+            tool_paths=tools or self._fake_poppler(f"tools-{target_run.name}"),
+        )
+
     def test_safe_path_rejects_absolute_traversal_and_symlink_escape(self) -> None:
         root = self.root / "safe"
         root.mkdir()
@@ -106,6 +182,24 @@ class PortableSkillRunStateTests(unittest.TestCase):
             with self.subTest(candidate=candidate):
                 with self.assertRaises(core.PathSafetyError):
                     core.safe_path(root, candidate)
+
+    def test_run_operations_reject_symlinked_internal_directories_without_external_writes(self) -> None:
+        for relative in ("input", "evidence/assets"):
+            with self.subTest(relative=relative):
+                self.run = self.root / "workspace" / relative.replace("/", "-")
+                self._initialize()
+                target = self.run / relative
+                shutil.rmtree(target)
+                outside = self.root / f"outside-{relative.replace('/', '-')}"
+                outside.mkdir()
+                target.symlink_to(outside, target_is_directory=True)
+                source = self.root / f"source-{relative.replace('/', '-')}.txt"
+                source.write_text("Grounded source.\n", encoding="utf-8")
+                asset = self.root / f"asset-{relative.replace('/', '-')}.png"
+                asset.write_bytes(b"asset")
+                with self.assertRaises(core.PathSafetyError):
+                    core.prepare_source(self.run, source, extra_assets=[asset])
+                self.assertEqual(list(outside.iterdir()), [])
 
     def test_atomic_writes_and_append_only_jsonl_are_complete(self) -> None:
         target = self.root / "state" / "record.json"
@@ -135,6 +229,21 @@ class PortableSkillRunStateTests(unittest.TestCase):
         self.assertEqual(redacted["nested"]["Authorization"], "[REDACTED]")
         self.assertEqual(redacted["nested"]["ok"], "visible")
         self.assertNotIn("hunter2", redacted["message"])
+
+    def test_secret_redaction_removes_complete_authentication_header_values(self) -> None:
+        redacted = core.redact_secrets(
+            "Cookie: sid=abc; theme=dark\n"
+            "Set-Cookie: session=secret; HttpOnly; Path=/\n"
+            "Authorization: Basic Zm9vOmJhcg==\n"
+            "X-Visible: keep"
+        )
+        self.assertEqual(
+            redacted,
+            "Cookie: [REDACTED]\n"
+            "Set-Cookie: [REDACTED]\n"
+            "Authorization: [REDACTED]\n"
+            "X-Visible: keep",
+        )
 
     def test_initialize_snapshots_all_runtime_files_without_writing_install(self) -> None:
         before = core.tree_hash(self.skill)
@@ -173,6 +282,30 @@ class PortableSkillRunStateTests(unittest.TestCase):
         core.atomic_write_json(manifest_path, manifest)
         with self.assertRaises(core.IntegrityError):
             core.verify_skill_snapshot(self.run)
+
+    def test_snapshot_verification_rejects_unlisted_extra_files(self) -> None:
+        self._initialize()
+        extra = self.run / "skill_snapshot" / "files" / "scripts" / "unlisted.py"
+        extra.write_text("UNLISTED = True\n", encoding="utf-8")
+        with self.assertRaises(core.IntegrityError):
+            core.verify_skill_snapshot(self.run)
+
+    def test_existing_run_rejects_release_version_and_archive_drift(self) -> None:
+        self._initialize()
+        with self.assertRaises(core.IntegrityError):
+            core.initialize_run(
+                self.run,
+                self.skill,
+                release_version="0.2.0",
+                archive_sha256="a" * 64,
+            )
+        with self.assertRaises(core.IntegrityError):
+            core.initialize_run(
+                self.run,
+                self.skill,
+                release_version="0.1.0",
+                archive_sha256="b" * 64,
+            )
 
     def _initialize_fresh(self, suffix: str) -> None:
         self.run = self.root / "workspace" / suffix
@@ -251,6 +384,7 @@ elif name == "pdftoppm":
     Path(sys.argv[-1] + "-1.png").write_bytes(b"page")
 elif name == "pdfimages" and "-list" in sys.argv:
     print("page num type width height")
+    print("1 0 image 10 10")
 elif name == "pdfimages":
     Path(sys.argv[-1] + "-000.png").write_bytes(b"figure")
 """
@@ -282,6 +416,94 @@ elif name == "pdfimages":
         self.assertEqual(visuals[0]["origin"], "pdf_extracted")
         self.assertEqual(visuals[0]["eligibility"], "review_required")
         self.assertEqual(core.load_evidence(self.run)[0]["anchor"]["page"], 1)
+
+    def test_pdf_retry_removes_stale_pages_and_extracted_images(self) -> None:
+        self._initialize()
+        source = self.root / "retry.pdf"
+        source.write_bytes(b"%PDF-1.4\nretry\n")
+        blocked = core.prepare_source(
+            self.run,
+            source,
+            tool_paths=self._fake_poppler(
+                "poppler-a",
+                text="Source A.\n",
+                page_count=2,
+                image_rows=((1, 0), (2, 1)),
+                fail_extract=True,
+            ),
+        )
+        self.assertEqual(blocked["status"], "blocked")
+        self.assertTrue((self.run / "evidence" / "pages" / "page-2.png").is_file())
+        self.assertTrue((self.run / "evidence" / "assets" / "pdf-image-001.png").is_file())
+
+        ready = core.prepare_source(
+            self.run,
+            source,
+            tool_paths=self._fake_poppler(
+                "poppler-b", text="Source B.\n", page_count=1, image_rows=((1, 7),)
+            ),
+        )
+        self.assertEqual(ready["status"], "ready")
+        self.assertEqual(
+            sorted(path.name for path in (self.run / "evidence" / "pages").iterdir()),
+            ["page-1.png"],
+        )
+        self.assertEqual(
+            sorted(
+                path.name
+                for path in (self.run / "evidence" / "assets").glob("pdf-image*")
+            ),
+            ["pdf-image-000.png"],
+        )
+
+    def test_ready_source_cannot_be_silently_replaced(self) -> None:
+        self._initialize()
+        first = self.root / "first.txt"
+        second = self.root / "second.txt"
+        first.write_text("Source A.\n", encoding="utf-8")
+        second.write_text("Source B.\n", encoding="utf-8")
+        core.prepare_source(self.run, first)
+        before = (self.run / "evidence" / "source_manifest.json").read_bytes()
+        with self.assertRaises(core.StateError):
+            core.prepare_source(self.run, second)
+        self.assertEqual(
+            (self.run / "evidence" / "source_manifest.json").read_bytes(), before
+        )
+
+    def test_pdf_visuals_record_pdfimages_page_and_object_number(self) -> None:
+        self._initialize()
+        manifest = self._prepare_pdf(
+            tools=self._fake_poppler(
+                "poppler-mapping",
+                text="Caption one.\fCaption two.\fCaption three.\n",
+                page_count=3,
+                image_rows=((1, 4), (3, 9)),
+            )
+        )
+        self.assertEqual(manifest["status"], "ready")
+        visuals = json.loads(
+            (self.run / "evidence" / "source_visuals.json").read_text(encoding="utf-8")
+        )["visuals"]
+        self.assertEqual(
+            [(item["page"], item["pdf_image_num"]) for item in visuals],
+            [(1, 4), (3, 9)],
+        )
+
+    def test_pdf_visual_mapping_mismatch_blocks_instead_of_registering_unknown_page(self) -> None:
+        self._initialize()
+        manifest = self._prepare_pdf(
+            tools=self._fake_poppler(
+                "poppler-mismatch",
+                image_rows=(),
+                extracted_image_count=1,
+            )
+        )
+        self.assertEqual(manifest["status"], "blocked")
+        self.assertIn("pdfimages_mapping", manifest["failed_commands"])
+        visuals = json.loads(
+            (self.run / "evidence" / "source_visuals.json").read_text(encoding="utf-8")
+        )["visuals"]
+        self.assertEqual(visuals, [])
 
     def test_read_only_install_tree_remains_unchanged(self) -> None:
         before = core.tree_hash(self.skill)
@@ -329,6 +551,15 @@ elif name == "pdfimages":
         (self.run / "evidence" / "assets" / "pdf-figure.png").write_bytes(b"pdf-image")
         visuals["visuals"].append(pdf_candidate)
         core.atomic_write_json(visuals_path, visuals)
+        source_manifest_path = self.run / "evidence" / "source_manifest.json"
+        source_manifest = json.loads(source_manifest_path.read_text(encoding="utf-8"))
+        source_manifest["source_visuals_sha256"] = core.sha256_file(visuals_path)
+        source_manifest["visual_count"] = len(visuals["visuals"])
+        core.atomic_write_json(source_manifest_path, source_manifest)
+        run_state_path = self.run / "run.json"
+        run_state = json.loads(run_state_path.read_text(encoding="utf-8"))
+        run_state["source_manifest_sha256"] = core.sha256_file(source_manifest_path)
+        core.atomic_write_json(run_state_path, run_state)
         with self.assertRaises(core.ContractError):
             core.validate_visual_plan(
                 self.run, [{"visual_id": "vis-002", "role": "method"}]
@@ -338,10 +569,16 @@ elif name == "pdfimages":
             self.run,
             {
                 "reviewer_mode": "fresh_host_vlm",
+                "source_manifest_sha256": core.sha256_file(
+                    self.run / "evidence" / "source_manifest.json"
+                ),
+                "source_visuals_sha256": core.sha256_file(visuals_path),
                 "matches": [
                     {
                         "visual_id": "vis-002",
+                        "visual_sha256": pdf_candidate["sha256"],
                         "caption_evidence_id": "ev-001",
+                        "caption_evidence_sha256": core.load_evidence(self.run)[0]["sha256"],
                         "confidence": 0.91,
                         "allowed_content_roles": ["method"],
                     }
@@ -353,6 +590,55 @@ elif name == "pdfimages":
                 self.run, [{"visual_id": "vis-002", "role": "method"}]
             )["valid"]
         )
+
+    def test_host_vlm_visual_review_is_bound_to_source_visual_and_caption_hashes(self) -> None:
+        self._initialize()
+        self._prepare_pdf(
+            tools=self._fake_poppler(
+                "poppler-bound-a", text="Figure A caption.\n", image_rows=((1, 2),)
+            )
+        )
+        visual_contract = json.loads(
+            (self.run / "evidence" / "source_visuals.json").read_text(encoding="utf-8")
+        )
+        visual = visual_contract["visuals"][0]
+        evidence = core.load_evidence(self.run)[0]
+        review = {
+            "reviewer_mode": "fresh_host_vlm",
+            "source_manifest_sha256": core.sha256_file(
+                self.run / "evidence" / "source_manifest.json"
+            ),
+            "source_visuals_sha256": core.sha256_file(
+                self.run / "evidence" / "source_visuals.json"
+            ),
+            "matches": [
+                {
+                    "visual_id": visual["id"],
+                    "visual_sha256": visual["sha256"],
+                    "caption_evidence_id": evidence["id"],
+                    "caption_evidence_sha256": evidence["sha256"],
+                    "confidence": 0.95,
+                    "allowed_content_roles": ["method"],
+                }
+            ],
+        }
+
+        other_run = self.root / "workspace" / "other-run"
+        core.initialize_run(
+            other_run,
+            self.skill,
+            release_version="0.1.0",
+            archive_sha256="a" * 64,
+        )
+        self._prepare_pdf(
+            run=other_run,
+            source_bytes=b"%PDF-1.4\nsource-b\n",
+            tools=self._fake_poppler(
+                "poppler-bound-b", text="Figure B caption.\n", image_rows=((1, 2),)
+            ),
+        )
+        with self.assertRaises(core.ContractError):
+            core.bind_host_vlm_visuals(other_run, review)
 
     def test_reference_images_are_separate_and_style_only(self) -> None:
         self._initialize()
@@ -395,7 +681,7 @@ elif name == "pdfimages":
                     "id": "c3",
                     "text": "The absolute improvement is 5%.",
                     "source_ids": ["ev-001"],
-                    "derived_formula": {"expression": "85 - 80 = 5", "inputs": ["85", "80"], "result": "5"},
+                    "derived_formula": {"expression": "85 - 80 = 5", "inputs": ["85%", "80%"], "result": "5%"},
                 },
             ],
             evidence,
@@ -423,8 +709,8 @@ elif name == "pdfimages":
                     "source_ids": ["ev-001"],
                     "derived_formula": {
                         "expression": "85 - 80 = 6",
-                        "inputs": ["85", "80"],
-                        "result": "6",
+                        "inputs": ["85%", "80%"],
+                        "result": "6%",
                     },
                 }
             ],
@@ -432,6 +718,62 @@ elif name == "pdfimages":
         )
         self.assertFalse(bad_formula["valid"])
         self.assertIn("invalid_derived_formula", {error["code"] for error in bad_formula["errors"]})
+
+    def test_numeric_grounding_preserves_percent_units_and_normalizes_number_formats(self) -> None:
+        text = "Accuracy is 85%, with 1,234.5 examples and 1.2e3 evaluation cases."
+        evidence = [
+            {
+                "id": "ev-001",
+                "kind": "text",
+                "text": text,
+                "safe_to_quote": True,
+                "anchor": {"line_start": 1, "line_end": 1},
+                "sha256": hashlib.sha256(text.encode()).hexdigest(),
+            }
+        ]
+        valid = core.validate_grounding(
+            [
+                {"id": "percent", "text": "Accuracy is 85%.", "source_ids": ["ev-001"]},
+                {"id": "comma", "text": "There are 1234.5 examples.", "source_ids": ["ev-001"]},
+                {"id": "scientific", "text": "There are 1,200 evaluation cases.", "source_ids": ["ev-001"]},
+            ],
+            evidence,
+        )
+        self.assertTrue(valid["valid"], valid)
+        unitless = core.validate_grounding(
+            [{"id": "unitless", "text": "Accuracy is 85.", "source_ids": ["ev-001"]}],
+            evidence,
+        )
+        self.assertFalse(unitless["valid"])
+        self.assertIn("unsupported_numeric", {item["code"] for item in unitless["errors"]})
+
+        percent_formula = core.validate_grounding(
+            [
+                {
+                    "id": "formula",
+                    "text": "Accuracy improves by 5%.",
+                    "source_ids": ["ev-002"],
+                    "derived_formula": {
+                        "expression": "85 - 80 = 5",
+                        "inputs": ["85%", "80%"],
+                        "result": "5%",
+                    },
+                }
+            ],
+            [
+                {
+                    "id": "ev-002",
+                    "kind": "text",
+                    "text": "Accuracy improves from 80% to 85%.",
+                    "safe_to_quote": True,
+                    "anchor": {"line_start": 1, "line_end": 1},
+                    "sha256": hashlib.sha256(
+                        b"Accuracy improves from 80% to 85%."
+                    ).hexdigest(),
+                }
+            ],
+        )
+        self.assertTrue(percent_formula["valid"], percent_formula)
 
     def test_visual_role_and_reuse_limits_are_enforced(self) -> None:
         self._initialize()
@@ -476,6 +818,140 @@ elif name == "pdfimages":
                 [{"id": "claim-002", "text": "Accuracy reaches 99%.", "source_ids": ["ev-001"]}],
             )
 
+    def test_source_maps_are_attempt_scoped_and_final_promotes_only_selected_attempt(self) -> None:
+        self._initialize()
+        source = self.root / "claims.txt"
+        source.write_text("Sparse routing reaches 85% accuracy.\n", encoding="utf-8")
+        core.prepare_source(self.run, source)
+        core.save_plan(self.run, {"artifact_type": "poster"})
+        first = core.begin_attempt(self.run)
+        first_map = core.write_source_map(
+            self.run,
+            first,
+            [{"id": "c1", "text": "Accuracy reaches 85%.", "source_ids": ["ev-001"]}],
+        )
+        core.mark_side_state(self.run, "failed", reason="repair requested")
+        second = core.begin_attempt(self.run)
+        second_map = core.write_source_map(
+            self.run,
+            second,
+            [{"id": "c2", "text": "Sparse routing reaches 85%.", "source_ids": ["ev-001"]}],
+        )
+        self.assertNotEqual(first_map["claims"], second_map["claims"])
+        self.assertTrue(
+            (self.run / "attempts" / first / "provenance" / "source-map.json").is_file()
+        )
+        self.assertTrue(
+            (self.run / "attempts" / second / "provenance" / "source-map.json").is_file()
+        )
+
+        attempt_root = self.run / "attempts" / second
+        core.atomic_write_bytes(attempt_root / "artifact" / "poster.html", b"artifact")
+        core.atomic_write_bytes(attempt_root / "qa" / "previews" / "poster.png", b"preview")
+        core.record_deterministic_result(
+            self.run,
+            second,
+            passed=True,
+            checks=[],
+            artifact_paths=["artifact/poster.html"],
+            preview_paths={"poster": "qa/previews/poster.png"},
+        )
+        context = core.create_review_context(
+            self.run, second, rubric={"format_version": 1, "dimensions": ["fidelity"]}
+        )
+        core.record_semantic_review(
+            self.run,
+            second,
+            {
+                "format_version": 1,
+                "attempt_id": second,
+                "review_context_sha256": context["context_sha256"],
+                "artifact_hashes": context["artifact_hashes"],
+                "preview_hashes": context["preview_hashes"],
+                "reviewed_frame_ids": sorted(context["preview_hashes"]),
+                "source_manifest_sha256": context["source_manifest_sha256"],
+                "rubric_sha256": context["rubric_sha256"],
+                "reviewer_mode": "fresh_subagent",
+                "dimension_scores": {"fidelity": 4},
+                "blockers": [],
+                "localized_repairs": [],
+                "verdict": "pass",
+                "complete": True,
+            },
+        )
+        core.finalize_attempt(self.run, second)
+        promoted = json.loads(
+            (self.run / "final" / "provenance" / "source-map.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(promoted["attempt_id"], second)
+        self.assertEqual(promoted["claims"], second_map["claims"])
+
+    def test_source_map_and_finalization_reverify_full_source_contract(self) -> None:
+        self._initialize()
+        source = self.root / "tamper.txt"
+        source.write_text("Grounded accuracy is 85%.\n", encoding="utf-8")
+        core.prepare_source(self.run, source)
+        core.save_plan(self.run, {"artifact_type": "poster"})
+        attempt = core.begin_attempt(self.run)
+        evidence_path = self.run / "evidence" / "evidence.jsonl"
+        evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+        evidence["text"] = "Tampered accuracy is 99%."
+        evidence["sha256"] = hashlib.sha256(evidence["text"].encode()).hexdigest()
+        evidence_path.write_text(json.dumps(evidence) + "\n", encoding="utf-8")
+        with self.assertRaises(core.IntegrityError):
+            core.write_source_map(
+                self.run,
+                attempt,
+                [{"id": "c1", "text": "Accuracy is 99%.", "source_ids": ["ev-001"]}],
+            )
+
+        # Use a separate intact run to reach semantic_passed, then tamper evidence.
+        self.run = self.root / "workspace" / "tamper-finalize"
+        self._initialize()
+        core.prepare_source(self.run, source)
+        core.save_plan(self.run, {"artifact_type": "poster"})
+        attempt = core.begin_attempt(self.run)
+        attempt_root = self.run / "attempts" / attempt
+        core.atomic_write_bytes(attempt_root / "artifact" / "poster.html", b"artifact")
+        core.atomic_write_bytes(attempt_root / "qa" / "previews" / "poster.png", b"preview")
+        core.record_deterministic_result(
+            self.run,
+            attempt,
+            passed=True,
+            checks=[],
+            artifact_paths=["artifact/poster.html"],
+            preview_paths={"poster": "qa/previews/poster.png"},
+        )
+        context = core.create_review_context(
+            self.run, attempt, rubric={"format_version": 1, "dimensions": ["fidelity"]}
+        )
+        review = {
+            "format_version": 1,
+            "attempt_id": attempt,
+            "review_context_sha256": context["context_sha256"],
+            "artifact_hashes": context["artifact_hashes"],
+            "preview_hashes": context["preview_hashes"],
+            "reviewed_frame_ids": sorted(context["preview_hashes"]),
+            "source_manifest_sha256": context["source_manifest_sha256"],
+            "rubric_sha256": context["rubric_sha256"],
+            "reviewer_mode": "fresh_subagent",
+            "dimension_scores": {"fidelity": 4},
+            "blockers": [],
+            "localized_repairs": [],
+            "verdict": "pass",
+            "complete": True,
+        }
+        core.record_semantic_review(self.run, attempt, review)
+        evidence_path = self.run / "evidence" / "evidence.jsonl"
+        evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+        evidence["text"] = "Tampered but internally hashed."
+        evidence["sha256"] = hashlib.sha256(evidence["text"].encode()).hexdigest()
+        evidence_path.write_text(json.dumps(evidence) + "\n", encoding="utf-8")
+        with self.assertRaises(core.IntegrityError):
+            core.finalize_attempt(self.run, attempt)
+
     def test_state_machine_and_idempotent_resume_recover_artifact_and_qa_writes(self) -> None:
         attempt = self._begin_attempt()
         self.assertEqual(attempt, "01")
@@ -501,12 +977,35 @@ elif name == "pdfimages":
         self.assertEqual(recovered["state"], "deterministic_passed")
         self.assertEqual(recovered["next_action"], "semantic_review")
 
+    def test_resume_recovers_failed_deterministic_qa_write_to_repair(self) -> None:
+        attempt = self._begin_attempt()
+        attempt_root = self.run / "attempts" / attempt
+        core.atomic_write_bytes(attempt_root / "artifact" / "poster.html", b"artifact")
+        with self.assertRaises(core.SimulatedCrash):
+            core.record_deterministic_result(
+                self.run,
+                attempt,
+                passed=False,
+                checks=[{"id": "geometry", "passed": False}],
+                artifact_paths=["artifact/poster.html"],
+                preview_paths={},
+                fail_after_write=True,
+            )
+        status = core.resume_run(self.run)
+        self.assertEqual(status["state"], "failed")
+        self.assertEqual(status["next_action"], "repair")
+
     def test_invalid_state_transition_is_rejected(self) -> None:
         self._initialize()
         with self.assertRaises(core.StateError):
             core.begin_attempt(self.run)
         with self.assertRaises(core.StateError):
             core.transition_state(self.run, "finalized")
+
+    def test_planning_requires_a_ready_source(self) -> None:
+        self._initialize()
+        with self.assertRaises(core.StateError):
+            core.save_plan(self.run, {"artifact_type": "poster"})
 
     def test_side_states_are_explicit_and_resume_reports_them(self) -> None:
         self._initialize()
@@ -640,6 +1139,26 @@ elif name == "pdfimages":
         self.assertEqual(status["state"], "semantic_passed")
         self.assertEqual(status["next_action"], "finalize")
 
+    def test_resume_and_finalize_revalidate_persisted_semantic_review_schema(self) -> None:
+        mutations = (
+            {"reviewed_frame_ids": []},
+            {"reviewer_mode": "author"},
+            {"dimension_scores": {"fidelity": 99}},
+            {"unexpected": True},
+        )
+        for index, mutation in enumerate(mutations):
+            with self.subTest(mutation=mutation):
+                self.run = self.root / "workspace" / f"semantic-tamper-{index}"
+                attempt, _ = self._semantic_attempt()
+                review_path = self.run / "attempts" / attempt / "qa" / "semantic-review.json"
+                review = json.loads(review_path.read_text(encoding="utf-8"))
+                review.update(mutation)
+                core.atomic_write_json(review_path, review)
+                with self.assertRaises(core.ContractError):
+                    core.resume_run(self.run)
+                with self.assertRaises(core.ContractError):
+                    core.finalize_attempt(self.run, attempt)
+
     def test_finalization_is_staged_non_overwriting_and_recovers_after_rename(self) -> None:
         attempt, _ = self._semantic_attempt()
         with self.assertRaises(core.SimulatedCrash):
@@ -666,6 +1185,13 @@ elif name == "pdfimages":
         with self.assertRaises(core.PathSafetyError):
             core.finalize_attempt(self.run, attempt)
 
+    def test_finalization_requires_active_attempt_source_map(self) -> None:
+        attempt, _ = self._semantic_attempt()
+        source_map = self.run / "attempts" / attempt / "provenance" / "source-map.json"
+        source_map.unlink()
+        with self.assertRaises(core.IntegrityError):
+            core.finalize_attempt(self.run, attempt)
+
     def test_incomplete_final_staging_is_never_promoted(self) -> None:
         attempt, _ = self._semantic_attempt()
         with self.assertRaises(core.SimulatedCrash):
@@ -688,9 +1214,28 @@ elif name == "pdfimages":
         self.assertEqual(status["next_action"], "complete")
         self.assertTrue((self.run / "final" / "poster.html").is_file())
 
+    def test_delivery_verification_rejects_unlisted_files_and_directories(self) -> None:
+        attempt, _ = self._semantic_attempt()
+        core.finalize_attempt(self.run, attempt)
+        (self.run / "final" / "unlisted.txt").write_text("extra", encoding="utf-8")
+        with self.assertRaises(core.IntegrityError):
+            core.resume_run(self.run)
+
+        self.run = self.root / "workspace" / "stage-extra"
+        attempt, _ = self._semantic_attempt()
+        with self.assertRaises(core.SimulatedCrash):
+            core.finalize_attempt(self.run, attempt, fail_at="after_manifest")
+        (self.run / f".final.staging-{attempt}" / "empty-extra").mkdir()
+        with self.assertRaises(core.IntegrityError):
+            core.resume_run(self.run)
+
     def test_sync_script_keeps_all_four_vendored_copies_byte_identical(self) -> None:
         completed = subprocess.run(
-            [sys.executable, str(REPO_ROOT / "scripts" / "sync_agent_skill_core.py")],
+            [
+                sys.executable,
+                str(REPO_ROOT / "scripts" / "sync_agent_skill_core.py"),
+                "--check",
+            ],
             cwd=REPO_ROOT,
             text=True,
             capture_output=True,
@@ -709,6 +1254,86 @@ elif name == "pdfimages":
                     (REPO_ROOT / "agent_skills" / skill_name / "references" / "source-grounding.md").read_bytes(),
                     grounding_bytes,
                 )
+
+    def test_sync_check_reports_drift_without_mutating_target(self) -> None:
+        root = self.root / "agent_skills"
+        shared = root / "_shared"
+        shared.mkdir(parents=True)
+        (shared / "portable_core.py").write_bytes(b"canonical-core")
+        (shared / "source-grounding.md").write_bytes(b"canonical-grounding")
+        for skill in SKILLS:
+            (root / skill / "scripts").mkdir(parents=True)
+            (root / skill / "references").mkdir()
+            (root / skill / "scripts" / "_portable.py").write_bytes(b"drifted-core")
+            (root / skill / "references" / "source-grounding.md").write_bytes(
+                b"canonical-grounding"
+            )
+        target = root / SKILLS[0] / "scripts" / "_portable.py"
+        before = target.read_bytes()
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(REPO_ROOT / "scripts" / "sync_agent_skill_core.py"),
+                "--root",
+                str(root),
+                "--check",
+            ],
+            cwd=REPO_ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 1)
+        self.assertIn("DRIFT:", completed.stdout)
+        self.assertEqual(target.read_bytes(), before)
+
+    def test_sync_rejects_symlinked_packages_directories_and_targets(self) -> None:
+        cases = ("package", "scripts", "references", "target")
+        for case in cases:
+            with self.subTest(case=case):
+                root = self.root / f"sync-{case}"
+                shared = root / "_shared"
+                shared.mkdir(parents=True)
+                (shared / "portable_core.py").write_bytes(b"canonical-core")
+                (shared / "source-grounding.md").write_bytes(b"canonical-grounding")
+                outside = self.root / f"outside-{case}"
+                outside.mkdir()
+                (outside / "sentinel").write_bytes(b"unchanged")
+                for skill in SKILLS:
+                    package = root / skill
+                    (package / "scripts").mkdir(parents=True)
+                    (package / "references").mkdir()
+                    (package / "scripts" / "_portable.py").write_bytes(b"canonical-core")
+                    (package / "references" / "source-grounding.md").write_bytes(
+                        b"canonical-grounding"
+                    )
+                package = root / SKILLS[0]
+                if case == "package":
+                    shutil.rmtree(package)
+                    package.symlink_to(outside, target_is_directory=True)
+                elif case in {"scripts", "references"}:
+                    shutil.rmtree(package / case)
+                    (package / case).symlink_to(outside, target_is_directory=True)
+                else:
+                    (package / "scripts" / "_portable.py").unlink()
+                    (package / "scripts" / "_portable.py").symlink_to(
+                        outside / "sentinel"
+                    )
+                completed = subprocess.run(
+                    [
+                        sys.executable,
+                        str(REPO_ROOT / "scripts" / "sync_agent_skill_core.py"),
+                        "--root",
+                        str(root),
+                    ],
+                    cwd=REPO_ROOT,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertIn("symlink", completed.stdout + completed.stderr)
+                self.assertEqual((outside / "sentinel").read_bytes(), b"unchanged")
 
 
 if __name__ == "__main__":
