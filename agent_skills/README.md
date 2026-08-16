@@ -36,7 +36,7 @@ below.
 | Poster | Poppler (`pdftotext`, `pdfinfo`, `pdftoppm`, `pdfimages`); its setup installs a pinned browser in the user cache |
 | PPT | Poppler and LibreOffice; its setup installs pinned browser and PPT runtimes in the user cache |
 | Webpage | Poppler; its setup installs a pinned browser in the user cache |
-| Video | Node.js 22+, npm, `ffmpeg`, `ffprobe`, and Python 3.10–3.12 for Kokoro/HyperFrames runtime setup |
+| Video | Poppler (`pdftotext`, `pdfinfo`, `pdftoppm`, `pdfimages`); Node.js 22+, npm, `ffmpeg`, `ffprobe`, and Python 3.10–3.12 for Kokoro/HyperFrames runtime setup |
 
 The setup tools select macOS, Linux, or Windows runtime packages and fail
 closed on unsupported architectures. Run each Skill's `doctor` before its first
