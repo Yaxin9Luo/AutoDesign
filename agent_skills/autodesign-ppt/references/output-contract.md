@@ -10,7 +10,7 @@ different deck or presentation count from 1 through 60. Arabic and common
 Chinese numerals are accepted. The count must be syntactically attached to the
 requested deck, slides, presentation, or a direct resize command such as “Make
 it 14 pages.” Source metadata such as “12-page manuscript”, “25-page article”,
-or “30-page PDF” is not a deck count. The default arc is:
+or “30-page PDF” is not a deck count. The default 18-slot narrative is:
 
 1. cover;
 2. roadmap;
@@ -20,36 +20,50 @@ or “30-page PDF” is not a deck count. The default arc is:
 6. contributions;
 7. method overview;
 8. core mechanism;
-9. algorithm, objective, or architecture;
-10. experimental setup;
+9. algorithm, objective, or architecture when evidenced;
+10. experimental setup when evidenced;
 11. primary results;
-12. robustness;
-13. ablation;
-14. qualitative evidence;
-15. limitations;
+12. robustness when evidenced;
+13. ablation when evidenced;
+14. qualitative evidence when evidenced;
+15. limitations when evidenced;
 16. implications;
 17. takeaways;
 18. closing and discussion.
 
-Combine adjacent roles when the user asks for fewer slides. Add evidence or
-mechanism deep dives before takeaways when the user asks for more. Do not pad
-with section dividers or split one sentence across multiple slides.
+Keep the count at 18 by replacing an unsupported conditional slot with a
+source-backed role from the same narrative phase, rather than inventing an
+experiment. Allowed substitutions are: objective -> method detail or
+architecture detail; setup -> implementation detail or method detail;
+robustness -> results deep dive or evidence analysis; ablation -> evidence
+analysis or results deep dive; qualitative -> case analysis or evidence
+analysis; limitations -> scope and boundaries or implications detail. The
+substitute must have distinctive cited evidence. If neither the conditional
+role nor an allowed substitute is supported, planning fails closed and asks the
+host for a grounded story plan. Combine adjacent roles when the user asks for
+fewer slides. Add evidence or mechanism deep dives before takeaways when the
+user asks for more. Do not pad with section dividers or split one sentence
+across multiple slides.
 
 After querying evidence, the host should pass `plan --story-plan PATH` with a
 version-1 JSON object containing exactly `format_version` and `slides`. `slides`
 contains exactly one object per requested slide, in order, with only:
 
 - `slide_id`: contiguous `slide-01` through `slide-N`;
-- `role`: the corresponding role in the academic arc;
+- `role`: the corresponding role in the academic arc, or one allowed
+  source-backed substitution for that conditional slot;
 - `evidence_refs`: a non-empty, unique list of real evidence IDs.
 
-The harness rejects unknown evidence, wrong roles, wrong order, and count
-mismatches before hashing the immutable plan. If no host story plan is passed,
-the deterministic fallback scores role-distinctive evidence concepts for each
-slide. A match must clear the minimum and beat the runner-up by a fixed margin;
-generic words such as “method” or “result” cannot stand in for missing ablation
-evidence. It does not rotate through extraction order. If a role has no unique,
-distinctive match, planning stops and requests an explicit story plan.
+The harness rejects unknown evidence, ungrounded or out-of-phase substitutions,
+duplicated roles, a broken or reordered narrative backbone, and count
+mismatches before hashing the immutable plan. Every role must be supported by
+its cited evidence. If no host story plan is passed, the deterministic fallback
+scores role-distinctive evidence concepts for each slide and applies the same
+conditional substitutions. A match must clear the minimum and beat the
+runner-up by a fixed margin; generic words such as “method” or “result” cannot
+stand in for missing ablation evidence. It does not rotate through extraction
+order. If neither a role nor an allowed substitute has a unique, distinctive
+match, planning stops and requests an explicit story plan.
 
 If source visuals are needed, write a JSON list and pass it to
 `plan --visual-allocations`:

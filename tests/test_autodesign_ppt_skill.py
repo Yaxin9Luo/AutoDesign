@@ -177,12 +177,75 @@ class AutoDesignPptSkillTests(unittest.TestCase):
             ],
         }
 
+    def _role_rich_evidence(self) -> str:
+        return (
+            "The paper title, authors, affiliation, and thesis identify the work. "
+            "A roadmap and outline give an overview. The problem is an unresolved "
+            "challenge whose motivation and significance explain its importance. "
+            "Related work leaves a prior-work gap. The contributions introduce three "
+            "advances. The method overview presents a framework and architecture; its "
+            "core mechanism coordinates each module through an algorithmic procedure. "
+            "A loss equation defines the objective. Experiments use a dataset, benchmark, "
+            "and evaluation metric. Performance, accuracy, improvement, and score describe "
+            "the primary results. Robustness and generalization hold across conditions. "
+            "An ablation removes each variant. Qualitative case-study examples visualize "
+            "representative behavior. Limitations and failure modes define uncertainty. "
+            "The implications connect application to practice. A takeaway summary states "
+            "the key finding, and the conclusion closes with discussion and future work. "
+            "Additional evidence and findings support each figure and table."
+        )
+
+    def _conditioned_story_fixture(
+        self,
+    ) -> tuple[dict[str, str], list[str], dict[str, str]]:
+        role_refs = {
+            "cover": "ev-001",
+            "outline": "ev-002",
+            "problem": "ev-003",
+            "motivation": "ev-004",
+            "prior-gap": "ev-005",
+            "contributions": "ev-006",
+            "method-overview": "ev-007",
+            "mechanism": "ev-008",
+            "objective": "ev-009",
+            "setup": "ev-010",
+            "primary-results": "ev-011",
+            "results-deep-dive": "ev-012",
+            "evidence-analysis": "ev-013",
+            "qualitative": "ev-014",
+            "limitations": "ev-015",
+            "implications": "ev-016",
+            "takeaways": "ev-017",
+            "closing": "ev-018",
+        }
+        evidence_texts = {
+            "ev-001": "The paper title, authors, affiliation, and thesis identify the work.",
+            "ev-002": "The roadmap gives an overview of the talk.",
+            "ev-003": "The research problem is an unresolved design challenge.",
+            "ev-004": "The motivation and significance explain why the work is important.",
+            "ev-005": "Related work leaves a clear prior-work gap.",
+            "ev-006": "The paper contributions introduce three advances.",
+            "ev-007": "The method overview presents the framework and architecture.",
+            "ev-008": "The core mechanism coordinates modules through an algorithmic procedure.",
+            "ev-009": "The objective is defined by a loss equation.",
+            "ev-010": "The experiment uses a dataset, benchmark, and evaluation metric.",
+            "ev-011": "Primary performance improves accuracy and the reported score.",
+            "ev-012": "A secondary result breakdown gives additional per-category findings.",
+            "ev-013": "Error analysis interprets the observed trend and supporting evidence.",
+            "ev-014": "Qualitative case-study examples visualize representative behavior.",
+            "ev-015": "Limitations and failure modes define uncertainty in the current scope.",
+            "ev-016": "The implications connect the application to research practice.",
+            "ev-017": "The takeaway summary states the key finding.",
+            "ev-018": "The conclusion and discussion close with future work.",
+        }
+        roles = list(role_refs)
+        return evidence_texts, roles, role_refs
+
     def _initialize_run(self, brief: str = "Create a conference deck.") -> Path:
         harness = self._require(self.harness, HARNESS_PATH)
         paper = self.root / "paper.md"
         paper.write_text(
-            "# Grounded paper\n\nThe paper presents a grounded research finding. "
-            "AutoDesign reports a grounded result.\n",
+            "# Grounded paper\n\n" + self._role_rich_evidence() + "\n",
             encoding="utf-8",
         )
         run = self.root / "run"
@@ -220,6 +283,7 @@ class AutoDesignPptSkillTests(unittest.TestCase):
         plan = harness.build_deck_plan(
             "Create a conference deck from this paper.",
             ["ev-001"],
+            evidence_texts={"ev-001": self._role_rich_evidence()},
             story_plan=self._story_plan(harness),
         )
         self.assertEqual(plan["slide_count"], 18)
@@ -245,6 +309,7 @@ class AutoDesignPptSkillTests(unittest.TestCase):
                 plan = harness.build_deck_plan(
                     brief,
                     ["ev-001"],
+                    evidence_texts={"ev-001": self._role_rich_evidence()},
                     story_plan=self._story_plan(harness, slide_count=expected),
                 )
                 self.assertEqual(plan["slide_count"], expected)
@@ -264,6 +329,7 @@ class AutoDesignPptSkillTests(unittest.TestCase):
                 chinese = harness.build_deck_plan(
                     brief,
                     ["ev-001"],
+                    evidence_texts={"ev-001": self._role_rich_evidence()},
                     story_plan=self._story_plan(harness, slide_count=expected),
                 )
                 self.assertEqual(chinese["slide_count"], expected)
@@ -280,6 +346,7 @@ class AutoDesignPptSkillTests(unittest.TestCase):
                 source_metadata = harness.build_deck_plan(
                     brief,
                     ["ev-001"],
+                    evidence_texts={"ev-001": self._role_rich_evidence()},
                     story_plan=self._story_plan(harness),
                 )
                 self.assertEqual(source_metadata["slide_count"], 18)
@@ -362,6 +429,119 @@ class AutoDesignPptSkillTests(unittest.TestCase):
                     evidence,
                 )
 
+    def test_default_planner_substitutes_unsupported_experimental_roles(self) -> None:
+        harness = self._require(self.harness, HARNESS_PATH)
+        evidence_texts, expected_roles, role_refs = self._conditioned_story_fixture()
+        plan = harness.build_deck_plan(
+            "Create a conference deck.",
+            list(evidence_texts),
+            evidence_texts=evidence_texts,
+        )
+        roles = [str(slide["role"]) for slide in plan["slides"]]
+        self.assertEqual(len(roles), 18)
+        self.assertEqual(roles, expected_roles)
+        self.assertNotIn("robustness", roles)
+        self.assertNotIn("ablation", roles)
+        self.assertEqual(len(roles), len(set(roles)))
+        self.assertEqual(
+            {
+                str(slide["role"]): list(slide["evidence_refs"])
+                for slide in plan["slides"]
+            },
+            {role: [source_id] for role, source_id in role_refs.items()},
+        )
+
+    def test_host_story_plan_accepts_supported_conditioned_substitutions(self) -> None:
+        harness = self._require(self.harness, HARNESS_PATH)
+        evidence_texts, roles, role_refs = self._conditioned_story_fixture()
+        story_plan = {
+            "format_version": 1,
+            "slides": [
+                {
+                    "slide_id": f"slide-{index:02d}",
+                    "role": role,
+                    "evidence_refs": [role_refs[role]],
+                }
+                for index, role in enumerate(roles, start=1)
+            ],
+        }
+        plan = harness.build_deck_plan(
+            "Create a conference deck.",
+            list(evidence_texts),
+            evidence_texts=evidence_texts,
+            story_plan=story_plan,
+        )
+        self.assertEqual(plan["evidence_assignment_source"], "host_story_plan")
+        self.assertEqual(
+            [str(slide["role"]) for slide in plan["slides"]],
+            roles,
+        )
+
+    def test_host_story_plan_rejects_an_ungrounded_conditional_role(self) -> None:
+        harness = self._require(self.harness, HARNESS_PATH)
+        evidence_texts, roles, role_refs = self._conditioned_story_fixture()
+        evidence_texts["ev-019"] = "The method improves the result."
+        roles[12] = "ablation"
+        role_refs["ablation"] = "ev-019"
+        story_plan = {
+            "format_version": 1,
+            "slides": [
+                {
+                    "slide_id": f"slide-{index:02d}",
+                    "role": role,
+                    "evidence_refs": [role_refs[role]],
+                }
+                for index, role in enumerate(roles, start=1)
+            ],
+        }
+        with self.assertRaisesRegex(
+            harness.PptHarnessError,
+            "role ablation.*evidence|evidence.*role ablation",
+        ):
+            harness.build_deck_plan(
+                "Create a conference deck.",
+                list(evidence_texts),
+                evidence_texts=evidence_texts,
+                story_plan=story_plan,
+            )
+
+    def test_host_story_plan_rejects_wrong_slot_and_duplicate_substitutions(self) -> None:
+        harness = self._require(self.harness, HARNESS_PATH)
+        evidence_texts, roles, role_refs = self._conditioned_story_fixture()
+
+        wrong_slot = list(roles)
+        wrong_slot[11] = "method-detail"
+        evidence_texts["ev-019"] = "A source-backed method detail explains one component."
+        role_refs["method-detail"] = "ev-019"
+
+        duplicated = list(roles)
+        duplicated[12] = "results-deep-dive"
+
+        for label, candidate_roles, expected_error in (
+            ("wrong phase", wrong_slot, "not a supported substitution"),
+            ("duplicated role", duplicated, "duplicated"),
+        ):
+            with (
+                self.subTest(label=label),
+                self.assertRaisesRegex(harness.PptHarnessError, expected_error),
+            ):
+                harness.build_deck_plan(
+                    "Create a conference deck.",
+                    list(evidence_texts),
+                    evidence_texts=evidence_texts,
+                    story_plan={
+                        "format_version": 1,
+                        "slides": [
+                            {
+                                "slide_id": f"slide-{index:02d}",
+                                "role": role,
+                                "evidence_refs": [role_refs[role]],
+                            }
+                            for index, role in enumerate(candidate_roles, start=1)
+                        ],
+                    },
+                )
+
     def test_host_story_plan_is_validated_before_becoming_immutable(self) -> None:
         harness = self._require(self.harness, HARNESS_PATH)
         roles = [
@@ -383,7 +563,7 @@ class AutoDesignPptSkillTests(unittest.TestCase):
             "Create a conference deck.",
             ["ev-001", "ev-002"],
             evidence_texts={
-                "ev-001": "The paper states its problem, results, and limitations.",
+                "ev-001": self._role_rich_evidence(),
                 "ev-002": "The method uses a planner and iterative architecture.",
             },
             story_plan=story_plan,
@@ -397,13 +577,21 @@ class AutoDesignPptSkillTests(unittest.TestCase):
             harness.build_deck_plan(
                 "Create a conference deck.",
                 ["ev-001", "ev-002"],
-                evidence_texts={"ev-001": "Problem", "ev-002": "Method"},
+                evidence_texts={
+                    "ev-001": self._role_rich_evidence(),
+                    "ev-002": "The method uses a planner and iterative architecture.",
+                },
                 story_plan=invalid,
             )
 
     def test_cjk_source_anchor_is_sentence_aware_and_display_bounded(self) -> None:
         harness = self._require(self.harness, HARNESS_PATH)
-        source = "这是论文的核心方法，它通过规划器和迭代反馈提升设计质量。" + "后续细节" * 400
+        source = (
+            "这是论文的核心方法，它通过规划器和迭代反馈提升设计质量。"
+            + "后续细节" * 400
+            + " "
+            + self._role_rich_evidence()
+        )
         plan = harness.build_deck_plan(
             "制作学术演示文稿。",
             ["ev-001"],
@@ -550,6 +738,7 @@ class AutoDesignPptSkillTests(unittest.TestCase):
         plan = harness.build_deck_plan(
             "Create a conference deck.",
             ["ev-001"],
+            evidence_texts={"ev-001": self._role_rich_evidence()},
             story_plan=self._story_plan(harness),
         )
         plan_gate = harness.validate_deck_against_plan(deck, plan)
@@ -569,13 +758,19 @@ class AutoDesignPptSkillTests(unittest.TestCase):
         plan = harness.build_deck_plan(
             "Create a conference deck.",
             ["ev-001"],
+            evidence_texts={"ev-001": self._role_rich_evidence()},
             story_plan=self._story_plan(harness),
         )
         html = self._write_fixture()
         conforming = _deck_html_for_plan(plan)
+        planned_assertion = str(plan["slides"][0]["assertion_title"])
 
         mutations = {
-            "assertion text": conforming.replace("Opening</h1>", "Unplanned opening</h1>", 1),
+            "assertion text": conforming.replace(
+                f">{planned_assertion}</h1>",
+                ">Unplanned opening</h1>",
+                1,
+            ),
             "visible text sources": conforming.replace(
                 'data-source-ids="ev-001">A concise source-backed explanation.',
                 'data-source-ids="ev-999">A concise source-backed explanation.',

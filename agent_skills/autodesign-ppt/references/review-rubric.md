@@ -34,6 +34,9 @@ localized evidence are invalid repair instructions.
 - invented or unsupported paper content;
 - incorrect visual-caption association or misleading crop;
 - missing, duplicated, or out-of-order slide;
+- an unsupported conditional experiment role, an ungrounded or out-of-phase
+  role substitution, or a broken problem -> method -> evidence -> takeaway
+  backbone;
 - a slide not inspected by the reviewer;
 - illegible, clipped, overlapping, or blank content;
 - visible remote/missing asset or runtime error;

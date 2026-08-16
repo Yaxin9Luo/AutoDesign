@@ -20,26 +20,37 @@ the Skill. Never write output, caches, or run state into the installed package.
 
 ## Execute
 
-Run `python "$SKILL_ROOT/scripts/ppt_harness.py" --help` for exact flags.
+Resolve a Python 3 launcher first: try `python3`, then `python`; on Windows also
+try `py -3`. Use the first command whose `--version` reports Python 3 in place
+of `<PYTHON3>` below. Run
+`<PYTHON3> "$SKILL_ROOT/scripts/ppt_harness.py" --help` for exact flags.
 
 1. Run `doctor`, then `init --run-dir "$RUN" --source "$PAPER"`. The first
    online run installs artifact-hash-locked browser and native-PPT dependencies
    in a versioned, content-verified user cache; later runs can reuse them
    offline. A missing or changed runtime is blocked, not a reason to skip QA.
 2. Use `evidence --query "..."`, `visuals`, and rendered paper pages. Query
-   evidence for identity, problem, gap, contributions,
-   method, results, ablations, qualitative evidence, limitations, and
-   conclusions. A fresh host VLM or subagent must inspect PDF visual candidates
+   evidence for identity, problem, gap, contributions, method, results, and
+   conclusions. Query ablations, robustness, qualitative evidence, and
+   limitations only when the paper actually reports them. A fresh host VLM or
+   subagent must inspect PDF visual candidates
    against their captions before using them; bind the complete hash-matched JSON
    with `bind-visuals`. Uncertain candidates stay unused.
 3. After the evidence queries, write a complete role/evidence story-plan JSON
    and run `plan --brief "..." --story-plan "$STORY_PLAN"`. It has exactly one
-   entry per slide with `slide_id`, the required academic `role`, and one or more
-   real `evidence_refs`; the harness validates it before the immutable hash is
-   written. If the story plan is omitted, deterministic semantic role scoring
-   selects evidence and never assigns by extraction order. That fallback needs
-   role-distinctive evidence with a unique winning margin; ambiguous or generic
-   overlap stops and requests `--story-plan`. Paper decks default to exactly 18
+   entry per slide with `slide_id`, a role valid for that narrative slot, and
+   one or more real `evidence_refs`; the harness validates role-to-evidence
+   compatibility before the immutable hash is written. The problem -> method ->
+   evidence -> takeaway backbone stays ordered. Conditional experimental slots
+   without source support must use an allowed same-phase source-backed role such
+   as method detail, results deep dive, evidence analysis, case analysis, or
+   scope and boundaries; never invent a robustness, ablation, qualitative, or
+   limitations section just to fill the arc. If the story plan is omitted,
+   deterministic semantic role scoring selects evidence and performs the same
+   evidence-conditioned substitutions; it never assigns by extraction order.
+   That fallback needs role-distinctive evidence with a unique winning margin;
+   ambiguous or generic overlap stops and requests `--story-plan`. Paper decks
+   default to exactly 18
    slides. A count attached to the requested deck/slides/presentation, including
    Chinese numerals through sixty, overrides the default; source metadata such
    as “12-page manuscript”, “25-page article”, or “30-page PDF” does not. Build

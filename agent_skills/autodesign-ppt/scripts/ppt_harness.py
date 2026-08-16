@@ -137,6 +137,69 @@ _ACADEMIC_ARC = (
     ("closing", "Closing", "End with the thesis and discussion prompt"),
 )
 
+_SUBSTITUTE_ROLE_DEFINITIONS = {
+    "method-detail": (
+        "method-detail",
+        "Method detail",
+        "Resolve one additional source-backed method detail",
+    ),
+    "architecture-detail": (
+        "architecture-detail",
+        "Architecture detail",
+        "Explain one additional source-backed architecture decision",
+    ),
+    "implementation-detail": (
+        "implementation-detail",
+        "Implementation detail",
+        "Explain source-backed implementation or training details",
+    ),
+    "results-deep-dive": (
+        "results-deep-dive",
+        "Results deep dive",
+        "Interpret one additional source-backed result breakdown",
+    ),
+    "evidence-analysis": (
+        "evidence-analysis",
+        "Evidence analysis",
+        "Explain one source-backed analysis without inventing an ablation",
+    ),
+    "case-analysis": (
+        "case-analysis",
+        "Case analysis",
+        "Analyze one source-backed case without claiming absent qualitative evidence",
+    ),
+    "scope-and-boundaries": (
+        "scope-and-boundaries",
+        "Scope and boundaries",
+        "State supported scope or assumptions without inventing limitations",
+    ),
+    "implications-detail": (
+        "implications-detail",
+        "Implications detail",
+        "Develop one additional source-backed implication",
+    ),
+}
+
+_CONDITIONAL_ROLE_SUBSTITUTIONS = {
+    "objective": ("method-detail", "architecture-detail"),
+    "setup": ("implementation-detail", "method-detail"),
+    "robustness": ("results-deep-dive", "evidence-analysis"),
+    "ablation": ("evidence-analysis", "results-deep-dive"),
+    "qualitative": ("case-analysis", "evidence-analysis"),
+    "limitations": ("scope-and-boundaries", "implications-detail"),
+}
+
+_NARRATIVE_BACKBONE = (
+    "cover",
+    "outline",
+    "problem",
+    "contributions",
+    "method-overview",
+    "primary-results",
+    "takeaways",
+    "closing",
+)
+
 
 _ROLE_DISTINCTIVE_CONCEPTS = {
     "cover": (
@@ -243,6 +306,59 @@ _ROLE_DISTINCTIVE_CONCEPTS = {
         ("future work", "未来工作"),
         ("conclusion", "结论"),
         ("closing", "结束"),
+    ),
+    "method-detail": (
+        ("method detail", "方法细节"),
+        ("component", "组件"),
+        ("procedure", "步骤"),
+        ("module", "模块"),
+    ),
+    "architecture-detail": (
+        ("architecture detail", "架构细节"),
+        ("layer", "层"),
+        ("backbone", "骨干"),
+        ("block", "模块块"),
+    ),
+    "implementation-detail": (
+        ("implementation", "实现"),
+        ("training detail", "训练细节"),
+        ("hyperparameter", "超参数"),
+        ("configuration", "配置"),
+    ),
+    "results-deep-dive": (
+        ("secondary result", "补充结果"),
+        ("breakdown", "分项"),
+        ("per-category", "分类结果"),
+        ("additional finding", "补充发现"),
+    ),
+    "evidence-analysis": (
+        ("error analysis", "误差分析"),
+        ("interpret", "解读"),
+        ("trend", "趋势"),
+        ("correlation", "相关性"),
+    ),
+    "case-analysis": (
+        ("case analysis", "案例分析"),
+        ("representative case", "代表案例"),
+        ("failure example", "失败示例"),
+    ),
+    "scope-and-boundaries": (
+        ("scope", "范围"),
+        ("boundary", "边界"),
+        ("assumption", "假设"),
+        ("applicability", "适用性"),
+    ),
+    "implications-detail": (
+        ("implication", "启示"),
+        ("application", "应用"),
+        ("deployment", "部署"),
+        ("practice", "实践"),
+    ),
+    "evidence-deep-dive": (
+        ("evidence", "证据"),
+        ("finding", "发现"),
+        ("figure", "图"),
+        ("table", "表"),
     ),
 }
 _SEMANTIC_MIN_CONCEPTS = 1
@@ -371,19 +487,38 @@ def _semantic_evidence_ref(
     _communication_job: str,
     evidence: Sequence[Mapping[str, Any]],
 ) -> str:
-    concepts = _ROLE_DISTINCTIVE_CONCEPTS.get(role, ())
+    candidate = _semantic_evidence_candidate(role, evidence)
+    if candidate is not None:
+        return candidate
+    raise PptHarnessError(
+        f"could not semantically assign evidence for role {role}; provide --story-plan"
+    )
+
+
+def _semantic_role_key(role: str) -> str:
+    if re.fullmatch(r"evidence-deep-dive-\d+", role):
+        return "evidence-deep-dive"
+    return role
+
+
+def _role_evidence_score(role: str, text: str) -> int:
+    concepts = _ROLE_DISTINCTIVE_CONCEPTS.get(_semantic_role_key(role), ())
+    normalized = " ".join(
+        unicodedata.normalize("NFKC", text).casefold().split()
+    )
+    return sum(
+        any(_semantic_term_present(normalized, term) for term in alternatives)
+        for alternatives in concepts
+    )
+
+
+def _semantic_evidence_candidate(
+    role: str,
+    evidence: Sequence[Mapping[str, Any]],
+) -> str | None:
     scored: list[tuple[int, str]] = []
     for item in evidence:
-        normalized = " ".join(
-            unicodedata.normalize(
-                "NFKC",
-                str(item.get("text", "")),
-            ).casefold().split()
-        )
-        score = sum(
-            any(_semantic_term_present(normalized, term) for term in alternatives)
-            for alternatives in concepts
-        )
+        score = _role_evidence_score(role, str(item.get("text", "")))
         scored.append((score, str(item.get("id", ""))))
     scored.sort(key=lambda item: (-item[0], item[1]))
     top_score, top_id = scored[0] if scored else (0, "")
@@ -393,9 +528,7 @@ def _semantic_evidence_ref(
         and top_score - runner_up >= _SEMANTIC_MARGIN
     ):
         return top_id
-    raise PptHarnessError(
-        f"could not semantically assign evidence for role {role}; provide --story-plan"
-    )
+    return None
 
 
 def _semantic_term_present(normalized_text: str, term: str) -> bool:
@@ -410,20 +543,80 @@ def _semantic_term_present(normalized_text: str, term: str) -> bool:
     ) is not None
 
 
-def _host_story_evidence_refs(
+def _role_definition(role: str) -> tuple[str, str, str]:
+    for definition in _ACADEMIC_ARC:
+        if definition[0] == role:
+            return definition
+    if role in _SUBSTITUTE_ROLE_DEFINITIONS:
+        return _SUBSTITUTE_ROLE_DEFINITIONS[role]
+    match = re.fullmatch(r"evidence-deep-dive-(\d+)", role)
+    if match:
+        number = int(match.group(1))
+        return (
+            role,
+            f"Evidence deep dive {number}",
+            "Explain one additional source-backed result or mechanism",
+        )
+    raise PptHarnessError(f"unknown deck role: {role}")
+
+
+def _adaptive_arc_and_evidence(
+    expected_arc: Sequence[tuple[str, str, str]],
+    evidence: Sequence[Mapping[str, Any]],
+) -> tuple[list[tuple[str, str, str]], list[list[str]]]:
+    resolved_arc: list[tuple[str, str, str]] = []
+    assignments: list[list[str]] = []
+    used_roles: set[str] = set()
+    for expected in expected_arc:
+        expected_role = expected[0]
+        candidate = _semantic_evidence_candidate(expected_role, evidence)
+        resolved = expected
+        if candidate is None:
+            for substitute_role in _CONDITIONAL_ROLE_SUBSTITUTIONS.get(
+                expected_role,
+                (),
+            ):
+                if substitute_role in used_roles:
+                    continue
+                candidate = _semantic_evidence_candidate(substitute_role, evidence)
+                if candidate is not None:
+                    resolved = _role_definition(substitute_role)
+                    break
+        if candidate is None:
+            raise PptHarnessError(
+                f"could not semantically assign evidence for role {expected_role}; "
+                "provide --story-plan with a source-backed role substitution"
+            )
+        if resolved[0] in used_roles:
+            raise PptHarnessError(
+                f"adaptive deck plan would duplicate role {resolved[0]}; provide --story-plan"
+            )
+        used_roles.add(resolved[0])
+        resolved_arc.append(resolved)
+        assignments.append([candidate])
+    return resolved_arc, assignments
+
+
+def _host_story_arc_and_evidence(
     story_plan: Mapping[str, Any],
-    arc: Sequence[tuple[str, str, str]],
-    evidence_ids: set[str],
-) -> list[list[str]]:
+    expected_arc: Sequence[tuple[str, str, str]],
+    evidence: Sequence[Mapping[str, Any]],
+) -> tuple[list[tuple[str, str, str]], list[list[str]]]:
     if set(story_plan) != {"format_version", "slides"} or story_plan.get(
         "format_version"
     ) != 1:
         raise PptHarnessError("story plan must use the exact version-1 schema")
     slides = story_plan.get("slides")
-    if not isinstance(slides, list) or len(slides) != len(arc):
+    if not isinstance(slides, list) or len(slides) != len(expected_arc):
         raise PptHarnessError("story plan slide count must match the requested deck")
+    evidence_by_id = {
+        str(item.get("id", "")): str(item.get("text", "")) for item in evidence
+    }
+    evidence_ids = set(evidence_by_id)
+    resolved_arc: list[tuple[str, str, str]] = []
     assignments: list[list[str]] = []
-    for index, (entry, expected) in enumerate(zip(slides, arc), start=1):
+    seen_roles: set[str] = set()
+    for index, (entry, expected) in enumerate(zip(slides, expected_arc), start=1):
         if not isinstance(entry, Mapping) or set(entry) != {
             "slide_id",
             "role",
@@ -431,8 +624,23 @@ def _host_story_evidence_refs(
         }:
             raise PptHarnessError("story plan slides must use the exact role/evidence schema")
         expected_id = f"slide-{index:02d}"
-        if entry.get("slide_id") != expected_id or entry.get("role") != expected[0]:
-            raise PptHarnessError("story plan slide IDs and roles must match the academic arc")
+        if entry.get("slide_id") != expected_id:
+            raise PptHarnessError("story plan slide IDs must be contiguous and ordered")
+        role = entry.get("role")
+        if not isinstance(role, str):
+            raise PptHarnessError("story plan roles must be strings")
+        allowed_roles = {
+            expected[0],
+            *_CONDITIONAL_ROLE_SUBSTITUTIONS.get(expected[0], ()),
+        }
+        if role not in allowed_roles:
+            raise PptHarnessError(
+                f"story plan role {role} is not a supported substitution for "
+                f"academic slot {expected[0]}"
+            )
+        if role in seen_roles:
+            raise PptHarnessError(f"story plan role {role} is duplicated")
+        seen_roles.add(role)
         refs = entry.get("evidence_refs")
         if (
             not isinstance(refs, list)
@@ -446,8 +654,28 @@ def _host_story_evidence_refs(
             raise PptHarnessError(
                 f"story plan cites unknown evidence: {', '.join(unknown)}"
             )
+        if max(
+            (_role_evidence_score(role, evidence_by_id[ref]) for ref in refs),
+            default=0,
+        ) < _SEMANTIC_MIN_CONCEPTS:
+            raise PptHarnessError(
+                f"story plan role {role} is not supported by its cited evidence"
+            )
+        resolved_arc.append(_role_definition(role))
         assignments.append(list(refs))
-    return assignments
+
+    actual_roles = [definition[0] for definition in resolved_arc]
+    required_backbone = [
+        role
+        for role in _NARRATIVE_BACKBONE
+        if role in {definition[0] for definition in expected_arc}
+    ]
+    actual_backbone = [role for role in actual_roles if role in required_backbone]
+    if actual_backbone != required_backbone:
+        raise PptHarnessError(
+            "story plan must preserve the ordered academic narrative backbone"
+        )
+    return resolved_arc, assignments
 
 
 def build_deck_plan(
@@ -467,30 +695,23 @@ def build_deck_plan(
     sources = [item for item in dict.fromkeys(evidence_ids) if re.fullmatch(r"ev-\d{3,}", item)]
     if not sources:
         raise PptHarnessError("deck planning requires at least one evidence ID")
-    arc = _arc_for_count(count)
+    expected_arc = _arc_for_count(count)
     evidence = [
         {"id": source_id, "text": str((evidence_texts or {}).get(source_id, ""))}
         for source_id in sources
     ]
     if story_plan is not None:
-        evidence_assignments = _host_story_evidence_refs(
+        arc, evidence_assignments = _host_story_arc_and_evidence(
             story_plan,
-            arc,
-            set(sources),
+            expected_arc,
+            evidence,
         )
         assignment_source = "host_story_plan"
     else:
-        evidence_assignments = [
-            [
-                _semantic_evidence_ref(
-                    role,
-                    title,
-                    communication_job,
-                    evidence,
-                )
-            ]
-            for role, title, communication_job in arc
-        ]
+        arc, evidence_assignments = _adaptive_arc_and_evidence(
+            expected_arc,
+            evidence,
+        )
         assignment_source = "semantic_default"
     slides: list[dict[str, Any]] = []
     for index, (role, title, communication_job) in enumerate(arc, start=1):
