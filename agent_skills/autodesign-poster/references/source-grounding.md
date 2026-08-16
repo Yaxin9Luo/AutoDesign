@@ -6,9 +6,9 @@ Do not invent evidence IDs or treat a citation ID as proof by itself.
 ## Evidence first
 
 1. Initialize a user-selected run directory. Initialization snapshots every
-   bundled instruction, reference, and script used by the run, excluding
-   generated interpreter caches. Resume always verifies the installed Skill
-   root against that snapshot.
+   bundled instruction, reference, script, and runtime asset used by the run,
+   excluding generated cache and output trees. Resume always verifies the
+   installed Skill root against that snapshot.
 2. Prepare the user's source. Text and Markdown receive stable section/line
    anchors; Markdown evidence retains preambles and heading text. Fully verified
    PDF preparation copies the input first, then runs `pdftotext`, `pdfinfo`,

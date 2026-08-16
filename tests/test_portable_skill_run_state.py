@@ -301,6 +301,75 @@ elif name == "pdfimages":
         )
         self.assertTrue((self.run / "skill_snapshot" / "files" / "scripts" / "tool.py").is_file())
 
+    def test_runtime_snapshot_captures_assets_and_resume_rejects_asset_drift(self) -> None:
+        runtime = self.skill / "assets" / "video-runtime"
+        runtime.mkdir(parents=True)
+        assets = {
+            "package.json": b'{"name":"video-runtime"}\n',
+            "package-lock.json": b'{"lockfileVersion":3}\n',
+            "requirements-kokoro.in": b"kokoro>=0.9\n",
+            "requirements-kokoro.lock": b"kokoro==0.9.4\n",
+        }
+        for name, data in assets.items():
+            (runtime / name).write_bytes(data)
+        before = core.tree_hash(self.skill)
+
+        self._initialize()
+
+        manifest = json.loads(
+            (self.run / "skill_snapshot" / "manifest.json").read_text(encoding="utf-8")
+        )
+        paths = {entry["path"] for entry in manifest["files"]}
+        for name, data in assets.items():
+            relative = f"assets/video-runtime/{name}"
+            self.assertIn(relative, paths)
+            self.assertEqual(
+                (self.run / "skill_snapshot" / "files" / relative).read_bytes(),
+                data,
+            )
+        self.assertEqual(core.tree_hash(self.skill), before)
+
+        (runtime / "package.json").write_bytes(b'{"name":"drifted"}\n')
+        with self.assertRaises(core.IntegrityError):
+            core.resume_run(self.run, skill_root=self.skill)
+
+    def test_runtime_snapshot_ignores_generated_assets_and_rejects_asset_symlinks(self) -> None:
+        runtime = self.skill / "assets" / "video-runtime"
+        runtime.mkdir(parents=True)
+        (runtime / "package.json").write_bytes(b'{"name":"video-runtime"}\n')
+        generated = (
+            runtime / "node_modules" / "dependency" / "package.json",
+            runtime / "dist" / "bundle.js",
+            runtime / "__pycache__" / "helper.cpython-313.pyc",
+            runtime / ".DS_Store",
+        )
+        for path in generated:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"generated")
+
+        self._initialize()
+
+        manifest = json.loads(
+            (self.run / "skill_snapshot" / "manifest.json").read_text(encoding="utf-8")
+        )
+        paths = {entry["path"] for entry in manifest["files"]}
+        self.assertIn("assets/video-runtime/package.json", paths)
+        self.assertTrue(
+            all(path.relative_to(self.skill).as_posix() not in paths for path in generated)
+        )
+        for path in generated:
+            path.write_bytes(b"changed generated output")
+        self.assertEqual(
+            core.resume_run(self.run, skill_root=self.skill)["next_action"],
+            "prepare_source",
+        )
+
+        outside = self.root / "outside-package.json"
+        outside.write_bytes(b"outside")
+        (runtime / "linked-package.json").symlink_to(outside)
+        with self.assertRaises(core.PathSafetyError):
+            core.resume_run(self.run, skill_root=self.skill)
+
     def test_snapshot_verification_fails_closed_on_tamper_drift_and_traversal(self) -> None:
         self._initialize()
         core.verify_skill_snapshot(self.run, skill_root=self.skill)

@@ -35,8 +35,13 @@ MAIN_STATES = (
 )
 SIDE_STATES = ("blocked", "failed", "needs_visual_review")
 _TRANSITIONS = dict(zip(MAIN_STATES, MAIN_STATES[1:]))
-_RUNTIME_TOP_LEVEL = {"SKILL.md", "scripts", "references"}
-_GENERATED_CACHE_DIRS = {"__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"}
+_RUNTIME_TOP_LEVEL = {"SKILL.md", "scripts", "references", "assets"}
+_GENERATED_CACHE_DIRS = {
+    ".mypy_cache", ".pytest_cache", ".ruff_cache", ".venv", "__pycache__",
+    "build", "dist", "node_modules", "out", "output", "outputs", "runs",
+    "sessions", "venv",
+}
+_GENERATED_CACHE_FILES = {".DS_Store"}
 _GENERATED_CACHE_SUFFIXES = {".pyc", ".pyo"}
 _SECRET_KEY = re.compile(
     r"(?:api[_-]?key|authorization|cookie|credential|password|private[_-]?key|secret|token)",
@@ -277,10 +282,13 @@ def _runtime_files(skill_root: Path) -> list[Path]:
             relative = path.relative_to(skill_root)
             if relative.parts[0] not in _RUNTIME_TOP_LEVEL:
                 continue
-            if path.suffix.lower() in _GENERATED_CACHE_SUFFIXES:
-                continue
             if path.is_symlink() or not path.is_file():
                 raise PathSafetyError(f"runtime file must be regular: {path}")
+            if (
+                path.name in _GENERATED_CACHE_FILES
+                or path.suffix.lower() in _GENERATED_CACHE_SUFFIXES
+            ):
+                continue
             selected.append(path)
     return sorted(selected, key=lambda path: path.relative_to(skill_root).as_posix())
 
