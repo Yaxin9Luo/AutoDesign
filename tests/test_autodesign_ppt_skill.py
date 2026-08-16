@@ -599,6 +599,9 @@ class AutoDesignPptSkillTests(unittest.TestCase):
             "ablation": (
                 "Removing the routing module changes accuracy from 82.1% to 79.4%.",
                 "W/o routing module: 79.4%; full model: 82.1%.",
+                "W/o routing module accuracy: 79.4%; full model accuracy: 82.1%.",
+                "无监督方法的消融结果显示，准确率从82.1%下降到79.4%。",
+                "缺乏路由模块时，准确率从82.1%下降到79.4%。",
             ),
             "robustness": (
                 "On the shifted dataset, accuracy is 78.5% versus 79.0% in-domain.",
@@ -617,6 +620,58 @@ class AutoDesignPptSkillTests(unittest.TestCase):
                         "ev-001",
                     )
 
+    def test_conditional_roles_reject_structural_counts_as_labeled_outcomes(self) -> None:
+        harness = self._require(self.harness, HARNESS_PATH)
+        false_comparisons = (
+            (
+                "W/o routing module uses 2 stages and 4 attention heads; "
+                "full model is the reference."
+            ),
+            (
+                "W/o routing module uses 2 stages at 50% capacity; "
+                "full routing module uses 4 stages at 100% capacity."
+            ),
+            "W/o routing module accuracy: 79.4%; full model latency: 82.1%.",
+            "W/o routing module mapping: 2; full routing module mapping: 4.",
+            "W/o routing module uses 2 metrics; full routing module uses 4 metrics.",
+        )
+        for text in false_comparisons:
+            with (
+                self.subTest(text=text),
+                self.assertRaisesRegex(
+                    harness.PptHarnessError,
+                    "role ablation; provide --story-plan",
+                ),
+            ):
+                harness._semantic_evidence_ref(
+                    "ablation",
+                    "Ablation",
+                    "Do not treat architecture counts as measured outcomes",
+                    [{"id": "ev-001", "text": text}],
+                )
+
+    def test_conditional_roles_reject_chinese_absence_but_not_method_terms(self) -> None:
+        harness = self._require(self.harness, HARNESS_PATH)
+        absent_evidence = {
+            "ablation": "本文缺乏消融实验。",
+            "robustness": "本文缺乏鲁棒性评估。",
+            "qualitative": "本文无定性分析。",
+        }
+        for role, text in absent_evidence.items():
+            with (
+                self.subTest(role=role),
+                self.assertRaisesRegex(
+                    harness.PptHarnessError,
+                    f"role {role}; provide --story-plan",
+                ),
+            ):
+                harness._semantic_evidence_ref(
+                    role,
+                    role.title(),
+                    "Reject a source statement that declares evidence absent",
+                    [{"id": "ev-001", "text": text}],
+                )
+
     def test_default_planner_uses_supported_numeric_experimental_roles(self) -> None:
         harness = self._require(self.harness, HARNESS_PATH)
         evidence_texts, roles, _role_refs = self._conditioned_story_fixture()
@@ -624,7 +679,7 @@ class AutoDesignPptSkillTests(unittest.TestCase):
             "On the shifted dataset, accuracy is 78.5% versus 79.0% in-domain."
         )
         evidence_texts["ev-013"] = (
-            "W/o routing module: 79.4%; full model: 82.1%."
+            "W/o routing module accuracy: 79.4%; full model accuracy: 82.1%."
         )
         roles[11] = "robustness"
         roles[12] = "ablation"
@@ -637,6 +692,39 @@ class AutoDesignPptSkillTests(unittest.TestCase):
             [str(slide["role"]) for slide in plan["slides"]],
             roles,
         )
+
+    def test_default_planner_rejects_structural_counts_as_ablation_outcomes(self) -> None:
+        harness = self._require(self.harness, HARNESS_PATH)
+        evidence_texts, _roles, _role_refs = self._conditioned_story_fixture()
+        evidence_texts["ev-013"] = (
+            "W/o routing module uses 2 stages and 4 attention heads; "
+            "full model is the reference."
+        )
+        with self.assertRaisesRegex(
+            harness.PptHarnessError,
+            "role ablation; provide --story-plan",
+        ):
+            harness.build_deck_plan(
+                "Create a conference deck.",
+                list(evidence_texts),
+                evidence_texts=evidence_texts,
+            )
+
+    def test_default_planner_rejects_chinese_absence_statements(self) -> None:
+        harness = self._require(self.harness, HARNESS_PATH)
+        evidence_texts, _roles, _role_refs = self._conditioned_story_fixture()
+        evidence_texts["ev-012"] = "本文缺乏鲁棒性评估。"
+        evidence_texts["ev-013"] = "本文缺乏消融实验。"
+        evidence_texts["ev-014"] = "本文无定性分析。"
+        with self.assertRaisesRegex(
+            harness.PptHarnessError,
+            "role robustness; provide --story-plan",
+        ):
+            harness.build_deck_plan(
+                "Create a conference deck.",
+                list(evidence_texts),
+                evidence_texts=evidence_texts,
+            )
 
     def test_default_planner_uses_independent_positive_clauses(self) -> None:
         harness = self._require(self.harness, HARNESS_PATH)
@@ -796,7 +884,7 @@ class AutoDesignPptSkillTests(unittest.TestCase):
             (
                 12,
                 "ablation",
-                "W/o routing module: 79.4%; full model: 82.1%.",
+                "W/o routing module accuracy: 79.4%; full model accuracy: 82.1%.",
             ),
         )
         for slot, role, text in cases:
@@ -821,6 +909,72 @@ class AutoDesignPptSkillTests(unittest.TestCase):
                 },
             )
             self.assertEqual(str(plan["slides"][slot]["role"]), role)
+
+    def test_host_story_plan_rejects_structural_counts_as_ablation_outcomes(self) -> None:
+        harness = self._require(self.harness, HARNESS_PATH)
+        evidence_texts, roles, role_refs = self._conditioned_story_fixture()
+        evidence_texts["ev-019"] = (
+            "W/o routing module uses 2 stages and 4 attention heads; "
+            "full model is the reference."
+        )
+        roles[12] = "ablation"
+        role_refs["ablation"] = "ev-019"
+        with self.assertRaisesRegex(
+            harness.PptHarnessError,
+            "role ablation.*evidence|evidence.*role ablation",
+        ):
+            harness.build_deck_plan(
+                "Create a conference deck.",
+                list(evidence_texts),
+                evidence_texts=evidence_texts,
+                story_plan={
+                    "format_version": 1,
+                    "slides": [
+                        {
+                            "slide_id": f"slide-{index:02d}",
+                            "role": planned_role,
+                            "evidence_refs": [role_refs[planned_role]],
+                        }
+                        for index, planned_role in enumerate(roles, start=1)
+                    ],
+                },
+            )
+
+    def test_host_story_plan_rejects_chinese_absence_statements(self) -> None:
+        harness = self._require(self.harness, HARNESS_PATH)
+        cases = (
+            (11, "robustness", "本文缺乏鲁棒性评估。"),
+            (12, "ablation", "本文缺乏消融实验。"),
+            (13, "qualitative", "本文无定性分析。"),
+        )
+        for slot, role, text in cases:
+            evidence_texts, roles, role_refs = self._conditioned_story_fixture()
+            evidence_texts["ev-019"] = text
+            roles[slot] = role
+            role_refs[role] = "ev-019"
+            with (
+                self.subTest(role=role),
+                self.assertRaisesRegex(
+                    harness.PptHarnessError,
+                    f"role {role}.*evidence|evidence.*role {role}",
+                ),
+            ):
+                harness.build_deck_plan(
+                    "Create a conference deck.",
+                    list(evidence_texts),
+                    evidence_texts=evidence_texts,
+                    story_plan={
+                        "format_version": 1,
+                        "slides": [
+                            {
+                                "slide_id": f"slide-{index:02d}",
+                                "role": planned_role,
+                                "evidence_refs": [role_refs[planned_role]],
+                            }
+                            for index, planned_role in enumerate(roles, start=1)
+                        ],
+                    },
+                )
 
     def test_host_story_plan_uses_independent_positive_clauses(self) -> None:
         harness = self._require(self.harness, HARNESS_PATH)

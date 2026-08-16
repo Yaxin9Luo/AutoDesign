@@ -41,7 +41,10 @@ localized evidence are invalid repair instructions.
   explicit terminology or the required condition/comparison plus observed result;
 - a negated, not-provided, or future-work statement used as positive evidence;
 - an experimental operation and result assembled from separate clauses, except
-  for an adjacent labeled `w/o`/`full` numeric pair;
+  for an adjacent labeled `w/o`/`full` pair whose two sides each contain a value
+  and share a measured metric or percentage scale;
+- a `w/o`/`full` comparison authorized by architecture counts rather than an
+  observed outcome;
 - a slide not inspected by the reviewer;
 - illegible, clipped, overlapping, or blank content;
 - visible remote/missing asset or runtime error;

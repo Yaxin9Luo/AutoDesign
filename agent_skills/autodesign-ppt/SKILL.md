@@ -55,11 +55,16 @@ of `<PYTHON3>` below. Run
    comparison can provide the observed result when the component operation or
    shifted condition is explicit. Reject negated, not-provided, or future-work
    statements before evaluating positive signals: stating that an experiment is
-   absent is not evidence that it was performed. Evaluate each independent
+   absent is not evidence that it was performed, including localized declarations
+   such as `本文缺乏消融实验` or `本文无定性分析`; do not confuse those with
+   method terms such as `无监督` or a measured result from removing a component.
+   Evaluate each independent
    sentence or clause on its own: a complete non-negated positive clause is
    sufficient, but never assemble an operation from one clause and a result from
    another. The explicit `w/o`/`full` labeled numeric pair is the only supported
-   two-clause comparison. That fallback needs
+   two-clause comparison. Both sides of that pair must contain a value and share
+   a measured metric (or an explicit percentage scale); architecture counts such
+   as stages or attention heads are not outcomes. That fallback needs
    role-distinctive evidence with a unique winning margin; ambiguous or generic
    overlap stops and requests `--story-plan`. Paper decks default to exactly 18
    slides. A count attached to the requested deck/slides/presentation, including

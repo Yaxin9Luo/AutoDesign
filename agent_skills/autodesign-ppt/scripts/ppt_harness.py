@@ -374,6 +374,8 @@ _CONDITIONAL_ROLE_SIGNAL_RULES = {
                 "remov",
                 "去除",
                 "移除",
+                "缺乏",
+                "缺少",
             ),
             ("component", "module", "block", "组件", "模块"),
             (
@@ -554,6 +556,37 @@ _CONDITIONAL_ROLE_ABSENCE_TERMS = {
 }
 
 _NUMERIC_VALUE_PATTERN = r"(?<![\w.])\d+(?:\.\d+)?\s*%?"
+_MEASURED_OUTCOME_TERM_GROUPS = {
+    "accuracy": ("accuracy", "acc", "准确率"),
+    "auc": ("auc",),
+    "bleu": ("bleu",),
+    "error-rate": ("error rate", "错误率"),
+    "f1": ("f1",),
+    "latency": ("latency", "延迟"),
+    "loss": ("loss", "损失"),
+    "map": ("map",),
+    "performance": ("performance", "性能"),
+    "precision": ("precision", "精确率"),
+    "psnr": ("psnr",),
+    "recall": ("recall", "召回率"),
+    "score": ("score", "分数"),
+    "ssim": ("ssim",),
+}
+_STRUCTURAL_COUNT_TERMS = (
+    "stage",
+    "attention head",
+    "layer",
+    "parameter",
+    "token",
+    "channel",
+    "dimension",
+    "阶段",
+    "注意力头",
+    "层数",
+    "参数量",
+    "通道数",
+    "维度",
+)
 
 
 def _parse_slide_count_token(token: str) -> int | None:
@@ -724,6 +757,15 @@ def _conditional_role_declares_absence(role: str, normalized: str) -> bool:
         rf"[^。！？]{{0,30}}{role_pattern}",
         rf"{role_pattern}[^。！？]{{0,40}}"
         rf"(?:未提供|未进行|没有|缺失|留待未来|未来工作)",
+        rf"(?:^|[，,；;：:\s])"
+        rf"(?:(?:本文|本研究|本工作|本方法|论文|文章|该研究|该工作|该文)\s*)?"
+        rf"(?:缺乏|缺少|未有|没有)\s*"
+        rf"(?:(?:对|关于|任何|相关的?)\s*)?{role_pattern}"
+        rf"(?:实验|评估|评价|分析|证据|结果|示例)?",
+        rf"(?:^|[，,；;：:\s])"
+        rf"(?:(?:本文|本研究|本工作|本方法|论文|文章|该研究|该工作|该文)\s*)?"
+        rf"无\s*(?:(?:对|关于|任何|相关的?)\s*)?{role_pattern}"
+        rf"(?:实验|评估|评价|分析|证据|结果|示例)?",
     )
     return any(re.search(pattern, normalized) for pattern in chinese_patterns)
 
@@ -753,15 +795,57 @@ def _semantic_evidence_clauses(normalized: str) -> list[str]:
     return [clause.strip() for clause in clauses if clause.strip()]
 
 
+def _measured_outcome_term_present(normalized_text: str, term: str) -> bool:
+    normalized_term = unicodedata.normalize("NFKC", term).casefold()
+    if any(not character.isascii() for character in normalized_term):
+        return normalized_term in normalized_text
+    return re.search(
+        rf"(?<![a-z0-9]){re.escape(normalized_term)}(?:s|es)?(?![a-z0-9])",
+        normalized_text,
+    ) is not None
+
+
 def _labeled_numeric_comparison_pairs(clauses: Sequence[str]) -> list[str]:
     pairs: list[str] = []
     for first, second in zip(clauses, clauses[1:]):
-        joined = f"{first}; {second}"
         has_labels = bool(
             ("w/o" in first and re.search(r"\bfull\b", second))
             or (re.search(r"\bfull\b", first) and "w/o" in second)
         )
-        if has_labels and _has_numeric_observed_comparison(joined):
+        first_values = re.findall(_NUMERIC_VALUE_PATTERN, first)
+        second_values = re.findall(_NUMERIC_VALUE_PATTERN, second)
+        first_metrics = {
+            label
+            for label, terms in _MEASURED_OUTCOME_TERM_GROUPS.items()
+            if any(_measured_outcome_term_present(first, term) for term in terms)
+        }
+        second_metrics = {
+            label
+            for label, terms in _MEASURED_OUTCOME_TERM_GROUPS.items()
+            if any(_measured_outcome_term_present(second, term) for term in terms)
+        }
+        shared_metric = bool(first_metrics & second_metrics)
+        shared_percentage_scale = bool(
+            any(value.rstrip().endswith("%") for value in first_values)
+            and any(value.rstrip().endswith("%") for value in second_values)
+        )
+        structural_count = any(
+            _semantic_term_present(fragment, term)
+            for fragment in (first, second)
+            for term in _STRUCTURAL_COUNT_TERMS
+        )
+        if first_metrics and second_metrics:
+            measured_outcome = shared_metric
+        else:
+            measured_outcome = shared_percentage_scale and not structural_count
+        joined = f"{first}; {second}"
+        if (
+            has_labels
+            and first_values
+            and second_values
+            and measured_outcome
+            and _has_numeric_observed_comparison(joined)
+        ):
             pairs.append(joined)
     return pairs
 
