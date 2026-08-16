@@ -600,6 +600,11 @@ class AutoDesignPptSkillTests(unittest.TestCase):
                 "Removing the routing module changes accuracy from 82.1% to 79.4%.",
                 "W/o routing module: 79.4%; full model: 82.1%.",
                 "W/o routing module accuracy: 79.4%; full model accuracy: 82.1%.",
+                "W/o routing module accuracy: 79.4%; full model: 82.1%.",
+                (
+                    "W/o routing module uses 2 stages and reports accuracy: 79.4%; "
+                    "full model uses 4 stages and reports accuracy: 82.1%."
+                ),
                 "无监督方法的消融结果显示，准确率从82.1%下降到79.4%。",
                 "缺乏路由模块时，准确率从82.1%下降到79.4%。",
             ),
@@ -634,6 +639,10 @@ class AutoDesignPptSkillTests(unittest.TestCase):
             "W/o routing module accuracy: 79.4%; full model latency: 82.1%.",
             "W/o routing module mapping: 2; full routing module mapping: 4.",
             "W/o routing module uses 2 metrics; full routing module uses 4 metrics.",
+            (
+                "W/o routing module uses 2 stages and reports accuracy; "
+                "full model uses 4 stages and reports accuracy."
+            ),
         )
         for text in false_comparisons:
             with (
@@ -695,20 +704,31 @@ class AutoDesignPptSkillTests(unittest.TestCase):
 
     def test_default_planner_rejects_structural_counts_as_ablation_outcomes(self) -> None:
         harness = self._require(self.harness, HARNESS_PATH)
-        evidence_texts, _roles, _role_refs = self._conditioned_story_fixture()
-        evidence_texts["ev-013"] = (
-            "W/o routing module uses 2 stages and 4 attention heads; "
-            "full model is the reference."
+        false_comparisons = (
+            (
+                "W/o routing module uses 2 stages and 4 attention heads; "
+                "full model is the reference."
+            ),
+            (
+                "W/o routing module uses 2 stages and reports accuracy; "
+                "full model uses 4 stages and reports accuracy."
+            ),
         )
-        with self.assertRaisesRegex(
-            harness.PptHarnessError,
-            "role ablation; provide --story-plan",
-        ):
-            harness.build_deck_plan(
-                "Create a conference deck.",
-                list(evidence_texts),
-                evidence_texts=evidence_texts,
-            )
+        for text in false_comparisons:
+            evidence_texts, _roles, _role_refs = self._conditioned_story_fixture()
+            evidence_texts["ev-013"] = text
+            with (
+                self.subTest(text=text),
+                self.assertRaisesRegex(
+                    harness.PptHarnessError,
+                    "role ablation; provide --story-plan",
+                ),
+            ):
+                harness.build_deck_plan(
+                    "Create a conference deck.",
+                    list(evidence_texts),
+                    evidence_texts=evidence_texts,
+                )
 
     def test_default_planner_rejects_chinese_absence_statements(self) -> None:
         harness = self._require(self.harness, HARNESS_PATH)
@@ -912,33 +932,44 @@ class AutoDesignPptSkillTests(unittest.TestCase):
 
     def test_host_story_plan_rejects_structural_counts_as_ablation_outcomes(self) -> None:
         harness = self._require(self.harness, HARNESS_PATH)
-        evidence_texts, roles, role_refs = self._conditioned_story_fixture()
-        evidence_texts["ev-019"] = (
-            "W/o routing module uses 2 stages and 4 attention heads; "
-            "full model is the reference."
+        false_comparisons = (
+            (
+                "W/o routing module uses 2 stages and 4 attention heads; "
+                "full model is the reference."
+            ),
+            (
+                "W/o routing module uses 2 stages and reports accuracy; "
+                "full model uses 4 stages and reports accuracy."
+            ),
         )
-        roles[12] = "ablation"
-        role_refs["ablation"] = "ev-019"
-        with self.assertRaisesRegex(
-            harness.PptHarnessError,
-            "role ablation.*evidence|evidence.*role ablation",
-        ):
-            harness.build_deck_plan(
-                "Create a conference deck.",
-                list(evidence_texts),
-                evidence_texts=evidence_texts,
-                story_plan={
-                    "format_version": 1,
-                    "slides": [
-                        {
-                            "slide_id": f"slide-{index:02d}",
-                            "role": planned_role,
-                            "evidence_refs": [role_refs[planned_role]],
-                        }
-                        for index, planned_role in enumerate(roles, start=1)
-                    ],
-                },
-            )
+        for text in false_comparisons:
+            evidence_texts, roles, role_refs = self._conditioned_story_fixture()
+            evidence_texts["ev-019"] = text
+            roles[12] = "ablation"
+            role_refs["ablation"] = "ev-019"
+            with (
+                self.subTest(text=text),
+                self.assertRaisesRegex(
+                    harness.PptHarnessError,
+                    "role ablation.*evidence|evidence.*role ablation",
+                ),
+            ):
+                harness.build_deck_plan(
+                    "Create a conference deck.",
+                    list(evidence_texts),
+                    evidence_texts=evidence_texts,
+                    story_plan={
+                        "format_version": 1,
+                        "slides": [
+                            {
+                                "slide_id": f"slide-{index:02d}",
+                                "role": planned_role,
+                                "evidence_refs": [role_refs[planned_role]],
+                            }
+                            for index, planned_role in enumerate(roles, start=1)
+                        ],
+                    },
+                )
 
     def test_host_story_plan_rejects_chinese_absence_statements(self) -> None:
         harness = self._require(self.harness, HARNESS_PATH)

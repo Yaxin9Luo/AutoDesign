@@ -63,8 +63,12 @@ of `<PYTHON3>` below. Run
    sufficient, but never assemble an operation from one clause and a result from
    another. The explicit `w/o`/`full` labeled numeric pair is the only supported
    two-clause comparison. Both sides of that pair must contain a value and share
-   a measured metric (or an explicit percentage scale); architecture counts such
-   as stages or attention heads are not outcomes. That fallback needs
+   a measured metric (or an explicit percentage scale). When a metric is named,
+   its value must be locally bound to it; merely mentioning `accuracy` beside a
+   stage/head/layer count does not turn the count into an outcome. A fully
+   unlabeled two-percentage pair may infer the common outcome only when neither
+   side contains structure counts. Architecture counts are not outcomes. That
+   fallback needs
    role-distinctive evidence with a unique winning margin; ambiguous or generic
    overlap stops and requests `--story-plan`. Paper decks default to exactly 18
    slides. A count attached to the requested deck/slides/presentation, including

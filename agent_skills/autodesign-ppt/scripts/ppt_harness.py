@@ -580,13 +580,20 @@ _STRUCTURAL_COUNT_TERMS = (
     "token",
     "channel",
     "dimension",
+    "configuration",
+    "expert",
+    "branch",
     "阶段",
     "注意力头",
     "层数",
     "参数量",
     "通道数",
     "维度",
+    "配置数",
+    "专家数",
+    "分支数",
 )
+_LOCAL_OUTCOME_BINDING_MAX_GAP = 48
 
 
 def _parse_slide_count_token(token: str) -> int | None:
@@ -795,14 +802,96 @@ def _semantic_evidence_clauses(normalized: str) -> list[str]:
     return [clause.strip() for clause in clauses if clause.strip()]
 
 
-def _measured_outcome_term_present(normalized_text: str, term: str) -> bool:
+def _term_spans(
+    normalized_text: str,
+    term: str,
+    *,
+    allow_ascii_suffix: bool,
+) -> list[tuple[int, int]]:
     normalized_term = unicodedata.normalize("NFKC", term).casefold()
     if any(not character.isascii() for character in normalized_term):
-        return normalized_term in normalized_text
-    return re.search(
-        rf"(?<![a-z0-9]){re.escape(normalized_term)}(?:s|es)?(?![a-z0-9])",
-        normalized_text,
-    ) is not None
+        return [
+            (match.start(), match.end())
+            for match in re.finditer(re.escape(normalized_term), normalized_text)
+        ]
+    suffix = "[a-z]*" if allow_ascii_suffix else "(?:s|es)?"
+    return [
+        (match.start(), match.end())
+        for match in re.finditer(
+            rf"(?<![a-z0-9]){re.escape(normalized_term)}{suffix}(?![a-z0-9])",
+            normalized_text,
+        )
+    ]
+
+
+def _span_distance(left: tuple[int, int], right: tuple[int, int]) -> int:
+    if left[1] < right[0]:
+        return right[0] - left[1]
+    if right[1] < left[0]:
+        return left[0] - right[1]
+    return 0
+
+
+def _measured_outcome_spans(
+    normalized_text: str,
+) -> dict[str, list[tuple[int, int]]]:
+    result: dict[str, list[tuple[int, int]]] = {}
+    for label, terms in _MEASURED_OUTCOME_TERM_GROUPS.items():
+        spans = [
+            span
+            for term in terms
+            for span in _term_spans(
+                normalized_text,
+                term,
+                allow_ascii_suffix=False,
+            )
+        ]
+        if spans:
+            result[label] = spans
+    return result
+
+
+def _locally_bound_outcome_labels(normalized_text: str) -> set[str]:
+    metric_spans = _measured_outcome_spans(normalized_text)
+    structural_spans = [
+        span
+        for term in _STRUCTURAL_COUNT_TERMS
+        for span in _term_spans(
+            normalized_text,
+            term,
+            allow_ascii_suffix=True,
+        )
+    ]
+    labels: set[str] = set()
+    for number in re.finditer(_NUMERIC_VALUE_PATTERN, normalized_text):
+        value = number.group().rstrip()
+        number_span = (number.start(), number.start() + len(value))
+        metric_distances = [
+            (_span_distance(number_span, span), label)
+            for label, spans in metric_spans.items()
+            for span in spans
+        ]
+        if not metric_distances:
+            continue
+        nearest_metric = min(distance for distance, _label in metric_distances)
+        nearest_structure = min(
+            (
+                _span_distance(number_span, span)
+                for span in structural_spans
+            ),
+            default=math.inf,
+        )
+        if (
+            nearest_metric > _LOCAL_OUTCOME_BINDING_MAX_GAP
+            or nearest_structure <= nearest_metric
+        ):
+            continue
+        labels.update(
+            label
+            for distance, label in metric_distances
+            if distance == nearest_metric
+        )
+    return labels
 
 
 def _labeled_numeric_comparison_pairs(clauses: Sequence[str]) -> list[str]:
@@ -814,17 +903,10 @@ def _labeled_numeric_comparison_pairs(clauses: Sequence[str]) -> list[str]:
         )
         first_values = re.findall(_NUMERIC_VALUE_PATTERN, first)
         second_values = re.findall(_NUMERIC_VALUE_PATTERN, second)
-        first_metrics = {
-            label
-            for label, terms in _MEASURED_OUTCOME_TERM_GROUPS.items()
-            if any(_measured_outcome_term_present(first, term) for term in terms)
-        }
-        second_metrics = {
-            label
-            for label, terms in _MEASURED_OUTCOME_TERM_GROUPS.items()
-            if any(_measured_outcome_term_present(second, term) for term in terms)
-        }
-        shared_metric = bool(first_metrics & second_metrics)
+        first_metric_mentions = set(_measured_outcome_spans(first))
+        second_metric_mentions = set(_measured_outcome_spans(second))
+        first_bound_metrics = _locally_bound_outcome_labels(first)
+        second_bound_metrics = _locally_bound_outcome_labels(second)
         shared_percentage_scale = bool(
             any(value.rstrip().endswith("%") for value in first_values)
             and any(value.rstrip().endswith("%") for value in second_values)
@@ -834,8 +916,20 @@ def _labeled_numeric_comparison_pairs(clauses: Sequence[str]) -> list[str]:
             for fragment in (first, second)
             for term in _STRUCTURAL_COUNT_TERMS
         )
-        if first_metrics and second_metrics:
-            measured_outcome = shared_metric
+        if first_metric_mentions and second_metric_mentions:
+            measured_outcome = bool(first_bound_metrics & second_bound_metrics)
+        elif first_metric_mentions:
+            measured_outcome = bool(
+                first_bound_metrics
+                and shared_percentage_scale
+                and not structural_count
+            )
+        elif second_metric_mentions:
+            measured_outcome = bool(
+                second_bound_metrics
+                and shared_percentage_scale
+                and not structural_count
+            )
         else:
             measured_outcome = shared_percentage_scale and not structural_count
         joined = f"{first}; {second}"

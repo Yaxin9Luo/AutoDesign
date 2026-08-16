@@ -45,6 +45,8 @@ localized evidence are invalid repair instructions.
   and share a measured metric or percentage scale;
 - a `w/o`/`full` comparison authorized by architecture counts rather than an
   observed outcome;
+- a numeric value bound to a nearby structure count while a metric word appears
+  elsewhere in the clause;
 - a slide not inspected by the reviewer;
 - illegible, clipped, overlapping, or blank content;
 - visible remote/missing asset or runtime error;
