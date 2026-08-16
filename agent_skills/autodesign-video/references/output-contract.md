@@ -1,0 +1,119 @@
+# Conference-video output contract
+
+## Plan
+
+The canonical plan is one JSON object:
+
+```json
+{
+  "format_version": 1,
+  "artifact_type": "video",
+  "width": 1920,
+  "height": 1080,
+  "fps": 30,
+  "scene_count": 12,
+  "duration_s": 360,
+  "voice_id": "af_heart",
+  "language": "en",
+  "max_attempts": 4,
+  "scenes": [
+    {
+      "scene_id": "scene_01",
+      "title": "The research question",
+      "role": "opening",
+      "start_s": 0,
+      "duration_s": 24,
+      "narration": "Complete English narration for this scene.",
+      "source_ids": ["ev-001"],
+      "visual_ids": []
+    }
+  ]
+}
+```
+
+Scenes are unique and contiguous from zero. Their durations sum exactly to the
+video duration. Default to 12 scenes and 360 seconds. Only an explicit user
+request may select 10–14 scenes or 300–600 seconds. The canvas and frame rate
+are always 1920×1080 at 30 fps. Narration is English and grounded; it is not
+slide copy read aloud.
+
+## Editable HyperFrames project
+
+The project contains `index.html`, `hyperframes.json`, and local assets. The
+JSON entry is `index.html`. HTML has exactly one root with
+`data-composition-id`, `data-start="0"`, `data-duration`, `data-width="1920"`,
+and `data-height="1080"`. A static project declares `data-no-timeline`; an
+animated project registers one deterministic seekable `window.__timelines`
+entry. Never use `requestAnimationFrame` or wall-clock state.
+
+Every planned scene is a direct `<section id="scene_XX" class="clip">` with
+exact `data-start`, `data-duration`, and `data-source-ids`. `data-hf-clip` is
+optional metadata and never replaces the literal `clip` class. Source images
+are regular local files with `data-source-id` matching the authorized visual
+catalog and its SHA-256. Preserve native text, SVG text, tables, and equations.
+
+Include exactly one narration element before delivery:
+
+```html
+<audio class="clip" src="assets/narration.wav"
+       data-start="0" data-duration="360"
+       data-track-index="2" data-media-start="0"></audio>
+```
+
+Include an accessible `data-subtitle-toggle` control with `aria-pressed` and a
+local subtitle overlay. Captions are selectable in the MP4 and toggleable in
+the editable project. They must not be burned in or forced. Default the HTML
+overlay off so the video remains intentionally composed without captions.
+
+Reject remote URLs, protocol-relative URLs, data/blob/javascript URLs, remote
+fonts, scripts, styles, media, iframes, executable downloads, `fetch`, XHR,
+WebSocket, EventSource, `sendBeacon`, dynamic imports, and any project path
+that is absolute, traverses `..`, escapes the project, is a symlink, or is a
+hard link. Rendering runs without provider credentials or network access.
+
+## Non-negotiable delivery order
+
+1. Deterministic structural HTML, timeline, source, and local-path validation.
+   This stage allows the pipeline-owned `assets/narration.wav` to be absent. It
+   never runs full media lint and never creates placeholder audio.
+2. Exact HyperFrames 0.7.86 invokes local Kokoro per scene. Measure every WAV;
+   conservatively refit at no more than 1.30× or route overlong narration to an
+   authoring repair. Mix measured speech at planned scene starts into one
+   full-duration 24 kHz mono PCM narration WAV.
+3. Write the English transcript, SRT, VTT, per-scene timing, voice ID, speed,
+   engine, and optional-caption metadata.
+4. Run the real complete `hyperframes lint` only after the referenced narration
+   WAV exists and is hash-bound.
+5. Run exactly `hyperframes render --fps 30 --resolution landscape --strict
+   --no-best-effort --output <fresh-path> .`. Only that fresh, nonempty result
+   may become the delivery video.
+6. Mux the SRT as non-forced English `mov_text` without re-rendering video or
+   audio. ffprobe then requires H.264/yuv420p video, AAC audio, 1920×1080,
+   exactly 30 fps, planned duration, and the selectable English subtitle track.
+7. Extract six spread-out representative frames and one 3×2 contact sheet.
+   Bind every hash into deterministic QA and a fresh host-VLM review.
+
+Nonzero TTS/probe execution, missing tools, corrupt caches, and timeouts are
+runtime failures: repair setup and resume the same attempt. Invalid authored
+HTML, full-lint findings, render-content failures, overlong narration, and
+media-contract failures are authoring repairs. Never resend a deterministic
+setup failure to the authoring model. Never accept an older MP4 after a failed
+render. Runtime diagnostics persist in the active attempt until a successful
+delivery clears them; they are never published as final artifacts.
+
+## Required delivery closure
+
+The selected attempt retains and hash-binds:
+
+- editable `index.html`, `hyperframes.json`, and every local asset;
+- `conference-video.mp4` produced from the fresh HyperFrames render;
+- `assets/narration.wav` and per-scene narration text/WAV files;
+- `narration/transcript.en.txt`, `subtitles.en.srt`, `subtitles.en.vtt`,
+  `timing.json`, and `voice-and-subtitles.json`;
+- `media_probe.json`, six representative frames, `contact-sheet.png`,
+  `video-source-map.json`, and `delivery-report.json`;
+- attempt-level deterministic report, semantic review/context, provenance
+  source map, and final exact-set `delivery-manifest.json` in the run state.
+
+Finalization is forbidden unless every delivered byte, preview, source map,
+review context, and reviewer verdict still matches its recorded hash.

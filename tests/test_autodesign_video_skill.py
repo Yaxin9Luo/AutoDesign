@@ -1,0 +1,863 @@
+from __future__ import annotations
+
+import importlib.util
+import json
+import os
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import textwrap
+import unittest
+from pathlib import Path
+from unittest import mock
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+SKILL_ROOT = REPO_ROOT / "agent_skills" / "autodesign-video"
+HARNESS_PATH = SKILL_ROOT / "scripts" / "video_harness.py"
+SETUP_PATH = SKILL_ROOT / "scripts" / "setup_video.py"
+
+
+def _load_script(name: str, path: Path):
+    if not path.is_file():
+        return None
+    spec = importlib.util.spec_from_file_location(name, path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _plan(*, scene_count: int = 12, duration_s: int = 360) -> dict[str, object]:
+    base_duration = duration_s // scene_count
+    remainder = duration_s - (base_duration * scene_count)
+    cursor = 0
+    scenes: list[dict[str, object]] = []
+    roles = (
+        "opening", "problem", "context", "method", "method", "method",
+        "results", "results", "analysis", "limitations", "implications", "closing",
+    )
+    for index in range(scene_count):
+        scene_duration = base_duration + (1 if index < remainder else 0)
+        scene_id = f"scene_{index + 1:02d}"
+        narration = (
+            f"Scene {index + 1} explains one source-grounded part of the paper. "
+            "The narration names the research question, method, evidence, and boundary "
+            "in complete English sentences so the conference audience can follow the "
+            "argument without reading dense text from the screen. "
+        )
+        scenes.append(
+            {
+                "scene_id": scene_id,
+                "title": f"Evidence-led scene {index + 1}",
+                "role": roles[min(index, len(roles) - 1)],
+                "start_s": cursor,
+                "duration_s": scene_duration,
+                "narration": narration,
+                "source_ids": ["ev-001"],
+                "visual_ids": ["vis-001"] if index == 3 else [],
+            }
+        )
+        cursor += scene_duration
+    return {
+        "format_version": 1,
+        "artifact_type": "video",
+        "width": 1920,
+        "height": 1080,
+        "fps": 30,
+        "scene_count": scene_count,
+        "duration_s": duration_s,
+        "voice_id": "af_heart",
+        "language": "en",
+        "scenes": scenes,
+        "max_attempts": 4,
+    }
+
+
+def _project_html(plan: dict[str, object], *, bad: str = "") -> str:
+    scenes = plan["scenes"]
+    assert isinstance(scenes, list)
+    scene_html: list[str] = []
+    for scene_index, scene in enumerate(scenes):
+        assert isinstance(scene, dict)
+        source_media = ""
+        visual_ids = scene["visual_ids"]
+        assert isinstance(visual_ids, list)
+        if visual_ids:
+            source_media = (
+                '<img src="assets/figure.png" data-source-id="vis-001" '
+                'alt="Source method figure">'
+            )
+        clip_class = "" if bad == "data-hf-only" and scene["scene_id"] == "scene_01" else ' class="clip"'
+        scene_start = "nan" if bad == "scene-malformed-timing" and scene_index == 0 else scene["start_s"]
+        scene_html.append(
+            f'<section id="{scene["scene_id"]}"{clip_class} data-hf-clip="true" '
+            f'data-start="{scene_start}" data-duration="{scene["duration_s"]}" '
+            f'data-track-index="1" data-narration="{scene["narration"]}" '
+            f'data-source-ids="ev-001"><h2>{scene["title"]}</h2>{source_media}</section>'
+        )
+    extra_root = (
+        '<div data-composition-id="duplicate" data-start="0" data-duration="360" '
+        'data-width="1920" data-height="1080" data-no-timeline></div>'
+        if bad == "two-roots"
+        else ""
+    )
+    remote = '<img src="https://example.com/remote.png">' if bad == "remote" else ""
+    data_url = '<img src="data:image/png;base64,AA==">' if bad == "data-url" else ""
+    remote_css = '<div style="background:url(https://example.com/remote.png)"></div>' if bad == "remote-css" else ""
+    iframe = '<iframe src="assets/figure.png"></iframe>' if bad == "iframe" else ""
+    unsafe_script = (
+        "requestAnimationFrame(()=>fetch('https://example.com'))"
+        if bad == "network-script"
+        else ""
+    )
+    subtitle_button = "" if bad == "no-subtitle-toggle" else (
+        f'<button type="button" data-subtitle-toggle aria-pressed="{str(bad == "subtitles-default-on").lower()}" '
+        'aria-controls="subtitles">CC</button>'
+    )
+    subtitle_hidden = "" if bad == "subtitles-default-on" else " hidden"
+    root_start = "not-a-number" if bad == "malformed-timing" else "0"
+    audio = "" if bad == "no-audio" else (
+        f'<audio id="narration" class="clip" src="assets/narration.wav" '
+        f'data-start="0" data-duration="{plan["duration_s"]}" '
+        'data-track-index="2" data-media-start="0"></audio>'
+    )
+    return f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><style>
+html,body{{margin:0;width:1920px;height:1080px;overflow:hidden}}
+[data-composition-id]{{position:relative;width:1920px;height:1080px;background:#101820;color:white}}
+.clip{{position:absolute;inset:0}} .subtitle-overlay[hidden]{{display:none}}
+</style></head><body>
+<main data-composition-id="conference-video" data-start="{root_start}"
+      data-duration="{plan['duration_s']}" data-width="1920" data-height="1080"
+      data-no-timeline>{''.join(scene_html)}{audio}
+  {subtitle_button}<div id="subtitles" class="subtitle-overlay" aria-live="polite"{subtitle_hidden}></div>
+  {remote}{data_url}{remote_css}{iframe}
+</main>{extra_root}
+<script>{unsafe_script}
+document.querySelector('[data-subtitle-toggle]')?.addEventListener('click',event=>{{
+ const button=event.currentTarget; const target=document.getElementById('subtitles');
+ const shown=button.getAttribute('aria-pressed')==='true';
+ button.setAttribute('aria-pressed',String(!shown)); target.hidden=shown;
+}});</script></body></html>"""
+
+
+def _write_project(root: Path, plan: dict[str, object], *, bad: str = "") -> Path:
+    project = root / "project"
+    (project / "assets").mkdir(parents=True)
+    (project / "assets" / "figure.png").write_bytes(b"source-figure")
+    (project / "index.html").write_text(_project_html(plan, bad=bad), encoding="utf-8")
+    (project / "hyperframes.json").write_text(
+        json.dumps({"version": 1, "entry": "index.html"}) + "\n", encoding="utf-8"
+    )
+    return project
+
+
+def _make_executable(path: Path, body: str) -> Path:
+    path.write_text("#!/usr/bin/env python3\n" + textwrap.dedent(body), encoding="utf-8")
+    path.chmod(path.stat().st_mode | stat.S_IXUSR)
+    return path
+
+
+def _fake_runtime(root: Path, *, fail_stage: str = "", stale_render: bool = False) -> dict[str, str]:
+    bin_dir = root / "fake-bin"
+    bin_dir.mkdir(parents=True)
+    log = root / "commands.jsonl"
+    hyperframes = _make_executable(
+        bin_dir / "hyperframes",
+        f"""
+        import json, os, pathlib, sys, wave
+        log = pathlib.Path(os.environ['AUTODESIGN_VIDEO_TEST_LOG'])
+        with log.open('a', encoding='utf-8') as handle:
+            handle.write(json.dumps({{'tool':'hyperframes','args':sys.argv[1:]}})+'\\n')
+        args=sys.argv[1:]
+        if args == ['--version']:
+            print('0.7.86'); raise SystemExit(0)
+        stage=args[0] if args else ''
+        if stage == 'tts':
+            if {fail_stage!r} == 'tts': raise SystemExit(7)
+            output=pathlib.Path(args[args.index('--output')+1])
+            output.parent.mkdir(parents=True, exist_ok=True)
+            with wave.open(str(output), 'wb') as wav:
+                wav.setnchannels(1); wav.setsampwidth(2); wav.setframerate(24000)
+                wav.writeframes(b'\\0\\0' * 2400)
+        elif stage == 'lint':
+            if not pathlib.Path('assets/narration.wav').is_file():
+                print('audio_src_not_found assets/narration.wav', file=sys.stderr); raise SystemExit(9)
+            if {fail_stage!r} == 'lint': print('invalid clip nesting', file=sys.stderr); raise SystemExit(8)
+        elif stage == 'render':
+            if {fail_stage!r} == 'render': raise SystemExit(6)
+            output=pathlib.Path(args[args.index('--output')+1])
+            output.parent.mkdir(parents=True, exist_ok=True); output.write_bytes(b'HYPERFRAMES-MP4')
+            if {stale_render!r}: os.utime(output, (1, 1))
+        elif stage == 'browser' and args[1:] == ['ensure']:
+            print('browser ready')
+        """,
+    )
+    ffmpeg = _make_executable(
+        bin_dir / "ffmpeg",
+        f"""
+        import json, os, pathlib, sys, wave
+        log=pathlib.Path(os.environ['AUTODESIGN_VIDEO_TEST_LOG'])
+        with log.open('a', encoding='utf-8') as handle:
+            handle.write(json.dumps({{'tool':'ffmpeg','args':sys.argv[1:]}})+'\\n')
+        args=sys.argv[1:]; output=pathlib.Path(args[-1]); output.parent.mkdir(parents=True, exist_ok=True)
+        if output.suffix == '.wav':
+            with wave.open(str(output), 'wb') as wav:
+                wav.setnchannels(1); wav.setsampwidth(2); wav.setframerate(24000)
+                wav.writeframes(b'\\0\\0' * 2400)
+        elif output.suffix == '.png':
+            output.write_bytes(bytes.fromhex('89504e470d0a1a0a') + b'frame')
+        else:
+            source=pathlib.Path(args[args.index('-i')+1]); output.write_bytes(source.read_bytes()+b'-SUBTITLES')
+        """,
+    )
+    ffprobe = _make_executable(
+        bin_dir / "ffprobe",
+        f"""
+        import json, os, pathlib, sys
+        log=pathlib.Path(os.environ['AUTODESIGN_VIDEO_TEST_LOG'])
+        with log.open('a', encoding='utf-8') as handle:
+            handle.write(json.dumps({{'tool':'ffprobe','args':sys.argv[1:]}})+'\\n')
+        if {fail_stage!r} == 'probe': print('probe failed', file=sys.stderr); raise SystemExit(5)
+        path=pathlib.Path(sys.argv[-1])
+        if path.suffix == '.wav':
+            print('360.0' if 'narration.wav' in path.name else '0.1'); raise SystemExit(0)
+        print(json.dumps({{
+          'streams':[
+            {{'codec_type':'video','codec_name':'h264','pix_fmt':'yuv420p','width':1920,'height':1080,
+              'avg_frame_rate':'30/1','r_frame_rate':'30/1','duration':'360.0','nb_read_frames':'10800'}},
+            {{'codec_type':'audio','codec_name':'aac','duration':'360.0'}},
+            {{'codec_type':'subtitle','codec_name':'mov_text','tags':{{'language':'eng'}},'disposition':{{'forced':0}}}}
+          ], 'format':{{'duration':'360.0'}}
+        }}))
+        """,
+    )
+    return {
+        "status": "ready",
+        "cache_dir": str(root / "runtime-cache"),
+        "home_dir": str(root / "runtime-home"),
+        "hyperframes": str(hyperframes),
+        "python": sys.executable,
+        "ffmpeg": str(ffmpeg),
+        "ffprobe": str(ffprobe),
+        "command_log": str(log),
+        "hyperframes_version": "0.7.86",
+    }
+
+
+def _write_runtime_fixture(setup: object, spec: object) -> tuple[str, str]:
+    cache = spec.cache_dir
+    home = cache / "home"
+    node_root = cache / "node"
+    hyperframes = node_root / "node_modules" / ".bin" / "hyperframes"
+    python = cache / "tts-venv" / "bin" / "python"
+    model = home / ".cache" / "hyperframes" / "tts" / "models" / "kokoro-v1.0.onnx"
+    voices = home / ".cache" / "hyperframes" / "tts" / "voices" / "voices-v1.0.bin"
+    smoke = cache / "smoke" / "tts.wav"
+    for path in (hyperframes, python, model, voices, smoke):
+        path.parent.mkdir(parents=True, exist_ok=True)
+    _make_executable(hyperframes, "print('0.7.86')")
+    _make_executable(
+        python,
+        """
+        import sys
+        source = sys.argv[-1] if sys.argv else ''
+        print('0.5.0' if 'kokoro-onnx' in source else '0.14.0')
+        """,
+    )
+    model.write_bytes(b"fixture-model")
+    voices.write_bytes(b"fixture-voices")
+    smoke.write_bytes(b"fixture-wav")
+    model_hash = setup._sha256(model)
+    voices_hash = setup._sha256(voices)
+    state = {
+        "format_version": setup.RUNTIME_FORMAT_VERSION,
+        "cache_key": spec.cache_key,
+        "system": spec.system,
+        "machine": spec.machine,
+        "python_major_minor": spec.python_major_minor,
+        "node_major": spec.node_major,
+        "node_binary": str(spec.node_binary),
+        "ffmpeg_binary": str(spec.ffmpeg_binary),
+        "ffprobe_binary": str(spec.ffprobe_binary),
+        "hyperframes_version": setup.HYPERFRAMES_VERSION,
+        "hyperframes_relative": hyperframes.relative_to(cache).as_posix(),
+        "python_relative": python.relative_to(cache).as_posix(),
+        "home_relative": home.relative_to(cache).as_posix(),
+        "package_sha256": spec.package_sha256,
+        "package_lock_sha256": spec.package_lock_sha256,
+        "kokoro_onnx_version": setup.KOKORO_ONNX_VERSION,
+        "soundfile_version": setup.SOUNDFILE_VERSION,
+        "kokoro_model_relative": model.relative_to(cache).as_posix(),
+        "kokoro_model_sha256": model_hash,
+        "kokoro_voices_relative": voices.relative_to(cache).as_posix(),
+        "kokoro_voices_sha256": voices_hash,
+        "tts_smoke_relative": smoke.relative_to(cache).as_posix(),
+        "tts_smoke_sha256": setup._sha256(smoke),
+        "browser_ensured": True,
+    }
+    setup._atomic_write_json(cache / "runtime-state.json", state)
+    return model_hash, voices_hash
+
+
+class AutoDesignVideoSkillTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.harness = _load_script("portable_video_harness", HARNESS_PATH)
+        self.setup = _load_script("portable_video_setup", SETUP_PATH)
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def _require(self, module: object | None, path: Path) -> object:
+        self.assertIsNotNone(module, f"missing standalone video implementation: {path}")
+        return module
+
+    def test_cli_help_exposes_complete_video_lifecycle(self) -> None:
+        completed = subprocess.run(
+            [sys.executable, str(HARNESS_PATH), "--help"],
+            cwd=self.root,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+        for command in (
+            "doctor", "setup", "init", "evidence", "bind-visuals", "plan",
+            "begin-attempt", "validate", "deliver", "review-context",
+            "record-review", "finalize", "resume",
+        ):
+            self.assertIn(command, completed.stdout)
+        setup_help = subprocess.run(
+            [sys.executable, str(SETUP_PATH), "--help"],
+            cwd=self.root,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(setup_help.returncode, 0, setup_help.stdout + setup_help.stderr)
+        for command in ("doctor", "setup", "remove", "smoke"):
+            self.assertIn(command, setup_help.stdout)
+        unbound_delivery = subprocess.run(
+            [sys.executable, str(HARNESS_PATH), "deliver", "project", "plan.json"],
+            cwd=self.root,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertNotEqual(unbound_delivery.returncode, 0)
+        for required in ("--run", "--attempt", "--claims"):
+            self.assertIn(required, unbound_delivery.stderr)
+
+    def test_plan_defaults_to_12_scenes_and_360_seconds(self) -> None:
+        harness = self._require(self.harness, HARNESS_PATH)
+        plan = harness.normalize_plan(
+            {"format_version": 1, "artifact_type": "video", "scenes": _plan()["scenes"]}
+        )
+        self.assertEqual(plan["scene_count"], 12)
+        self.assertEqual(plan["duration_s"], 360)
+        self.assertEqual(plan["width"], 1920)
+        self.assertEqual(plan["height"], 1080)
+        self.assertEqual(plan["fps"], 30)
+
+    def test_plan_honors_valid_user_scene_and_duration_overrides(self) -> None:
+        harness = self._require(self.harness, HARNESS_PATH)
+        for scene_count, duration_s in ((10, 300), (11, 427), (14, 600)):
+            with self.subTest(scene_count=scene_count, duration_s=duration_s):
+                normalized = harness.normalize_plan(_plan(scene_count=scene_count, duration_s=duration_s))
+                self.assertEqual(normalized["scene_count"], scene_count)
+                self.assertEqual(normalized["duration_s"], duration_s)
+                self.assertEqual(
+                    sum(scene["duration_s"] for scene in normalized["scenes"]), duration_s
+                )
+
+    def test_plan_rejects_out_of_range_scene_duration_and_noncontiguous_timing(self) -> None:
+        harness = self._require(self.harness, HARNESS_PATH)
+        for value in (
+            _plan(scene_count=9, duration_s=360),
+            _plan(scene_count=15, duration_s=360),
+            _plan(scene_count=12, duration_s=299),
+            _plan(scene_count=12, duration_s=601),
+        ):
+            with self.subTest(scene_count=value["scene_count"], duration_s=value["duration_s"]):
+                with self.assertRaises(harness.VideoContractError):
+                    harness.normalize_plan(value)
+        broken = _plan()
+        broken["scenes"][3]["start_s"] += 1
+        with self.assertRaisesRegex(harness.VideoContractError, "contiguous"):
+            harness.normalize_plan(broken)
+
+    def test_structural_validation_accepts_local_editable_hyperframes_project(self) -> None:
+        harness = self._require(self.harness, HARNESS_PATH)
+        plan = _plan()
+        project = _write_project(self.root, plan)
+        report = harness.validate_project(
+            project,
+            plan,
+            evidence_ids={"ev-001"},
+            visual_catalog={
+                "vis-001": {
+                    "path": str(project / "assets" / "figure.png"),
+                    "sha256": harness.sha256_file(project / "assets" / "figure.png"),
+                }
+            },
+        )
+        self.assertTrue(report["passed"], report)
+        self.assertEqual(report["scene_count"], 12)
+        self.assertEqual(report["timeline_duration_s"], 360)
+        self.assertTrue(report["subtitle_toggle"])
+
+    def test_structural_validation_rejects_unsafe_or_noncanonical_projects(self) -> None:
+        harness = self._require(self.harness, HARNESS_PATH)
+        for bad, code in (
+            ("remote", "remote_asset"),
+            ("remote-css", "remote_asset"),
+            ("data-url", "data_url"),
+            ("iframe", "unsafe_embedded_content"),
+            ("network-script", "non_seekable_or_network_script"),
+            ("two-roots", "composition_root_count"),
+            ("data-hf-only", "literal_clip_required"),
+            ("no-audio", "narration_audio_missing"),
+            ("no-subtitle-toggle", "subtitle_toggle_missing"),
+            ("subtitles-default-on", "subtitle_default_state"),
+            ("malformed-timing", "composition_contract"),
+            ("scene-malformed-timing", "scene_timing"),
+        ):
+            with self.subTest(bad=bad):
+                project = _write_project(self.root / bad, _plan(), bad=bad)
+                report = harness.validate_project(project, _plan(), evidence_ids={"ev-001"})
+                self.assertFalse(report["passed"])
+                self.assertIn(code, {item["code"] for item in report["issues"]})
+
+    def test_source_visual_binding_rejects_missing_hash_symlink_and_hardlink(self) -> None:
+        harness = self._require(self.harness, HARNESS_PATH)
+        plan = _plan()
+        for mode, expected in (("hash", "source_visual_hash_mismatch"), ("symlink", "unsafe_local_asset"), ("hardlink", "unsafe_local_asset")):
+            with self.subTest(mode=mode):
+                root = self.root / mode
+                project = _write_project(root, plan)
+                source = root / "trusted.png"
+                source.write_bytes(b"source-figure")
+                asset = project / "assets" / "figure.png"
+                if mode == "hash":
+                    expected_hash = "0" * 64
+                elif mode == "symlink":
+                    asset.unlink(); asset.symlink_to(source)
+                    expected_hash = harness.sha256_file(source)
+                else:
+                    asset.unlink(); os.link(source, asset)
+                    expected_hash = harness.sha256_file(source)
+                report = harness.validate_project(
+                    project,
+                    plan,
+                    evidence_ids={"ev-001"},
+                    visual_catalog={"vis-001": {"path": str(source), "sha256": expected_hash}},
+                )
+                self.assertFalse(report["passed"])
+                self.assertIn(expected, {item["code"] for item in report["issues"]})
+
+    def test_delivery_uses_structural_tts_subtitles_full_lint_render_probe_order(self) -> None:
+        harness = self._require(self.harness, HARNESS_PATH)
+        plan = _plan()
+        project = _write_project(self.root, plan)
+        runtime = _fake_runtime(self.root)
+        report = harness.deliver_project(project, plan, runtime, smoke=True)
+        self.assertTrue(report["passed"], report)
+        events = [json.loads(line) for line in Path(runtime["command_log"]).read_text().splitlines()]
+        tools_and_stages = [
+            (item["tool"], item["args"][0] if item["tool"] == "hyperframes" else "")
+            for item in events
+        ]
+        tts_positions = [index for index, value in enumerate(tools_and_stages) if value == ("hyperframes", "tts")]
+        lint_position = tools_and_stages.index(("hyperframes", "lint"))
+        render_position = tools_and_stages.index(("hyperframes", "render"))
+        probe_position = next(index for index, item in enumerate(events) if item["tool"] == "ffprobe" and item["args"][-1].endswith(".mp4"))
+        self.assertEqual(len(tts_positions), 12)
+        self.assertLess(max(tts_positions), lint_position)
+        self.assertLess(lint_position, render_position)
+        self.assertLess(render_position, probe_position)
+        self.assertTrue((project / "assets" / "narration.wav").is_file())
+        self.assertTrue((project / "narration" / "transcript.en.txt").is_file())
+        self.assertTrue((project / "narration" / "subtitles.en.srt").is_file())
+        self.assertTrue((project / "narration" / "subtitles.en.vtt").is_file())
+        first_cue = (project / "narration" / "subtitles.en.srt").read_text(
+            encoding="utf-8"
+        ).splitlines()[1]
+        self.assertEqual(first_cue, "00:00:00,000 --> 00:00:00,100")
+        subtitle_metadata = json.loads(
+            (project / "narration" / "voice-and-subtitles.json").read_text(encoding="utf-8")
+        )
+        self.assertFalse(subtitle_metadata["html_subtitles_default_on"])
+        self.assertEqual(report["media_probe"]["video_codec"], "h264")
+        self.assertEqual(report["media_probe"]["subtitle_language"], "eng")
+        self.assertFalse(report["media_probe"]["subtitle_forced"])
+
+    def test_full_lint_runs_only_after_real_narration_reference_exists(self) -> None:
+        harness = self._require(self.harness, HARNESS_PATH)
+        plan = _plan()
+        project = _write_project(self.root, plan)
+        runtime = _fake_runtime(self.root)
+        report = harness.deliver_project(project, plan, runtime, smoke=True)
+        self.assertTrue(report["passed"], report)
+        lint = next(stage for stage in report["stages"] if stage["id"] == "full_lint")
+        self.assertEqual(lint["narration_sha256"], harness.sha256_file(project / "assets" / "narration.wav"))
+        self.assertNotIn("placeholder", json.dumps(report).lower())
+
+    def test_deterministic_runtime_failures_do_not_route_back_to_authoring(self) -> None:
+        harness = self._require(self.harness, HARNESS_PATH)
+        for stage in ("tts", "probe"):
+            with self.subTest(stage=stage):
+                root = self.root / stage
+                plan = _plan()
+                project = _write_project(root, plan)
+                report = harness.deliver_project(project, plan, _fake_runtime(root, fail_stage=stage), smoke=True)
+                self.assertFalse(report["passed"])
+                self.assertEqual(report["failure_class"], "runtime")
+                self.assertFalse(report["authoring_retryable"])
+
+    def test_delivery_failure_persists_runtime_resume_and_routes_authoring_next(self) -> None:
+        harness = self._require(self.harness, HARNESS_PATH)
+        core = harness.core
+        source = self.root / "source.md"
+        source.write_text("# Video source\nA grounded contribution and result.\n", encoding="utf-8")
+        run = self.root / "run"
+        core.initialize_run(run, SKILL_ROOT, release_version="0.1.0")
+        core.prepare_source(run, source)
+        plan = _plan()
+        core.save_plan(run, plan)
+        attempt_id = harness.begin_video_attempt(run)
+        project = _write_project(self.root / "failure", plan)
+        report = harness.deliver_project(
+            project,
+            plan,
+            _fake_runtime(self.root / "runtime-failure", fail_stage="tts"),
+            smoke=True,
+        )
+        routed = harness.record_delivery_failure(run, attempt_id, report)
+        self.assertEqual(routed["next_action"], "repair_runtime_and_resume_same_attempt")
+        resumed = harness.resume_video_run(run)
+        self.assertEqual(resumed["active_attempt"], attempt_id)
+        self.assertEqual(resumed["next_action"], "repair_runtime_and_resume_same_attempt")
+        self.assertIn("narration", resumed["runtime_failure"]["failed_stage"])
+        self.assertEqual(json.loads((run / "run.json").read_text())["state"], "authoring")
+        authoring = {
+            "passed": False,
+            "failure_class": "authoring",
+            "failed_stage": "full_lint",
+            "error": "authored clip contract failed",
+        }
+        routed = harness.record_delivery_failure(run, attempt_id, authoring)
+        self.assertEqual(routed["next_action"], "repair_authoring_in_next_attempt")
+        self.assertFalse((run / "attempts" / attempt_id / "qa" / "runtime-failure.json").exists())
+        self.assertEqual(harness.begin_video_attempt(run), "02")
+
+    def test_lint_and_render_failures_are_truthful_and_never_use_ffmpeg_as_final_renderer(self) -> None:
+        harness = self._require(self.harness, HARNESS_PATH)
+        for stage in ("lint", "render"):
+            with self.subTest(stage=stage):
+                root = self.root / stage
+                plan = _plan()
+                project = _write_project(root, plan)
+                runtime = _fake_runtime(root, fail_stage=stage)
+                report = harness.deliver_project(project, plan, runtime, smoke=True)
+                self.assertFalse(report["passed"])
+                self.assertEqual(report["failed_stage"], "full_lint" if stage == "lint" else "render")
+                self.assertEqual(report["failure_class"], "authoring")
+                commands = Path(runtime["command_log"]).read_text(encoding="utf-8")
+                if stage == "render":
+                    self.assertNotIn("-c:v", commands)
+                self.assertFalse(any(project.glob("renders/delivery*.mp4")))
+
+    def test_stale_render_output_cannot_satisfy_delivery(self) -> None:
+        harness = self._require(self.harness, HARNESS_PATH)
+        plan = _plan()
+        project = _write_project(self.root, plan)
+        report = harness.deliver_project(
+            project, plan, _fake_runtime(self.root, stale_render=True), smoke=True
+        )
+        self.assertFalse(report["passed"])
+        self.assertEqual(report["failed_stage"], "render")
+        self.assertIn("fresh", report["error"].lower())
+
+    def test_media_probe_requires_exact_h264_aac_1080p_30fps_english_optional_subtitles(self) -> None:
+        harness = self._require(self.harness, HARNESS_PATH)
+        valid = {
+            "streams": [
+                {"codec_type": "video", "codec_name": "h264", "pix_fmt": "yuv420p", "width": 1920, "height": 1080, "avg_frame_rate": "30/1", "r_frame_rate": "30/1", "duration": "360", "nb_read_frames": "10800"},
+                {"codec_type": "audio", "codec_name": "aac", "duration": "360"},
+                {"codec_type": "subtitle", "codec_name": "mov_text", "tags": {"language": "eng"}, "disposition": {"forced": 0}},
+            ],
+            "format": {"duration": "360"},
+        }
+        report = harness.validate_media_probe(valid, expected_duration_s=360)
+        self.assertTrue(report["passed"], report)
+        for mutation, code in (
+            (("streams", 0, "width", 1280), "video_dimensions"),
+            (("streams", 0, "codec_name", "hevc"), "video_codec"),
+            (("streams", 0, "avg_frame_rate", "unknown"), "video_frame_rate"),
+            (("streams", 1, "codec_name", "opus"), "audio_codec"),
+            (("streams", 2, "tags", {"language": "fra"}), "subtitle_language"),
+            (("streams", 2, "disposition", {"forced": 1}), "subtitle_forced"),
+        ):
+            payload = json.loads(json.dumps(valid))
+            _, index, key, value = mutation
+            payload["streams"][index][key] = value
+            broken = harness.validate_media_probe(payload, expected_duration_s=360)
+            self.assertFalse(broken["passed"])
+            self.assertIn(code, {item["code"] for item in broken["issues"]})
+
+        malformed = json.loads(json.dumps(valid))
+        malformed["streams"][2]["disposition"]["forced"] = "unknown"
+        report = harness.validate_media_probe(malformed, expected_duration_s=360)
+        self.assertFalse(report["passed"])
+        self.assertIn("subtitle_forced", {item["code"] for item in report["issues"]})
+
+    def test_setup_contract_pins_exact_runtime_and_kokoro_hashes(self) -> None:
+        setup = self._require(self.setup, SETUP_PATH)
+        self.assertEqual(setup.HYPERFRAMES_VERSION, "0.7.86")
+        self.assertEqual(
+            setup.KOKORO_MODEL_SHA256,
+            "7d5df8ecf7d4b1878015a32686053fd0eebe2bc377234608764cc0ef3636a6c5",
+        )
+        self.assertEqual(
+            setup.KOKORO_VOICES_SHA256,
+            "bca610b8308e8d99f32e6fe4197e7ec01679264efed0cac9140fe9c29f1fbf7d",
+        )
+        package = json.loads((SKILL_ROOT / "assets" / "video-runtime" / "package.json").read_text())
+        lock = json.loads((SKILL_ROOT / "assets" / "video-runtime" / "package-lock.json").read_text())
+        self.assertEqual(package["dependencies"], {"hyperframes": "0.7.86"})
+        self.assertEqual(lock["packages"]["node_modules/hyperframes"]["version"], "0.7.86")
+        self.assertEqual(
+            lock["packages"]["node_modules/hyperframes"]["integrity"],
+            "sha512-R8Vds5hY9XULMsCGUa+qynC7F0tL7KZyDaL6cgQ4xyJAATC9fOIPgRMOBkOHYd9JOntRqbR9bFSsfK7mYJjaow==",
+        )
+        spec = setup.runtime_spec(cache_root=self.root / "cache")
+        self.assertLessEqual(len(spec.cache_key), 40)
+        self.assertEqual(setup._venv_python_relative().parts[0], "p")
+
+    def test_doctor_distinguishes_missing_partial_corrupt_and_ready_cache(self) -> None:
+        setup = self._require(self.setup, SETUP_PATH)
+        cache_root = self.root / "cache"
+        missing = setup.doctor_video_runtime(cache_root=cache_root)
+        self.assertEqual(missing["status"], "missing")
+        spec = setup.runtime_spec(cache_root=cache_root)
+        spec.cache_dir.mkdir(parents=True)
+        partial = setup.doctor_video_runtime(cache_root=cache_root)
+        self.assertEqual(partial["status"], "partial")
+        (spec.cache_dir / "runtime-state.json").write_text("{}\n", encoding="utf-8")
+        corrupt = setup.doctor_video_runtime(cache_root=cache_root)
+        self.assertEqual(corrupt["status"], "corrupt")
+        shutil.rmtree(spec.cache_dir)
+        model_hash, voices_hash = _write_runtime_fixture(setup, spec)
+        with (
+            mock.patch.object(setup, "KOKORO_MODEL_SHA256", model_hash),
+            mock.patch.object(setup, "KOKORO_VOICES_SHA256", voices_hash),
+        ):
+            ready = setup.doctor_video_runtime(cache_root=cache_root)
+        self.assertEqual(ready["status"], "ready")
+        self.assertTrue(ready["ready"])
+        state_path = spec.cache_dir / "runtime-state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["ffmpeg_binary"] = str(Path(shutil.which("echo") or "/bin/echo").resolve())
+        setup._atomic_write_json(state_path, state)
+        with (
+            mock.patch.object(setup, "KOKORO_MODEL_SHA256", model_hash),
+            mock.patch.object(setup, "KOKORO_VOICES_SHA256", voices_hash),
+        ):
+            changed_tool = setup.doctor_video_runtime(cache_root=cache_root)
+        self.assertEqual(changed_tool["status"], "corrupt")
+        self.assertIn("ffmpeg_binary", json.dumps(changed_tool))
+        state["ffmpeg_binary"] = str(spec.ffmpeg_binary)
+        external_state = self.root / "external-runtime-state.json"
+        setup._atomic_write_json(external_state, state)
+        state_path.unlink()
+        state_path.symlink_to(external_state)
+        with (
+            mock.patch.object(setup, "KOKORO_MODEL_SHA256", model_hash),
+            mock.patch.object(setup, "KOKORO_VOICES_SHA256", voices_hash),
+        ):
+            linked_state = setup.doctor_video_runtime(cache_root=cache_root)
+        self.assertEqual(linked_state["status"], "corrupt")
+        self.assertIn("runtime-state.json", json.dumps(linked_state))
+
+    def test_runtime_cache_rejects_skill_internal_symlink_and_hardlinked_assets(self) -> None:
+        setup = self._require(self.setup, SETUP_PATH)
+        with self.assertRaises(setup.VideoRuntimeError):
+            setup.runtime_spec(cache_root=SKILL_ROOT / "cache")
+        linked_root = self.root / "linked"
+        linked_root.mkdir()
+        real_root = self.root / "real"
+        real_root.mkdir()
+        (linked_root / "cache").symlink_to(real_root, target_is_directory=True)
+        with self.assertRaises(setup.VideoRuntimeError):
+            setup.runtime_spec(cache_root=linked_root / "cache")
+        if setup.platform.system() == "Darwin":
+            with self.assertRaisesRegex(setup.VideoRuntimeError, "too long"):
+                setup.runtime_spec(cache_root=self.root / ("deep-cache-" * 20))
+
+        short_root = Path(tempfile.mkdtemp(prefix="adv-v-broken-", dir="/tmp"))
+        self.addCleanup(shutil.rmtree, short_root, True)
+        broken_spec = setup.runtime_spec(cache_root=short_root)
+        broken_spec.cache_root.mkdir(parents=True, exist_ok=True)
+        broken_spec.cache_dir.symlink_to(self.root / "missing-runtime", target_is_directory=True)
+        broken = setup.doctor_video_runtime(cache_root=broken_spec.cache_root)
+        self.assertEqual(broken["status"], "corrupt")
+        self.assertIn("symlink", json.dumps(broken).lower())
+
+        spec = setup.runtime_spec(cache_root=self.root / "cache")
+        model_hash, voices_hash = _write_runtime_fixture(setup, spec)
+        model = spec.cache_dir / "home" / ".cache" / "hyperframes" / "tts" / "models" / "kokoro-v1.0.onnx"
+        twin = self.root / "model-copy"
+        os.link(model, twin)
+        with (
+            mock.patch.object(setup, "KOKORO_MODEL_SHA256", model_hash),
+            mock.patch.object(setup, "KOKORO_VOICES_SHA256", voices_hash),
+        ):
+            doctor = setup.doctor_video_runtime(cache_root=spec.cache_root)
+        self.assertEqual(doctor["status"], "corrupt")
+        self.assertIn("hard link", json.dumps(doctor).lower())
+
+    def test_runtime_environment_isolated_to_versioned_home_and_contains_no_secrets(self) -> None:
+        setup = self._require(self.setup, SETUP_PATH)
+        spec = setup.runtime_spec(cache_root=self.root / "cache")
+        model_hash, voices_hash = _write_runtime_fixture(setup, spec)
+        with (
+            mock.patch.object(setup, "KOKORO_MODEL_SHA256", model_hash),
+            mock.patch.object(setup, "KOKORO_VOICES_SHA256", voices_hash),
+        ):
+            runtime = setup.require_video_runtime(cache_root=spec.cache_root)
+        env = setup.runtime_environment(
+            runtime,
+            base={"PATH": os.environ.get("PATH", ""), "OPENAI_API_KEY": "secret", "HOME": "/tmp/elsewhere"},
+        )
+        self.assertEqual(Path(env["HOME"]), runtime.home_dir)
+        self.assertEqual(Path(env["HYPERFRAMES_PYTHON"]), runtime.python_executable)
+        self.assertEqual(env["HYPERFRAMES_NO_TELEMETRY"], "1")
+        self.assertNotIn("OPENAI_API_KEY", env)
+
+    def test_runtime_remove_is_explicit_idempotent_and_confined_to_exact_cache(self) -> None:
+        setup = self._require(self.setup, SETUP_PATH)
+        cache_root = self.root / "cache"
+        spec = setup.runtime_spec(cache_root=cache_root)
+        spec.cache_dir.mkdir(parents=True)
+        (spec.cache_dir / "owned.txt").write_text("runtime\n", encoding="utf-8")
+        sibling = cache_root / "keep-me"
+        sibling.mkdir()
+        (sibling / "user.txt").write_text("keep\n", encoding="utf-8")
+
+        removed = setup.remove_video_runtime(cache_root=cache_root)
+        self.assertEqual(removed["status"], "removed")
+        self.assertFalse(spec.cache_dir.exists())
+        self.assertEqual((sibling / "user.txt").read_text(encoding="utf-8"), "keep\n")
+
+        missing = setup.remove_video_runtime(cache_root=cache_root)
+        self.assertEqual(missing["status"], "missing")
+
+        spec.cache_dir.symlink_to(sibling, target_is_directory=True)
+        with self.assertRaisesRegex(setup.VideoRuntimeError, "symlink"):
+            setup.remove_video_runtime(cache_root=cache_root)
+        self.assertTrue((sibling / "user.txt").is_file())
+
+    def test_attempt_delivery_is_hash_bound_and_resume_rejects_tampered_mp4(self) -> None:
+        harness = self._require(self.harness, HARNESS_PATH)
+        core = harness.core
+        source = self.root / "source.md"
+        source.write_text("# Grounded video\nThe paper reports a grounded method and evidence.\n", encoding="utf-8")
+        run = self.root / "run"
+        core.initialize_run(run, SKILL_ROOT, release_version="0.1.0")
+        core.prepare_source(run, source)
+        plan = _plan()
+        core.save_plan(run, plan)
+        attempt_id = core.begin_attempt(run)
+        attempt = run / "attempts" / attempt_id
+        project = _write_project(attempt / "artifact-root", plan)
+        report = harness.deliver_project(project, plan, _fake_runtime(self.root / "runtime"), smoke=True)
+        self.assertTrue(report["passed"], report)
+        claims = [{"id": "claim-01", "text": "The paper reports a grounded method.", "source_ids": ["ev-001"]}]
+        runtime_marker = attempt / "qa" / "runtime-failure.json"
+        core.atomic_write_json(
+            runtime_marker,
+            {
+                "format_version": 1,
+                "attempt_id": attempt_id,
+                "failure_class": "runtime",
+                "failed_stage": "narration",
+                "error": "temporary runtime failure",
+            },
+        )
+        harness.record_attempt_delivery(run, attempt_id, project, report, claims=claims)
+        self.assertFalse(runtime_marker.exists())
+        context = core.create_review_context(run, attempt_id, rubric=harness.REVIEW_RUBRIC)
+        review = {
+            "format_version": 1,
+            "attempt_id": attempt_id,
+            "review_context_sha256": context["context_sha256"],
+            "artifact_hashes": context["artifact_hashes"],
+            "preview_hashes": context["preview_hashes"],
+            "reviewed_frame_ids": sorted(context["preview_hashes"]),
+            "source_manifest_sha256": context["source_manifest_sha256"],
+            "source_map_sha256": context["source_map_sha256"],
+            "rubric_sha256": context["rubric_sha256"],
+            "reviewer_mode": "fresh_host_vlm",
+            "dimension_scores": {name: 5 for name in harness.REVIEW_RUBRIC["dimensions"]},
+            "blockers": [],
+            "localized_repairs": [],
+            "verdict": "pass",
+            "complete": True,
+        }
+        core.record_semantic_review(run, attempt_id, review)
+        copied_mp4 = attempt / "artifact" / "conference-video.mp4"
+        copied_mp4.write_bytes(copied_mp4.read_bytes() + b"tampered")
+        with self.assertRaises(core.IntegrityError):
+            core.finalize_attempt(run, attempt_id)
+        with self.assertRaises(core.IntegrityError):
+            core.resume_run(run, skill_root=SKILL_ROOT)
+
+    def test_video_attempt_budget_is_enforced_without_fallback(self) -> None:
+        harness = self._require(self.harness, HARNESS_PATH)
+        core = harness.core
+        source = self.root / "source.md"
+        source.write_text("# Grounded video\nA grounded method and evidence.\n", encoding="utf-8")
+        run = self.root / "bounded-run"
+        core.initialize_run(run, SKILL_ROOT, release_version="0.1.0")
+        core.prepare_source(run, source)
+        plan = _plan()
+        plan["max_attempts"] = 1
+        core.save_plan(run, harness.normalize_plan(plan))
+        attempt_id = harness.begin_video_attempt(run)
+        self.assertEqual(attempt_id, "01")
+        core.mark_side_state(run, "failed", reason="authored timeline failed")
+        with self.assertRaisesRegex(harness.VideoContractError, "budget exhausted"):
+            harness.begin_video_attempt(run)
+        self.assertFalse((run / "final").exists())
+
+    @unittest.skipUnless(
+        os.environ.get("AUTODESIGN_VIDEO_REAL_SMOKE") == "1",
+        "set AUTODESIGN_VIDEO_REAL_SMOKE=1 for the real HyperFrames/Kokoro smoke",
+    )
+    def test_real_hyperframes_0786_tts_render_probe_and_selectable_subtitles(self) -> None:
+        setup = self._require(self.setup, SETUP_PATH)
+        harness = self._require(self.harness, HARNESS_PATH)
+        with tempfile.TemporaryDirectory(prefix="adv-video-", dir="/tmp") as short_cache:
+            runtime = setup.ensure_video_runtime(cache_root=Path(short_cache))
+            evidence = setup.run_real_smoke(runtime, output_dir=self.root / "real-smoke")
+        self.assertTrue(evidence["passed"], evidence)
+        self.assertEqual(evidence["hyperframes_version"], "0.7.86")
+        probe = harness.validate_media_probe(
+            json.loads(Path(evidence["ffprobe_json"]).read_text()),
+            expected_duration_s=evidence["duration_s"],
+            smoke=True,
+        )
+        self.assertTrue(probe["passed"], probe)
+        self.assertEqual(probe["subtitle_language"], "eng")
+        self.assertFalse(probe["subtitle_forced"])
+        self.assertTrue(Path(evidence["contact_sheet"]).is_file())
+
+
+if __name__ == "__main__":
+    unittest.main()
