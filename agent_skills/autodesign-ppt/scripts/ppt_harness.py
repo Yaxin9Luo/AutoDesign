@@ -3,19 +3,22 @@
 
 from __future__ import annotations
 
+import sys
+
+sys.dont_write_bytecode = True
+
 import argparse
+import hashlib
 import importlib.util
 import json
 import os
 import re
 import shutil
 import subprocess
-import sys
 import uuid
 from collections import Counter
 from pathlib import Path
 from typing import Any, Mapping, Sequence
-from urllib.parse import unquote, urlsplit
 
 
 DEFAULT_SLIDE_COUNT = 18
@@ -23,6 +26,7 @@ MAX_REPAIR_ATTEMPTS = 3
 RELEASE_VERSION = "0.1.0"
 SLIDE_WIDTH = 1920
 SLIDE_HEIGHT = 1080
+_PLAN_SHA_FIELD = "ppt_plan_sha256"
 
 
 class PptHarnessError(RuntimeError):
@@ -57,9 +61,12 @@ exporter = _load_sibling("autodesign_ppt_exporter", "export_pptx.py")
 
 
 _EXPLICIT_COUNT_PATTERNS = (
-    re.compile(r"(?<!\d)([1-5]?\d|60)\s*-?\s*(?:slides?|pages?|页)(?!\w)", re.IGNORECASE),
+    re.compile(
+        r"(?<!\d)([1-5]?\d|60)\s*-?\s*(?:slides?|pages?|页)(?![A-Za-z0-9_])",
+        re.IGNORECASE,
+    ),
     re.compile(r"(?:slides?|pages?)\s*(?:count|total)?\s*[:=]?\s*([1-5]?\d|60)(?!\d)", re.IGNORECASE),
-    re.compile(r"(?:生成|做成|制作|需要|共)\s*([1-5]?\d|60)\s*页"),
+    re.compile(r"(?:生成|做成|制作|需要|想要|要|做|共)\s*([1-5]?\d|60)\s*页"),
 )
 
 _ACADEMIC_ARC = (
@@ -165,17 +172,12 @@ def build_deck_plan(
 
 
 def _contained_dependency(root: Path, base: Path, reference: str) -> Path | None:
-    parsed = urlsplit(reference.strip().strip("'\""))
-    if parsed.scheme or parsed.netloc or not parsed.path or parsed.path.startswith("/"):
-        return None
-    candidate = (base / Path(unquote(parsed.path))).resolve(strict=True)
     try:
-        candidate.relative_to(root)
-    except ValueError as error:
-        raise PptHarnessError(f"local deck dependency escapes the workspace: {reference}") from error
-    if candidate.is_symlink() or not candidate.is_file():
-        raise PptHarnessError(f"local deck dependency is missing or unsafe: {reference}")
-    return candidate
+        return exporter.resolve_local_dependency(root, base, reference)
+    except (OSError, exporter.PptContractError) as error:
+        raise PptHarnessError(
+            f"local deck dependency is missing or unsafe: {reference}: {error}"
+        ) from error
 
 
 def _dependency_closure(deck: Any) -> list[Path]:
@@ -219,6 +221,139 @@ def _copy_dependencies(deck: Any, destination_root: Path) -> None:
         target = destination_root / relative
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(path, target)
+
+
+def validate_deck_against_plan(
+    deck: Any, plan: Mapping[str, Any]
+) -> dict[str, Any]:
+    planned_slides = plan.get("slides")
+    if not isinstance(planned_slides, list):
+        return {
+            "name": "deck_plan",
+            "passed": False,
+            "issues": ["deck plan has no ordered slide list"],
+        }
+    issues: list[str] = []
+    if len(deck.slides) != len(planned_slides):
+        issues.append(
+            f"planned {len(planned_slides)} slides but authored {len(deck.slides)}"
+        )
+    for index, (slide, planned) in enumerate(
+        zip(deck.slides, planned_slides), start=1
+    ):
+        if not isinstance(planned, Mapping):
+            issues.append(f"slide {index}: plan entry is not an object")
+            continue
+        expected = {
+            "id": planned.get("slide_id"),
+            "data-slide-id": planned.get("slide_id"),
+            "data-slide-index": str(planned.get("slide_index")),
+            "data-slide-role": planned.get("role"),
+            "data-section": planned.get("chapter"),
+            "data-assertion-title": planned.get("assertion_title"),
+        }
+        actual = {
+            "id": slide.attrs.get("id"),
+            "data-slide-id": slide.attrs.get("data-slide-id"),
+            "data-slide-index": slide.attrs.get("data-slide-index"),
+            "data-slide-role": slide.attrs.get("data-slide-role"),
+            "data-section": slide.attrs.get("data-section"),
+            "data-assertion-title": slide.attrs.get("data-assertion-title"),
+        }
+        for field, expected_value in expected.items():
+            if actual[field] != expected_value:
+                issues.append(
+                    f"slide {index}: {field} differs from the immutable plan"
+                )
+        planned_sources = [str(item) for item in planned.get("evidence_refs", [])]
+        authored_sources = [
+            item
+            for item in re.split(
+                r"[\s,;]+", slide.attrs.get("data-source-ids", "").strip()
+            )
+            if item
+        ]
+        if authored_sources != planned_sources:
+            issues.append(f"slide {index}: evidence refs differ from the immutable plan")
+        parsed_notes = exporter.parse_speaker_notes(
+            slide.attrs.get("data-speaker-notes", "")
+        )
+        if parsed_notes is None or parsed_notes[0] != planned_sources:
+            issues.append(
+                f"slide {index}: speaker-note refs differ from the immutable plan"
+            )
+    return {"name": "deck_plan", "passed": not issues, "issues": issues}
+
+
+def _verify_attempt_plan_snapshot(run_dir: Path, attempt: str) -> Path:
+    plan_path = run_dir / "plan.json"
+    snapshot = (
+        run_dir / "attempts" / attempt / "artifact" / "provenance" / "plan.json"
+    )
+    if (
+        snapshot.is_symlink()
+        or not snapshot.is_file()
+        or snapshot.lstat().st_nlink > 1
+        or snapshot.read_bytes() != plan_path.read_bytes()
+    ):
+        raise PptHarnessError("attempt plan snapshot differs from the bound plan")
+    return snapshot
+
+
+def _artifact_delivery_paths(
+    artifact_root: Path,
+    deck: Any,
+    *,
+    require_notes: bool = True,
+    require_outputs: bool,
+) -> list[str]:
+    expected = {
+        Path("deck.html"),
+        Path("deck.pdf"),
+        Path("deck.pptx"),
+        Path("notes.json"),
+        Path("provenance/plan.json"),
+    }
+    if artifact_root.is_symlink() or not artifact_root.is_dir():
+        raise PptHarnessError("artifact root is missing or unsafe")
+    root = artifact_root.resolve(strict=True)
+    for dependency in _dependency_closure(deck):
+        expected.add(dependency.relative_to(root))
+    allowed_directories = {
+        parent
+        for relative in expected
+        for parent in relative.parents
+        if parent != Path(".")
+    }
+    actual_files: list[Path] = []
+    for path in sorted(artifact_root.rglob("*")):
+        relative = path.relative_to(artifact_root)
+        if path.is_symlink():
+            raise PptHarnessError(f"artifact contains a symlink: {relative}")
+        status = path.lstat()
+        if path.is_dir():
+            if relative not in allowed_directories:
+                raise PptHarnessError(f"unexpected artifact directory: {relative}")
+            continue
+        if relative not in expected:
+            raise PptHarnessError(f"unexpected artifact file: {relative}")
+        if not path.is_file() or status.st_nlink > 1:
+            raise PptHarnessError(f"artifact contains a hardlink or unsafe file: {relative}")
+        actual_files.append(path)
+    required = {Path("deck.html"), Path("provenance/plan.json")}
+    if require_notes:
+        required.add(Path("notes.json"))
+    if require_outputs:
+        required.update({Path("deck.pdf"), Path("deck.pptx")})
+    missing = sorted(str(path) for path in required if not (artifact_root / path).is_file())
+    if missing:
+        raise PptHarnessError(
+            "required delivery artifact is missing: " + ", ".join(missing)
+        )
+    return [
+        f"artifact/{path.relative_to(artifact_root).as_posix()}"
+        for path in actual_files
+    ]
 
 
 def create_slide_audit_variants(
@@ -425,7 +560,12 @@ def _optional_office_comparison(
         return office
     rasterizer = shutil.which("pdftoppm")
     if not rasterizer:
-        return {**office, "comparison_performed": False, "reason": "pdftoppm unavailable"}
+        return {
+            **office,
+            "passed": False,
+            "comparison_performed": False,
+            "reason": "pdftoppm unavailable",
+        }
     rendered = qa_dir / "office" / "rendered"
     rendered.mkdir(parents=True, exist_ok=True)
     result = subprocess.run(
@@ -554,7 +694,9 @@ def render_and_validate_deck(
     )
     browser_pass = all(report.get("passed") is True for report in browser_reports.values())
     office_pass = not office.get("performed") or (
-        office.get("page_count") == expected_slide_count and office.get("passed", True)
+        office.get("page_count") == expected_slide_count
+        and office.get("comparison_performed") is True
+        and office.get("passed") is True
     )
     checks = [
         {"name": "html_contract", "passed": bool(contract["passed"])},
@@ -610,8 +752,95 @@ def _run_state(run_dir: Path) -> dict[str, Any]:
     return json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
 
 
+def _plan_bytes(plan: Mapping[str, Any]) -> bytes:
+    return (
+        json.dumps(dict(plan), ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+
+
+def _plan_binding(plan: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "format_version": 1,
+        "plan_sha256": hashlib.sha256(_plan_bytes(plan)).hexdigest(),
+    }
+
+
+def _verify_plan_binding(run_dir: Path, state: Mapping[str, Any]) -> dict[str, Any] | None:
+    plan_path = run_dir / "plan.json"
+    binding_path = run_dir / "plan-binding.json"
+    state_digest = state.get(_PLAN_SHA_FIELD)
+    if binding_path.is_symlink() or (
+        binding_path.exists()
+        and (not binding_path.is_file() or binding_path.lstat().st_nlink > 1)
+    ):
+        raise PptHarnessError("plan hash binding is linked or unsafe")
+    if not plan_path.exists() and not binding_path.exists():
+        if state.get("state") != "initialized" or state_digest is not None:
+            raise PptHarnessError("planned run is missing its plan binding")
+        return None
+    if not plan_path.exists():
+        if state.get("state") == "initialized" and binding_path.is_file():
+            binding = json.loads(binding_path.read_text(encoding="utf-8"))
+            if state_digest is not None and binding.get("plan_sha256") != state_digest:
+                raise PptHarnessError("plan hash binding changed")
+            return None
+        raise PptHarnessError("plan binding exists without its plan")
+    if plan_path.is_symlink() or plan_path.lstat().st_nlink > 1:
+        raise PptHarnessError("plan file is linked or unsafe")
+    if not binding_path.is_file():
+        raise PptHarnessError("plan hash binding is missing")
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    binding = json.loads(binding_path.read_text(encoding="utf-8"))
+    if binding != _plan_binding(plan) or state_digest != binding["plan_sha256"]:
+        raise PptHarnessError("plan hash binding changed")
+    return plan
+
+
+def _bind_plan_before_save(run_dir: Path, plan: Mapping[str, Any]) -> None:
+    binding_path = run_dir / "plan-binding.json"
+    expected = _plan_binding(plan)
+    state = _run_state(run_dir)
+    state_digest = state.get(_PLAN_SHA_FIELD)
+    if state_digest is not None and state_digest != expected["plan_sha256"]:
+        raise PptHarnessError("refusing to replace a different plan hash binding")
+    if binding_path.exists():
+        if binding_path.is_symlink() or binding_path.lstat().st_nlink > 1:
+            raise PptHarnessError("plan hash binding is linked or unsafe")
+        existing = json.loads(binding_path.read_text(encoding="utf-8"))
+        if existing != expected:
+            raise PptHarnessError("refusing to replace a different plan hash binding")
+    else:
+        portable.atomic_write_json(binding_path, expected)
+    if state_digest is None:
+        state[_PLAN_SHA_FIELD] = expected["plan_sha256"]
+        portable.atomic_write_json(run_dir / "run.json", state)
+
+
+def _snapshot_plan_for_attempt(run_dir: Path, attempt: str) -> Path:
+    plan_path = run_dir / "plan.json"
+    plan = _verify_plan_binding(run_dir, _run_state(run_dir))
+    if plan is None:
+        raise PptHarnessError("attempt requires a bound plan")
+    destination = (
+        run_dir / "attempts" / attempt / "artifact" / "provenance" / "plan.json"
+    )
+    if destination.exists():
+        if (
+            destination.is_symlink()
+            or not destination.is_file()
+            or destination.lstat().st_nlink > 1
+            or destination.read_bytes() != plan_path.read_bytes()
+        ):
+            raise PptHarnessError("attempt plan snapshot differs from the bound plan")
+        return destination
+    portable.atomic_write_bytes(destination, plan_path.read_bytes())
+    return destination
+
+
 def _resume(run_dir: Path) -> dict[str, Any]:
-    return portable.resume_run(run_dir, skill_root=_skill_root())
+    state = portable.resume_run(run_dir, skill_root=_skill_root())
+    _verify_plan_binding(run_dir, state)
+    return state
 
 
 def _active_attempt(run_dir: Path) -> str:
@@ -669,8 +898,11 @@ def _command_plan(args: argparse.Namespace) -> dict[str, Any]:
         if not visual_check["valid"]:
             raise PptHarnessError("visual allocation exceeds an allowed reuse limit")
         plan["visual_allocations"] = allocations
-    portable.save_plan(args.run_dir, plan)
-    return plan
+    clean_plan = portable.redact_secrets(plan)
+    _bind_plan_before_save(args.run_dir, clean_plan)
+    saved = portable.save_plan(args.run_dir, clean_plan)
+    _verify_plan_binding(args.run_dir, _run_state(args.run_dir))
+    return saved
 
 
 def _command_evidence(args: argparse.Namespace) -> dict[str, Any]:
@@ -697,6 +929,7 @@ def _command_bind_visuals(args: argparse.Namespace) -> dict[str, Any]:
 def _command_begin(args: argparse.Namespace) -> dict[str, Any]:
     _resume(args.run_dir)
     attempt = _begin_attempt(args.run_dir)
+    _snapshot_plan_for_attempt(args.run_dir, attempt)
     artifact = args.run_dir / "attempts" / attempt / "artifact" / "deck.html"
     return {"attempt_id": attempt, "author_target": str(artifact)}
 
@@ -824,13 +1057,20 @@ def _command_validate(args: argparse.Namespace) -> dict[str, Any]:
     qa_root = prepare_qa_directory(attempt_root)
     artifact_root = attempt_root / "artifact"
     html = artifact_root / "deck.html"
-    plan = json.loads((args.run_dir / "plan.json").read_text(encoding="utf-8"))
+    _verify_attempt_plan_snapshot(args.run_dir, attempt)
+    plan = _verify_plan_binding(args.run_dir, _run_state(args.run_dir))
+    if plan is None:
+        raise PptHarnessError("validation requires a bound plan")
     deck = exporter.parse_deck_html(html)
-    portable.write_source_map(args.run_dir, attempt, exporter.claims_from_deck(deck))
+    plan_gate = validate_deck_against_plan(deck, plan)
+    _artifact_delivery_paths(
+        artifact_root, deck, require_notes=False, require_outputs=False
+    )
     notes_path = artifact_root / "notes.json"
     _atomic_json(notes_path, {"format_version": 1, "slides": exporter.notes_from_deck(deck)})
+    portable.write_source_map(args.run_dir, attempt, exporter.claims_from_deck(deck))
     visual_gate = _run_visual_gate(args.run_dir, deck, plan)
-    if visual_gate["passed"]:
+    if plan_gate["passed"] and visual_gate["passed"]:
         result = render_and_validate_deck(
             html,
             expected_slide_count=int(plan["slide_count"]),
@@ -840,27 +1080,31 @@ def _command_validate(args: argparse.Namespace) -> dict[str, Any]:
             offline_browser=args.offline_browser,
             offline_ppt=args.offline_ppt,
         )
-        result["checks"] = [visual_gate, *result.get("checks", [])]
-        result["passed"] = visual_gate["passed"] and bool(result.get("passed"))
+        result["checks"] = [plan_gate, visual_gate, *result.get("checks", [])]
+        result["passed"] = (
+            plan_gate["passed"]
+            and visual_gate["passed"]
+            and bool(result.get("passed"))
+        )
         _atomic_json(qa_root / "deck-validation.json", result)
     else:
         result = {
             "format_version": 1,
             "passed": False,
-            "checks": [visual_gate],
+            "checks": [plan_gate, visual_gate],
             "preview_paths": [],
         }
         _atomic_json(qa_root / "deck-validation.json", result)
-    artifact_paths = [
-        f"artifact/{path.relative_to(artifact_root).as_posix()}"
-        for path in sorted(artifact_root.rglob("*"))
-        if path.is_file() and not path.is_symlink()
-    ]
+    artifact_paths = _artifact_delivery_paths(
+        artifact_root, deck, require_outputs=bool(result.get("passed"))
+    )
     preview_paths: dict[str, str] = {}
     for path_text in result.get("preview_paths", []):
-        path = Path(path_text)
+        path = Path(path_text).resolve(strict=True)
         frame = "contact-sheet" if path.name == "contact-sheet.png" else path.stem
-        preview_paths[frame] = path.relative_to(attempt_root).as_posix()
+        preview_paths[frame] = path.relative_to(
+            attempt_root.resolve(strict=True)
+        ).as_posix()
     portable.record_deterministic_result(
         args.run_dir,
         attempt,

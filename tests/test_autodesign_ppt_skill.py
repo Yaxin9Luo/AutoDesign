@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import importlib.util
 import json
 import os
@@ -8,6 +9,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 import zipfile
 from pathlib import Path
@@ -20,6 +23,7 @@ SKILL_ROOT = REPO_ROOT / "agent_skills" / "autodesign-ppt"
 HARNESS_PATH = SKILL_ROOT / "scripts" / "ppt_harness.py"
 EXPORTER_PATH = SKILL_ROOT / "scripts" / "export_pptx.py"
 SETUP_PATH = SKILL_ROOT / "scripts" / "setup_ppt.py"
+PPT_LOCK_PATH = SKILL_ROOT / "scripts" / "requirements-ppt.lock"
 SAFE_NAVIGATION_SCRIPT = "(()=>{const s=[...document.querySelectorAll('.deck-slide')];const i=()=>Math.max(0,s.findIndex(x=>'#'+x.id===location.hash));const g=n=>{const x=s[Math.min(s.length-1,Math.max(0,n))];if(x){location.hash=x.id;x.scrollIntoView({block:'start'})}};addEventListener('keydown',e=>{if(e.key==='ArrowLeft'){e.preventDefault();g(i()-1)}else if(e.key==='ArrowRight'){e.preventDefault();g(i()+1)}});addEventListener('hashchange',()=>{const x=s[i()];if(x)x.scrollIntoView({block:'start'})})})();"
 
 
@@ -126,6 +130,34 @@ class AutoDesignPptSkillTests(unittest.TestCase):
         html.write_text(_deck_html(slide_count, remote_asset=remote_asset), encoding="utf-8")
         return html
 
+    def _initialize_run(self, brief: str = "Create a conference deck.") -> Path:
+        harness = self._require(self.harness, HARNESS_PATH)
+        paper = self.root / "paper.md"
+        paper.write_text(
+            "# Grounded paper\n\nThe paper presents a grounded research finding. "
+            "AutoDesign reports a grounded result.\n",
+            encoding="utf-8",
+        )
+        run = self.root / "run"
+        harness._command_init(
+            SimpleNamespace(
+                run_dir=run,
+                source=paper,
+                extra_asset=[],
+                reference_image=[],
+                archive_sha256=None,
+            )
+        )
+        harness._command_plan(
+            SimpleNamespace(
+                run_dir=run,
+                brief=brief,
+                slide_count=None,
+                visual_allocations=None,
+            )
+        )
+        return run
+
     def test_planner_defaults_paper_decks_to_exactly_18_slides(self) -> None:
         harness = self._require(self.harness, HARNESS_PATH)
         plan = harness.build_deck_plan("Create a conference deck from this paper.", ["ev-001"])
@@ -136,12 +168,41 @@ class AutoDesignPptSkillTests(unittest.TestCase):
 
     def test_explicit_user_slide_count_overrides_the_18_slide_default(self) -> None:
         harness = self._require(self.harness, HARNESS_PATH)
-        for brief, expected in (("Make 12 slides.", 12), ("请生成 22 页 PPT。", 22), ("Create a 15-page deck", 15)):
+        for brief, expected in (
+            ("Make 12 slides.", 12),
+            ("请生成 22 页 PPT。", 22),
+            ("我想要 22 页的 PPT。", 22),
+            ("Create a 15-page deck", 15),
+        ):
             with self.subTest(brief=brief):
                 plan = harness.build_deck_plan(brief, ["ev-001"])
                 self.assertEqual(plan["slide_count"], expected)
                 self.assertEqual(plan["count_source"], "explicit_user")
                 self.assertEqual(len(plan["slides"]), expected)
+
+    def test_saved_plan_is_hash_bound_and_snapshotted_into_each_attempt(self) -> None:
+        harness = self._require(self.harness, HARNESS_PATH)
+        run = self._initialize_run()
+        begin = harness._command_begin(SimpleNamespace(run_dir=run))
+        attempt = begin["attempt_id"]
+        snapshot = run / "attempts" / attempt / "artifact" / "provenance" / "plan.json"
+        self.assertTrue(snapshot.is_file())
+        self.assertEqual(snapshot.read_bytes(), (run / "plan.json").read_bytes())
+        binding = json.loads((run / "plan-binding.json").read_text(encoding="utf-8"))
+        state = json.loads((run / "run.json").read_text(encoding="utf-8"))
+        self.assertEqual(state["ppt_plan_sha256"], binding["plan_sha256"])
+
+        plan = json.loads((run / "plan.json").read_text(encoding="utf-8"))
+        plan["slide_count"] = 7
+        (run / "plan.json").write_text(json.dumps(plan), encoding="utf-8")
+        with self.assertRaisesRegex(Exception, "plan.*(?:hash|binding|changed)"):
+            harness._resume(run)
+
+        (run / "plan-binding.json").write_text(
+            json.dumps(harness._plan_binding(plan)), encoding="utf-8"
+        )
+        with self.assertRaisesRegex(Exception, "plan.*(?:hash|binding|changed)"):
+            harness._resume(run)
 
     def test_html_contract_accepts_exact_ids_assertions_sources_notes_canvas_and_navigation(self) -> None:
         exporter = self._require(self.exporter, EXPORTER_PATH)
@@ -162,6 +223,104 @@ class AutoDesignPptSkillTests(unittest.TestCase):
         codes = {item["code"] for item in report["issues"]}
         self.assertIn("slide_count_mismatch", codes)
         self.assertIn("remote_asset", codes)
+
+    def test_html_contract_rejects_remote_links_and_css_generated_text(self) -> None:
+        exporter = self._require(self.exporter, EXPORTER_PATH)
+        html = self._write_fixture()
+        (html.parent / "theme").write_text(
+            '.deck-slide::after{content:"Raster-only conclusion"}'
+            '@import url("https://example.com/remote.css");',
+            encoding="utf-8",
+        )
+        text = html.read_text(encoding="utf-8")
+        text = text.replace(
+            "The paper presents a grounded research finding.</h1>",
+            '<a href="https://example.com/paper">The paper presents a grounded research finding.</a></h1>',
+            1,
+        ).replace(
+            "</head>",
+            '<link rel="stylesheet" href="theme"></head>',
+            1,
+        )
+        html.write_text(text, encoding="utf-8")
+        report = exporter.validate_deck_html(html, expected_slide_count=18)
+        codes = {item["code"] for item in report["issues"]}
+        self.assertFalse(report["passed"])
+        self.assertIn("remote_asset", codes)
+        self.assertIn("css_generated_text", codes)
+
+    def test_html_contract_rejects_symlink_and_hardlink_assets(self) -> None:
+        exporter = self._require(self.exporter, EXPORTER_PATH)
+        outside = self.root / "outside.png"
+        outside.write_bytes(_png_bytes())
+        for link_kind in ("symlink", "hardlink"):
+            with self.subTest(link_kind=link_kind):
+                artifact = self.root / link_kind
+                (artifact / "assets").mkdir(parents=True)
+                link = artifact / "assets" / "pixel.png"
+                if link_kind == "symlink":
+                    link.symlink_to(outside)
+                else:
+                    os.link(outside, link)
+                html = artifact / "deck.html"
+                html.write_text(_deck_html(), encoding="utf-8")
+                report = exporter.validate_deck_html(html, expected_slide_count=18)
+                self.assertFalse(report["passed"])
+                self.assertIn(
+                    "unsafe_local_asset",
+                    {item["code"] for item in report["issues"]},
+                )
+
+    def test_slide_metadata_notes_and_all_native_text_are_source_mapped(self) -> None:
+        exporter = self._require(self.exporter, EXPORTER_PATH)
+        harness = self._require(self.harness, HARNESS_PATH)
+        html = self._write_fixture()
+        text = html.read_text(encoding="utf-8")
+        text = text.replace(' data-slide-id="slide-01"', "", 1)
+        text = text.replace('data-slide-index="1"', 'data-slide-index="999"', 1)
+        text = text.replace(
+            "[Sources] ev-001 [Talk] Explain slide 1.",
+            "[Sources] ev-999 [Talk] Accuracy is 99.9%.",
+            1,
+        )
+        text = text.replace("<td>Grounded</td>", "<td>Invented 88.8%</td>", 1)
+        html.write_text(text, encoding="utf-8")
+        deck = exporter.parse_deck_html(html)
+        report = exporter.validate_deck_html(html, expected_slide_count=18)
+        codes = {item["code"] for item in report["issues"]}
+        self.assertFalse(report["passed"])
+        self.assertIn("slide_id_contract", codes)
+        self.assertIn("slide_index_contract", codes)
+        self.assertIn("speaker_note_sources", codes)
+
+        claims = exporter.claims_from_deck(deck)
+        claim_text = "\n".join(str(item.get("text", "")) for item in claims)
+        self.assertIn("A concise source-backed explanation.", claim_text)
+        self.assertIn("Invented 88.8%", claim_text)
+        self.assertIn("Accuracy is 99.9%", claim_text)
+
+        plan = harness.build_deck_plan("Create a conference deck.", ["ev-001"])
+        plan_gate = harness.validate_deck_against_plan(deck, plan)
+        self.assertFalse(plan_gate["passed"])
+        self.assertTrue(plan_gate["issues"])
+
+        conforming = _deck_html()
+        for slide in plan["slides"]:
+            index = slide["slide_index"]
+            conforming = conforming.replace(
+                f'data-slide-index="{index}" data-slide-role="evidence" '
+                'data-section="paper-talk" '
+                'data-assertion-title="The paper presents a grounded research finding."',
+                f'data-slide-index="{index}" data-slide-role="{slide["role"]}" '
+                f'data-section="{slide["chapter"]}" '
+                f'data-assertion-title="{slide["assertion_title"]}"',
+                1,
+            )
+        html.write_text(conforming, encoding="utf-8")
+        accepted_gate = harness.validate_deck_against_plan(
+            exporter.parse_deck_html(html), plan
+        )
+        self.assertTrue(accepted_gate["passed"], accepted_gate)
 
     def test_html_contract_rejects_visible_text_that_would_be_rasterized_in_pptx(self) -> None:
         exporter = self._require(self.exporter, EXPORTER_PATH)
@@ -232,6 +391,23 @@ class AutoDesignPptSkillTests(unittest.TestCase):
             self.assertIn(b"<a:tbl>", slide_xml)
             self.assertIn(b"The paper presents a grounded research finding.", slide_xml)
 
+    def test_pptx_font_sizes_use_the_same_144_pixel_canvas_scale_as_positions(self) -> None:
+        from pptx import Presentation
+
+        exporter = self._require(self.exporter, EXPORTER_PATH)
+        html = self._write_fixture()
+        output = self.root / "scaled-fonts.pptx"
+        exporter.export_deck_to_pptx(html, output)
+        presentation = Presentation(str(output))
+        title = next(
+            shape
+            for shape in presentation.slides[0].shapes
+            if getattr(shape, "has_text_frame", False)
+            and "The paper presents" in shape.text_frame.text
+        )
+        points = title.text_frame.paragraphs[0].runs[0].font.size.pt
+        self.assertAlmostEqual(points, 27.0, places=2)
+
     def test_pptx_validation_rejects_whole_slide_rasterization_without_editable_overlays(self) -> None:
         exporter = self._require(self.exporter, EXPORTER_PATH)
         html = self._write_fixture()
@@ -278,6 +454,191 @@ class AutoDesignPptSkillTests(unittest.TestCase):
         self.assertTrue(cleaned_file.is_dir())
         self.assertEqual(list(cleaned_file.iterdir()), [])
 
+    def test_validation_rejects_unlisted_or_hardlinked_delivery_files(self) -> None:
+        harness = self._require(self.harness, HARNESS_PATH)
+        run = self._initialize_run()
+        attempt = harness._command_begin(SimpleNamespace(run_dir=run))["attempt_id"]
+        artifact = run / "attempts" / attempt / "artifact"
+        (artifact / "assets").mkdir(exist_ok=True)
+        (artifact / "assets" / "pixel.png").write_bytes(_png_bytes())
+        (artifact / "deck.html").write_text(_deck_html(), encoding="utf-8")
+        (artifact / "deck.pdf").write_bytes(b"pdf")
+        (artifact / "deck.pptx").write_bytes(b"pptx")
+        outside = self.root / "private.txt"
+        outside.write_text("must not be delivered\n", encoding="utf-8")
+        os.link(outside, artifact / "private.txt")
+        args = SimpleNamespace(
+            run_dir=run,
+            attempt=attempt,
+            browser_cache=None,
+            ppt_cache=None,
+            offline_browser=True,
+            offline_ppt=True,
+        )
+        with (
+            mock.patch.object(harness.portable, "write_source_map"),
+            mock.patch.object(
+                harness,
+                "validate_deck_against_plan",
+                return_value={"name": "deck_plan", "passed": True, "issues": []},
+                create=True,
+            ),
+            mock.patch.object(
+                harness,
+                "_run_visual_gate",
+                return_value={"name": "visual_provenance", "passed": True, "issues": []},
+            ),
+            mock.patch.object(
+                harness,
+                "render_and_validate_deck",
+                return_value={"passed": True, "checks": [], "preview_paths": []},
+            ),
+            mock.patch.object(harness.portable, "record_deterministic_result") as record,
+            self.assertRaisesRegex(harness.PptHarnessError, "unexpected artifact|hardlink"),
+        ):
+            harness._command_validate(args)
+        record.assert_not_called()
+
+        (artifact / "private.txt").unlink()
+        (artifact / "notes.json").write_text(
+            '{"format_version":1,"slides":[]}\n', encoding="utf-8"
+        )
+        allowed = harness._artifact_delivery_paths(
+            artifact, harness.exporter.parse_deck_html(artifact / "deck.html"), require_outputs=True
+        )
+        self.assertIn("artifact/provenance/plan.json", allowed)
+        self.assertEqual(
+            set(allowed),
+            {
+                "artifact/assets/pixel.png",
+                "artifact/deck.html",
+                "artifact/deck.pdf",
+                "artifact/deck.pptx",
+                "artifact/notes.json",
+                "artifact/provenance/plan.json",
+            },
+        )
+
+    def test_validate_hash_binds_plan_all_native_claims_and_delivery_into_review(self) -> None:
+        harness = self._require(self.harness, HARNESS_PATH)
+        run = self._initialize_run()
+        attempt = harness._command_begin(SimpleNamespace(run_dir=run))["attempt_id"]
+        artifact = run / "attempts" / attempt / "artifact"
+        (artifact / "assets").mkdir(exist_ok=True)
+        (artifact / "assets" / "pixel.png").write_bytes(_png_bytes())
+        plan = json.loads((run / "plan.json").read_text(encoding="utf-8"))
+        authored = _deck_html().replace(
+            "A concise source-backed explanation.",
+            "AutoDesign reports a grounded result.",
+        )
+        for slide in plan["slides"]:
+            index = slide["slide_index"]
+            authored = authored.replace(
+                f'data-slide-index="{index}" data-slide-role="evidence" '
+                'data-section="paper-talk" '
+                'data-assertion-title="The paper presents a grounded research finding."',
+                f'data-slide-index="{index}" data-slide-role="{slide["role"]}" '
+                f'data-section="{slide["chapter"]}" '
+                f'data-assertion-title="{slide["assertion_title"]}"',
+                1,
+            ).replace(
+                f"[Sources] ev-001 [Talk] Explain slide {index}.",
+                "[Sources] ev-001 [Talk] The paper presents a grounded research finding.",
+                1,
+            )
+        (artifact / "deck.html").write_text(authored, encoding="utf-8")
+
+        def fake_render(_html, *, qa_dir, **_kwargs):
+            (artifact / "deck.pdf").write_bytes(b"pdf")
+            (artifact / "deck.pptx").write_bytes(b"pptx")
+            preview = qa_dir / "slide-01.png"
+            preview.parent.mkdir(parents=True, exist_ok=True)
+            preview.write_bytes(_png_bytes())
+            return {
+                "passed": True,
+                "checks": [],
+                "preview_paths": [str(preview)],
+            }
+
+        args = SimpleNamespace(
+            run_dir=run,
+            attempt=attempt,
+            browser_cache=None,
+            ppt_cache=None,
+            offline_browser=True,
+            offline_ppt=True,
+        )
+        with (
+            mock.patch.object(
+                harness,
+                "_run_visual_gate",
+                return_value={"name": "visual_provenance", "passed": True, "issues": []},
+            ),
+            mock.patch.object(harness, "render_and_validate_deck", side_effect=fake_render),
+        ):
+            result = harness._command_validate(args)
+        self.assertTrue(result["passed"], result)
+
+        deterministic = json.loads(
+            (run / "attempts" / attempt / "qa" / "deterministic.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertIn("artifact/provenance/plan.json", deterministic["artifact_hashes"])
+        source_map = json.loads(
+            (run / "attempts" / attempt / "provenance" / "source-map.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(len(source_map["claims"]), 18 * 3 + 1)
+        self.assertIn("slide_table", {claim["claim_type"] for claim in source_map["claims"]})
+        self.assertEqual(
+            sum(claim["claim_type"] == "speaker_notes" for claim in source_map["claims"]),
+            18,
+        )
+        context = harness._command_review_context(
+            SimpleNamespace(run_dir=run, attempt=attempt)
+        )
+        self.assertEqual(context["artifact_hashes"], deterministic["artifact_hashes"])
+        self.assertIn("artifact/provenance/plan.json", context["artifact_hashes"])
+
+    def test_rendered_comparison_rejects_a_blank_powerpoint_render(self) -> None:
+        from PIL import Image, ImageDraw
+
+        exporter = self._require(self.exporter, EXPORTER_PATH)
+        canonical = self.root / "canonical.png"
+        rendered = self.root / "rendered.png"
+        image = Image.new("RGB", (1920, 1080), "white")
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((100, 100, 850, 300), fill="black")
+        draw.rectangle((100, 420, 1700, 900), fill="#6B3FA0")
+        image.save(canonical)
+        Image.new("RGB", (1920, 1080), "white").save(rendered)
+        report = exporter.compare_rendered_slides([canonical], [rendered])
+        self.assertFalse(report["passed"], report)
+        self.assertLess(report["slide_metrics"][0]["edge_recall"], 0.1)
+
+    def test_libreoffice_render_requires_pixel_comparison_when_office_is_available(self) -> None:
+        harness = self._require(self.harness, HARNESS_PATH)
+        with (
+            mock.patch.object(
+                harness.exporter,
+                "render_pptx_with_libreoffice",
+                return_value={"performed": True, "page_count": 18, "pdf": "rendered.pdf"},
+            ),
+            mock.patch.object(harness.shutil, "which", return_value=None),
+        ):
+            report = harness._optional_office_comparison(
+                self.root / "deck.pptx",
+                self.root / "previews",
+                self.root / "qa",
+                18,
+                object(),
+            )
+        self.assertTrue(report["performed"])
+        self.assertFalse(report["comparison_performed"])
+        self.assertFalse(report["passed"])
+
     def test_setup_runtime_is_versioned_outside_the_installed_skill(self) -> None:
         setup = self._require(self.setup, SETUP_PATH)
         spec = setup.runtime_spec(cache_root=self.root / "cache")
@@ -287,6 +648,215 @@ class AutoDesignPptSkillTests(unittest.TestCase):
         self.assertEqual(setup.PINNED_PACKAGES["python-pptx"], "1.0.2")
         with self.assertRaisesRegex(setup.PptRuntimeError, "outside the installed Skill"):
             setup.runtime_spec(cache_root=SKILL_ROOT / "generated-cache")
+
+    def test_ppt_runtime_uses_an_artifact_hash_lock_and_require_hashes(self) -> None:
+        setup = self._require(self.setup, SETUP_PATH)
+        self.assertTrue(PPT_LOCK_PATH.is_file())
+        lock_text = PPT_LOCK_PATH.read_text(encoding="utf-8")
+        for name, version in setup.PINNED_PACKAGES.items():
+            self.assertIn(f"{name}=={version}".lower(), lock_text.lower())
+        self.assertGreaterEqual(lock_text.count("--hash=sha256:"), len(setup.PINNED_PACKAGES))
+        spec = setup.runtime_spec(cache_root=self.root / "cache")
+        self.assertEqual(
+            spec.package_lock_sha256,
+            hashlib.sha256(PPT_LOCK_PATH.read_bytes()).hexdigest(),
+        )
+
+        commands: list[list[str]] = []
+
+        def completed(command, **_kwargs):
+            commands.append([str(item) for item in command])
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with (
+            mock.patch.object(setup.subprocess, "run", side_effect=completed),
+            mock.patch.object(setup, "_runtime_tree_sha256", return_value="a" * 64, create=True),
+        ):
+            setup._install(self.root / "staging", spec)
+        pip_command = commands[1]
+        self.assertIn("--require-hashes", pip_command)
+        self.assertIn("--no-deps", pip_command)
+        self.assertIn("--requirement", pip_command)
+        self.assertNotIn("python-pptx==1.0.2", pip_command)
+
+    def test_ppt_runtime_rejects_same_version_cache_content_tampering(self) -> None:
+        setup = self._require(self.setup, SETUP_PATH)
+        spec = setup.runtime_spec(cache_root=self.root / "cache")
+        cache = spec.cache_dir
+        python = cache / ("venv/Scripts/python.exe" if os.name == "nt" else "venv/bin/python")
+        python.parent.mkdir(parents=True)
+        python.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        python.chmod(0o755)
+        site = (
+            cache / "venv" / "Lib" / "site-packages"
+            if os.name == "nt"
+            else cache
+            / "venv"
+            / "lib"
+            / f"python{sys.version_info.major}.{sys.version_info.minor}"
+            / "site-packages"
+        )
+        site.mkdir(parents=True)
+        module = site / "pptx.py"
+        module.write_text("VERSION = 1\n", encoding="utf-8")
+        digest = setup._runtime_tree_sha256(cache)
+        setup._atomic_json(cache / setup._STATE_FILE, setup._state_payload(spec, digest))
+        module.write_text("VERSION = 2\n", encoding="utf-8")
+        with (
+            mock.patch.object(setup, "_probe"),
+            self.assertRaisesRegex(setup.PptRuntimeError, "content hash|tree hash|tampered"),
+        ):
+            setup.inspect_runtime(cache, spec)
+
+    def test_ppt_runtime_lock_prevents_dual_holders_after_liveness_false_negative(self) -> None:
+        setup = self._require(self.setup, SETUP_PATH)
+        lock = self.root / "runtime.lock"
+        first_entered = threading.Event()
+        release_first = threading.Event()
+        second_entered = threading.Event()
+        errors: list[BaseException] = []
+
+        def first() -> None:
+            try:
+                with setup._runtime_lock(lock, 2.0):
+                    first_entered.set()
+                    release_first.wait(2.0)
+            except BaseException as error:
+                errors.append(error)
+
+        def second() -> None:
+            try:
+                first_entered.wait(2.0)
+                with setup._runtime_lock(lock, 2.0):
+                    second_entered.set()
+            except BaseException as error:
+                errors.append(error)
+
+        with mock.patch.object(setup, "_process_alive", return_value=False):
+            left = threading.Thread(target=first)
+            right = threading.Thread(target=second)
+            left.start()
+            right.start()
+            self.assertTrue(first_entered.wait(1.0))
+            time.sleep(0.15)
+            self.assertFalse(second_entered.is_set())
+            release_first.set()
+            left.join(2.0)
+            right.join(2.0)
+        self.assertEqual(errors, [])
+        self.assertTrue(second_entered.is_set())
+
+    def test_ppt_runtime_advisory_lock_serializes_independent_processes(self) -> None:
+        lock = self.root / "runtime.lock"
+        first_entered = self.root / "first-entered"
+        second_entered = self.root / "second-entered"
+        release_first = self.root / "release-first"
+        release_second = self.root / "release-second"
+        release_second.write_text("ready\n", encoding="utf-8")
+        helper = self.root / "lock-holder.py"
+        helper.write_text(
+            """
+import importlib.util
+import sys
+import time
+from pathlib import Path
+
+module_path, lock_path, entered_path, release_path = map(Path, sys.argv[1:])
+spec = importlib.util.spec_from_file_location("ppt_lock_holder", module_path)
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+module._process_alive = lambda _pid: False
+with module._runtime_lock(lock_path, 5.0):
+    entered_path.write_text("entered\\n", encoding="utf-8")
+    deadline = time.monotonic() + 4.0
+    while not release_path.exists():
+        if time.monotonic() >= deadline:
+            raise SystemExit("timed out waiting for release")
+        time.sleep(0.02)
+""".strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        environment = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
+        first = subprocess.Popen(
+            [
+                sys.executable,
+                "-B",
+                str(helper),
+                str(SETUP_PATH),
+                str(lock),
+                str(first_entered),
+                str(release_first),
+            ],
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        second = None
+        try:
+            deadline = time.monotonic() + 3.0
+            while not first_entered.exists() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertTrue(first_entered.exists())
+            second = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-B",
+                    str(helper),
+                    str(SETUP_PATH),
+                    str(lock),
+                    str(second_entered),
+                    str(release_second),
+                ],
+                env=environment,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            time.sleep(0.25)
+            self.assertFalse(second_entered.exists())
+            release_first.write_text("release\n", encoding="utf-8")
+            first_output = first.communicate(timeout=5)
+            second_output = second.communicate(timeout=5)
+            self.assertEqual(first.returncode, 0, "".join(first_output))
+            self.assertEqual(second.returncode, 0, "".join(second_output))
+            self.assertTrue(second_entered.exists())
+        finally:
+            for process in (first, second):
+                if process is not None and process.poll() is None:
+                    process.kill()
+                    process.communicate()
+
+    def test_cli_help_does_not_write_into_the_installed_skill(self) -> None:
+        installed = self.root / "installed" / "autodesign-ppt"
+        shutil.copytree(SKILL_ROOT, installed)
+        for generated in installed.rglob("__pycache__"):
+            shutil.rmtree(generated)
+        before = {
+            path.relative_to(installed).as_posix(): path.read_bytes()
+            for path in installed.rglob("*")
+            if path.is_file()
+        }
+        environment = dict(os.environ)
+        environment.pop("PYTHONDONTWRITEBYTECODE", None)
+        completed = subprocess.run(
+            [sys.executable, str(installed / "scripts" / "ppt_harness.py"), "--help"],
+            cwd=self.root,
+            env=environment,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+        after = {
+            path.relative_to(installed).as_posix(): path.read_bytes()
+            for path in installed.rglob("*")
+            if path.is_file()
+        }
+        self.assertEqual(after, before)
+        self.assertEqual(list(installed.rglob("__pycache__")), [])
 
     def test_passing_review_cannot_bypass_the_bound_minimum_scores(self) -> None:
         harness = self._require(self.harness, HARNESS_PATH)
@@ -329,6 +899,8 @@ class AutoDesignPptSkillTests(unittest.TestCase):
         self.assertEqual(result["pptx_validation"]["slide_count"], 18)
         if shutil.which("soffice"):
             self.assertTrue(result["rendered_pptx_comparison"]["performed"])
+            self.assertTrue(result["rendered_pptx_comparison"]["comparison_performed"])
+            self.assertTrue(result["rendered_pptx_comparison"]["passed"])
             self.assertEqual(result["rendered_pptx_comparison"]["page_count"], 18)
 
 

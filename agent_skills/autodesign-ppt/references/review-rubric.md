@@ -40,6 +40,7 @@ localized evidence are invalid repair instructions.
 - screenshot-only text/table content in the PPTX;
 - missing speaker notes or source IDs;
 - PPTX reopen/render failure, wrong PDF page count, or stale review binding;
+- plan-snapshot mismatch, incomplete source map, or an unlisted delivery file;
 - generic AI-marketing copy, decorative filler, or repeated template grids that
   displace the paper's evidence.
 

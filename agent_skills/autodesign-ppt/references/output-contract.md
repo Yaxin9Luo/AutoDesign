@@ -44,6 +44,12 @@ The visual must be eligible for that role, stay within its catalog reuse limit,
 and appear on the allocated slide. Run `stage-visual` after `begin`; do not copy
 an unapproved evidence file into the artifact by hand.
 
+`plan` writes an immutable hash binding. `begin` snapshots its exact bytes to
+`artifact/provenance/plan.json`. Every authored slide must preserve the plan's
+ordered ID, index, role, chapter, assertion title, and evidence refs. Validation
+and review bind that snapshot; repairs use a new attempt rather than rewriting
+it.
+
 ## Canonical HTML
 
 Write `artifact/deck.html` with:
@@ -64,7 +70,8 @@ Write `artifact/deck.html` with:
   navigation. Navigation controls may stay invisible in the rendered slide;
 - only local regular-file dependencies. No remote URL, hotlink, iframe, web
   font, network fetch, data URL, event-handler attribute, author-written script,
-  or symlink. The sole script is the audited navigation snippet below.
+  symlink, hardlink, CSS-generated text, or hidden URL-bearing attribute. The
+  sole script is the audited navigation snippet below.
 
 Use this exact navigation element; any other script is rejected:
 
@@ -118,10 +125,12 @@ font family, font size, color, fill, bold, italic, horizontal alignment, and
 vertical alignment. All visible text must be tagged; untagged slide text would be
 rasterized into the decorative background and is therefore a hard failure.
 
-Each slide needs native editable text and at least one `data-claim-id` bound to
-real `ev-*` source IDs. Each source image needs its visual source ID. Keep table
-cells native; never use a screenshot of a table, equation label, or final text.
-A near-full-slide image without editable overlays is rejected.
+Every visible native text element and table needs real `ev-*` source IDs; each
+slide also needs at least one stable `data-claim-id`. Speaker-note `[Sources]`
+must exactly match the slide evidence refs and the `[Talk]` statement is included
+in the source map. Each source image needs its visual source ID. Keep table cells
+native; never use a screenshot of a table, equation label, or final text. A
+near-full-slide image without editable overlays is rejected.
 
 The exporter creates a text-free background from the canonical browser render
 only to preserve CSS decoration. It then lays native PowerPoint text, tables,
@@ -143,12 +152,15 @@ checks slide size, notes, object types, counts, and OOXML integrity.
 
 ## Deterministic delivery
 
-The reviewed artifact set contains `deck.html`, `deck.pdf`, `deck.pptx`,
-`notes.json`, and local artifact dependencies. Browser QA must pass separately
-for every slide and the contact sheet. The PDF page count must equal the plan.
+The reviewed artifact set contains only `deck.html`, `deck.pdf`, `deck.pptx`,
+`notes.json`, `provenance/plan.json`, and the exact local dependency closure.
+Unexpected files and directories, symlinks, hardlinks, and non-regular files are
+rejected. Browser QA must pass separately for every slide and the contact sheet.
+The PDF page count must equal the plan.
 The PPTX must reopen at 13.333333x7.5 inches with every slide, note, editable
 text layer, table, image, and shape present. When a local office renderer exists,
-all pages must render and remain acceptably similar to canonical HTML.
+all pages must rasterize and pass both pixel-similarity and foreground-edge
+recall against canonical HTML. A page-count-only or blank render cannot pass.
 
 Finalization adds the exact reviewed source map and a hash manifest. It refuses
 stale artifacts, stale previews, partial reviews, and unreviewed frames.

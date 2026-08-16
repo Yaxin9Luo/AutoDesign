@@ -17,6 +17,7 @@ import zipfile
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
 from pathlib import Path
+from stat import S_ISREG
 from typing import Any, Iterable, Sequence
 from urllib.parse import unquote, urlsplit
 
@@ -29,7 +30,24 @@ PX_PER_INCH = 144.0
 _SLIDE_ID = re.compile(r"^slide-(\d{2})$")
 _HEX_COLOR = re.compile(r"^#?([0-9a-fA-F]{6})$")
 _REMOTE_SCHEMES = {"http", "https", "ws", "wss", "ftp", "file", "javascript"}
-_RESOURCE_TAGS = {"audio", "embed", "iframe", "img", "input", "link", "object", "script", "source", "track", "video"}
+_URL_ATTRIBUTES = {
+    "action",
+    "archive",
+    "background",
+    "cite",
+    "codebase",
+    "data",
+    "formaction",
+    "href",
+    "longdesc",
+    "manifest",
+    "ping",
+    "poster",
+    "profile",
+    "src",
+    "usemap",
+    "xlink:href",
+}
 SAFE_NAVIGATION_SCRIPT = "(()=>{const s=[...document.querySelectorAll('.deck-slide')];const i=()=>Math.max(0,s.findIndex(x=>'#'+x.id===location.hash));const g=n=>{const x=s[Math.min(s.length-1,Math.max(0,n))];if(x){location.hash=x.id;x.scrollIntoView({block:'start'})}};addEventListener('keydown',e=>{if(e.key==='ArrowLeft'){e.preventDefault();g(i()-1)}else if(e.key==='ArrowRight'){e.preventDefault();g(i()+1)}});addEventListener('hashchange',()=>{const x=s[i()];if(x)x.scrollIntoView({block:'start'})})})();"
 
 
@@ -75,6 +93,7 @@ class DeckModel:
     root_attrs: dict[str, str]
     slides: list[SlideModel]
     resources: list[tuple[str, str, str]]
+    stylesheets: list[str]
     raw_html: str
     root_count: int = 0
 
@@ -82,7 +101,7 @@ class DeckModel:
 class _DeckParser(HTMLParser):
     def __init__(self, html_path: Path, raw_html: str) -> None:
         super().__init__(convert_charrefs=True)
-        self.model = DeckModel(html_path, {}, [], [], raw_html)
+        self.model = DeckModel(html_path, {}, [], [], [], raw_html)
         self._slide: SlideModel | None = None
         self._element: ExportElement | None = None
         self._element_depth = 0
@@ -109,11 +128,20 @@ class _DeckParser(HTMLParser):
             self._element.current_row = []
         if self._element is not None and lowered in {"td", "th"}:
             self._element.current_cell = []
-        if lowered in _RESOURCE_TAGS:
-            for attribute in ("src", "href", "data", "poster"):
-                value = values.get(attribute, "").strip()
-                if value:
-                    self.model.resources.append((lowered, attribute, value))
+        if (
+            lowered == "link"
+            and "stylesheet" in values.get("rel", "").lower().split()
+            and values.get("href", "").strip()
+        ):
+            self.model.stylesheets.append(values["href"].strip())
+        for attribute, value in values.items():
+            if attribute in _URL_ATTRIBUTES and value.strip():
+                self.model.resources.append((lowered, attribute, value.strip()))
+            elif attribute == "srcset":
+                for candidate in value.split(","):
+                    reference = candidate.strip().split(maxsplit=1)[0]
+                    if reference:
+                        self.model.resources.append((lowered, attribute, reference))
         if lowered in {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track", "wbr"}:
             self._element = None
             self._element_depth = 0
@@ -214,22 +242,64 @@ def _normalized_text(parts: Iterable[str]) -> str:
     return " ".join(" ".join(parts).split())
 
 
-def _local_asset(deck: DeckModel, reference: str) -> Path:
-    parsed = urlsplit(reference)
+def resolve_local_dependency(root: Path, base: Path, reference: str) -> Path | None:
+    parsed = urlsplit(reference.strip().strip("'\""))
     if parsed.scheme or parsed.netloc or reference.startswith("//"):
         raise PptContractError(f"asset is not local: {reference}")
+    if not parsed.path and parsed.fragment:
+        return None
     relative = Path(unquote(parsed.path))
-    if relative.is_absolute() or ".." in relative.parts:
+    if not parsed.path or relative.is_absolute() or ".." in relative.parts:
         raise PptContractError(f"asset escapes the deck workspace: {reference}")
-    root = deck.html_path.parent.resolve(strict=True)
-    candidate = (root / relative).resolve(strict=True)
+    workspace = root.resolve(strict=True)
+    parent = base.resolve(strict=True)
     try:
-        candidate.relative_to(root)
+        parent.relative_to(workspace)
+    except ValueError as error:
+        raise PptContractError(f"asset base escapes the deck workspace: {reference}") from error
+    unresolved = parent / relative
+    cursor = workspace
+    try:
+        parts = unresolved.relative_to(workspace).parts
     except ValueError as error:
         raise PptContractError(f"asset escapes the deck workspace: {reference}") from error
-    if candidate.is_symlink() or not candidate.is_file():
+    for part in parts:
+        cursor = cursor / part
+        if cursor.is_symlink():
+            raise PptContractError(f"local asset is a symlink: {reference}")
+    candidate = unresolved.resolve(strict=True)
+    try:
+        candidate.relative_to(workspace)
+    except ValueError as error:
+        raise PptContractError(f"asset escapes the deck workspace: {reference}") from error
+    status = candidate.lstat()
+    if not S_ISREG(status.st_mode) or status.st_nlink > 1:
         raise PptContractError(f"local asset is missing or unsafe: {reference}")
     return candidate
+
+
+def _local_asset(deck: DeckModel, reference: str) -> Path:
+    candidate = resolve_local_dependency(
+        deck.html_path.parent, deck.html_path.parent, reference
+    )
+    if candidate is None:
+        raise PptContractError(f"local asset is missing or unsafe: {reference}")
+    return candidate
+
+
+def parse_speaker_notes(value: str) -> tuple[list[str], str] | None:
+    match = re.fullmatch(
+        r"\s*\[Sources\]\s*(?P<sources>.*?)\s+\[Talk\]\s*(?P<talk>\S.*?)\s*",
+        value,
+        flags=re.DOTALL,
+    )
+    if not match:
+        return None
+    sources = _source_ids(match.group("sources"))
+    talk = " ".join(match.group("talk").split())
+    if not sources or not talk:
+        return None
+    return sources, talk
 
 
 def validate_deck_html(
@@ -241,7 +311,16 @@ def validate_deck_html(
     actual_ids = [slide.slide_id for slide in deck.slides]
     if len(deck.slides) != expected_slide_count:
         issues.append(_issue("slide_count_mismatch", f"expected {expected_slide_count}, found {len(deck.slides)}"))
-    if actual_ids != expected_ids or len(set(actual_ids)) != len(actual_ids):
+    exact_id_attributes = all(
+        slide.attrs.get("id") == expected
+        and slide.attrs.get("data-slide-id") == expected
+        for slide, expected in zip(deck.slides, expected_ids)
+    )
+    if (
+        actual_ids != expected_ids
+        or len(set(actual_ids)) != len(actual_ids)
+        or not exact_id_attributes
+    ):
         issues.append(_issue("slide_id_contract", "slide ids must be unique and contiguous slide-01..slide-N"))
     root = deck.root_attrs
     if deck.root_count != 1:
@@ -274,6 +353,97 @@ def validate_deck_html(
         issues.append(_issue("event_handler_attribute", "inline event-handler attributes are forbidden"))
     if re.search(r"<(?:audio|embed|iframe|object|video)\b", deck.raw_html, flags=re.IGNORECASE):
         issues.append(_issue("unsafe_embedded_content", "embedded executable or media content is forbidden"))
+    css_queue: list[tuple[Path, str]] = [
+        (deck.html_path.parent, css)
+        for css in re.findall(
+            r"<style\b[^>]*>(.*?)</style\s*>",
+            deck.raw_html,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+    ]
+    css_queue.extend(
+        (deck.html_path.parent, match.group(1))
+        for match in re.finditer(
+            r"\sstyle\s*=\s*['\"](.*?)['\"]",
+            deck.raw_html,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+    )
+    seen_css_files: set[Path] = set()
+    for reference in deck.stylesheets:
+        try:
+            stylesheet = resolve_local_dependency(
+                deck.html_path.parent, deck.html_path.parent, reference
+            )
+        except (OSError, PptContractError):
+            continue
+        if stylesheet is not None and stylesheet not in seen_css_files:
+            seen_css_files.add(stylesheet)
+            try:
+                css_queue.append(
+                    (stylesheet.parent, stylesheet.read_text(encoding="utf-8"))
+                )
+            except (OSError, UnicodeError) as error:
+                issues.append(_issue("unsafe_local_asset", str(error)))
+    css_url = re.compile(
+        r"url\(\s*(?:(['\"])(.*?)\1|([^)'\"\s]+))\s*\)",
+        flags=re.IGNORECASE,
+    )
+    css_import = re.compile(
+        r"@import\s+(?:url\(\s*)?(?:(['\"])(.*?)\1|([^)'\";\s]+))\s*\)?",
+        flags=re.IGNORECASE,
+    )
+    generated_content_reported = False
+    position = 0
+    while position < len(css_queue):
+        base, css = css_queue[position]
+        position += 1
+        if not generated_content_reported and re.search(
+            r"(?:^|[;{])\s*content\s*:\s*(?!none\b|normal\b|['\"]{2})[^;}]+",
+            css,
+            flags=re.IGNORECASE,
+        ):
+            issues.append(
+                _issue(
+                    "css_generated_text",
+                    "CSS generated content would become raster-only text in PowerPoint",
+                )
+            )
+            generated_content_reported = True
+        import_references = {
+            match.group(2) or match.group(3) for match in css_import.finditer(css)
+        }
+        references = {
+            *(match.group(2) or match.group(3) for match in css_url.finditer(css)),
+            *import_references,
+        }
+        for reference in references:
+            try:
+                dependency = resolve_local_dependency(
+                    deck.html_path.parent, base, reference
+                )
+            except (OSError, PptContractError) as error:
+                parsed = urlsplit(reference)
+                code = (
+                    "remote_asset"
+                    if parsed.scheme.lower() in _REMOTE_SCHEMES
+                    or reference.startswith("//")
+                    else "unsafe_local_asset"
+                )
+                issues.append(_issue(code, str(error)))
+                continue
+            if (
+                reference in import_references
+                and dependency is not None
+                and dependency not in seen_css_files
+            ):
+                seen_css_files.add(dependency)
+                try:
+                    css_queue.append(
+                        (dependency.parent, dependency.read_text(encoding="utf-8"))
+                    )
+                except (OSError, UnicodeError) as error:
+                    issues.append(_issue("unsafe_local_asset", str(error)))
 
     assertion_count = 0
     note_count = 0
@@ -283,6 +453,14 @@ def validate_deck_html(
         attrs = slide.attrs
         if attrs.get("data-width") != "1920" or attrs.get("data-height") != "1080":
             issues.append(_issue("slide_canvas", "slide must declare 1920x1080", slide_id=slide_id))
+        if attrs.get("data-slide-index") != str(index):
+            issues.append(
+                _issue(
+                    "slide_index_contract",
+                    f"slide index must be {index}",
+                    slide_id=slide_id,
+                )
+            )
         for required in ("data-slide-role", "data-section", "data-assertion-title"):
             if not attrs.get(required, "").strip():
                 issues.append(_issue("missing_slide_metadata", f"missing {required}", slide_id=slide_id))
@@ -290,11 +468,21 @@ def validate_deck_html(
             assertion_count += 1
         if not _source_ids(attrs.get("data-source-ids", "")):
             issues.append(_issue("missing_slide_sources", "slide must cite source ids", slide_id=slide_id))
+        slide_sources = _source_ids(attrs.get("data-source-ids", ""))
         notes = attrs.get("data-speaker-notes", "").strip()
         if notes:
             note_count += 1
-        if "[Sources]" not in notes or "[Talk]" not in notes:
+        parsed_notes = parse_speaker_notes(notes)
+        if parsed_notes is None:
             issues.append(_issue("speaker_note_contract", "notes require [Sources] and [Talk]", slide_id=slide_id))
+        elif parsed_notes[0] != slide_sources:
+            issues.append(
+                _issue(
+                    "speaker_note_sources",
+                    "speaker-note source IDs must exactly match slide source IDs",
+                    slide_id=slide_id,
+                )
+            )
         editable_text = sum(
             1 for element in slide.elements if element.kind == "text" and element.text
         )
@@ -321,6 +509,14 @@ def validate_deck_html(
                     except PptContractError as error:
                         issues.append(_issue("invalid_typography", str(error), slide_id=slide_id))
                 claim_id = element.attrs.get("data-claim-id", "").strip()
+                if not _source_ids(element.attrs.get("data-source-ids", "")):
+                    issues.append(
+                        _issue(
+                            "missing_text_sources",
+                            "every visible text element must cite source IDs",
+                            slide_id=slide_id,
+                        )
+                    )
                 if claim_id:
                     slide_claim_count += 1
                     if claim_id in claim_ids:
@@ -333,7 +529,12 @@ def validate_deck_html(
                 try:
                     _local_asset(deck, reference)
                 except (OSError, PptContractError) as error:
-                    code = "remote_asset" if urlsplit(reference).scheme.lower() in _REMOTE_SCHEMES or reference.startswith("//") else "missing_local_asset"
+                    code = (
+                        "remote_asset"
+                        if urlsplit(reference).scheme.lower() in _REMOTE_SCHEMES
+                        or reference.startswith("//")
+                        else "unsafe_local_asset"
+                    )
                     issues.append(_issue(code, str(error), slide_id=slide_id))
                 if not _source_ids(element.attrs.get("data-source-ids", "")):
                     issues.append(_issue("missing_image_sources", "source image must cite source ids", slide_id=slide_id))
@@ -345,6 +546,14 @@ def validate_deck_html(
                 )
                 if not element.rows or not any(any(cell.strip() for cell in row) for row in element.rows):
                     issues.append(_issue("empty_editable_table", "editable table must contain cells", slide_id=slide_id))
+                if not _source_ids(element.attrs.get("data-source-ids", "")):
+                    issues.append(
+                        _issue(
+                            "missing_table_sources",
+                            "every native table must cite source IDs",
+                            slide_id=slide_id,
+                        )
+                    )
         if editable_text == 0:
             issues.append(_issue("missing_editable_text", "every slide requires native editable text", slide_id=slide_id))
         if slide_claim_count == 0:
@@ -369,13 +578,15 @@ def validate_deck_html(
         parsed = urlsplit(reference)
         if parsed.scheme.lower() in _REMOTE_SCHEMES or reference.startswith("//"):
             issues.append(_issue("remote_asset", f"remote {tag}[{attribute}] is forbidden"))
-        elif parsed.scheme not in {"", "data", "about", "blob"}:
+        elif parsed.scheme:
             issues.append(_issue("unsafe_asset_scheme", f"unsupported asset scheme: {parsed.scheme}"))
-        elif parsed.scheme == "" and not reference.startswith("#"):
+        elif not reference.startswith("#"):
             try:
-                _local_asset(deck, reference)
+                resolve_local_dependency(
+                    deck.html_path.parent, deck.html_path.parent, reference
+                )
             except (OSError, PptContractError) as error:
-                issues.append(_issue("missing_local_asset", str(error)))
+                issues.append(_issue("unsafe_local_asset", str(error)))
 
     return {
         "format_version": 1,
@@ -394,15 +605,37 @@ def validate_deck_html(
 def claims_from_deck(deck: DeckModel) -> list[dict[str, Any]]:
     claims: list[dict[str, Any]] = []
     for slide in deck.slides:
-        for element in slide.elements:
-            claim_id = element.attrs.get("data-claim-id", "").strip()
-            if not claim_id:
+        for element_index, element in enumerate(slide.elements, start=1):
+            if element.kind == "text":
+                text = element.text
+            elif element.kind == "table":
+                text = " | ".join(
+                    cell for row in element.rows for cell in row if cell.strip()
+                )
+            else:
                 continue
+            claim_id = element.attrs.get("data-claim-id", "").strip() or (
+                f"{slide.slide_id}-{element.kind}-{element_index:02d}"
+            )
             claims.append(
                 {
                     "id": claim_id,
-                    "text": element.text,
+                    "text": text,
                     "source_ids": _source_ids(element.attrs.get("data-source-ids", "")),
+                    "claim_type": f"slide_{element.kind}",
+                }
+            )
+        parsed_notes = parse_speaker_notes(
+            slide.attrs.get("data-speaker-notes", "")
+        )
+        if parsed_notes is not None:
+            source_ids, talk = parsed_notes
+            claims.append(
+                {
+                    "id": f"{slide.slide_id}-speaker-notes",
+                    "text": talk,
+                    "source_ids": source_ids,
+                    "claim_type": "speaker_notes",
                 }
             )
     return claims
@@ -462,7 +695,11 @@ def _add_text(slide: Any, element: ExportElement, slide_id: str) -> None:
     run = paragraph.runs[0]
     font = run.font
     font.name = element.attrs.get("data-font-family", "Arial").split(",")[0].strip(" '\"") or "Arial"
-    font.size = Pt(_positive_number(element.attrs.get("data-font-size", "28"), "data-font-size") * 0.75)
+    font.size = Pt(
+        _positive_number(element.attrs.get("data-font-size", "28"), "data-font-size")
+        * 72.0
+        / PX_PER_INCH
+    )
     font.bold = element.attrs.get("data-bold", "").lower() in {"1", "true", "yes", "bold"}
     font.italic = element.attrs.get("data-italic", "").lower() in {"1", "true", "yes", "italic"}
     font.color.rgb = _rgb(element.attrs.get("data-color", "#171717"), "171717")
@@ -540,7 +777,11 @@ def _add_table(slide: Any, element: ExportElement, slide_id: str) -> None:
             paragraph.alignment = PP_ALIGN.LEFT
             for run in paragraph.runs:
                 run.font.name = element.attrs.get("data-font-family", "Arial")
-                run.font.size = Pt(_positive_number(element.attrs.get("data-font-size", "20"), "data-font-size") * 0.75)
+                run.font.size = Pt(
+                    _positive_number(element.attrs.get("data-font-size", "20"), "data-font-size")
+                    * 72.0
+                    / PX_PER_INCH
+                )
                 run.font.bold = row_index == 0
                 run.font.color.rgb = _rgb(element.attrs.get("data-color", "#171717"), "171717")
     _set_shape_metadata(shape, name=f"{slide_id}:table:editable", source_ids=_source_ids(element.attrs.get("data-source-ids", "")))
@@ -722,6 +963,10 @@ def render_pptx_with_libreoffice(
     pptx = Path(pptx_path).resolve(strict=True)
     output = _external_output(output_dir)
     output.mkdir(parents=True, exist_ok=True)
+    rendered = output / f"{pptx.stem}.pdf"
+    if rendered.is_symlink():
+        raise PptContractError("LibreOffice output PDF must not be a symlink")
+    rendered.unlink(missing_ok=True)
     with tempfile.TemporaryDirectory(prefix="autodesign-ppt-office-") as profile:
         command = [
             executable,
@@ -734,7 +979,6 @@ def render_pptx_with_libreoffice(
             str(pptx),
         ]
         result = subprocess.run(command, capture_output=True, text=True, timeout=timeout_seconds, check=False)
-    rendered = output / f"{pptx.stem}.pdf"
     if result.returncode != 0 or not rendered.is_file():
         detail = (result.stderr or result.stdout or "no renderer output").strip()[-1000:]
         raise PptContractError(f"LibreOffice could not reopen/render deck.pptx: {detail}")
@@ -759,26 +1003,62 @@ def compare_rendered_slides(
     canonical_paths: Sequence[Path | str],
     rendered_paths: Sequence[Path | str],
 ) -> dict[str, Any]:
-    from PIL import Image, ImageChops, ImageStat
+    from PIL import Image, ImageChops, ImageFilter, ImageStat
 
     if len(canonical_paths) != len(rendered_paths) or not canonical_paths:
         raise PptContractError("rendered comparison requires equal non-empty slide sets")
     scores: list[float] = []
+    metrics: list[dict[str, float]] = []
     for canonical_path, rendered_path in zip(canonical_paths, rendered_paths):
         with Image.open(canonical_path) as canonical_image:
-            canonical = canonical_image.convert("RGB").resize((320, 180))
+            canonical = canonical_image.convert("RGB").resize((640, 360))
         with Image.open(rendered_path) as rendered_image:
-            rendered = rendered_image.convert("RGB").resize((320, 180))
+            rendered = rendered_image.convert("RGB").resize((640, 360))
         difference = ImageChops.difference(canonical, rendered)
         mean = sum(ImageStat.Stat(difference).mean) / 3.0
-        scores.append(round(max(0.0, 1.0 - mean / 255.0), 6))
+        similarity = round(max(0.0, 1.0 - mean / 255.0), 6)
+        scores.append(similarity)
+        canonical_edges = canonical.convert("L").filter(ImageFilter.FIND_EDGES)
+        rendered_edges = rendered.convert("L").filter(ImageFilter.FIND_EDGES)
+        # FIND_EDGES marks the outer frame even for a blank image. Removing it
+        # keeps the metric focused on actual slide content.
+        for edge_image in (canonical_edges, rendered_edges):
+            edge_image.paste(0, (0, 0, edge_image.width, 2))
+            edge_image.paste(0, (0, edge_image.height - 2, edge_image.width, edge_image.height))
+            edge_image.paste(0, (0, 0, 2, edge_image.height))
+            edge_image.paste(0, (edge_image.width - 2, 0, edge_image.width, edge_image.height))
+        canonical_mask = canonical_edges.point(lambda value: 255 if value >= 24 else 0)
+        rendered_mask = rendered_edges.point(lambda value: 255 if value >= 24 else 0)
+        rendered_nearby = rendered_mask.filter(ImageFilter.MaxFilter(9))
+        canonical_data = canonical_mask.get_flattened_data()
+        rendered_data = rendered_nearby.get_flattened_data()
+        canonical_pixels = sum(1 for value in canonical_data if value)
+        overlap_pixels = sum(
+            1
+            for canonical_value, rendered_value in zip(
+                canonical_data, rendered_data
+            )
+            if canonical_value and rendered_value
+        )
+        edge_recall = (
+            overlap_pixels / canonical_pixels if canonical_pixels else 1.0
+        )
+        metrics.append(
+            {
+                "similarity": similarity,
+                "edge_recall": round(edge_recall, 6),
+            }
+        )
     minimum = min(scores)
+    minimum_edge_recall = min(metric["edge_recall"] for metric in metrics)
     return {
         "performed": True,
         "slide_scores": scores,
+        "slide_metrics": metrics,
         "minimum_similarity": minimum,
+        "minimum_edge_recall": minimum_edge_recall,
         "mean_similarity": round(sum(scores) / len(scores), 6),
-        "passed": minimum >= 0.65,
+        "passed": minimum >= 0.65 and minimum_edge_recall >= 0.2,
     }
 
 

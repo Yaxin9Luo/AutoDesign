@@ -23,9 +23,9 @@ the Skill. Never write output, caches, or run state into the installed package.
 Run `python "$SKILL_ROOT/scripts/ppt_harness.py" --help` for exact flags.
 
 1. Run `doctor`, then `init --run-dir "$RUN" --source "$PAPER"`. The first
-   online run installs exact-pinned browser and native-PPT dependencies in a
-   versioned user cache; later runs can reuse them offline. A missing runtime is
-   blocked, not a reason to skip QA.
+   online run installs artifact-hash-locked browser and native-PPT dependencies
+   in a versioned, content-verified user cache; later runs can reuse them
+   offline. A missing or changed runtime is blocked, not a reason to skip QA.
 2. Use `evidence --query "..."`, `visuals`, and rendered paper pages. Query
    evidence for identity, problem, gap, contributions,
    method, results, ablations, qualitative evidence, limitations, and
@@ -38,11 +38,14 @@ Run `python "$SKILL_ROOT/scripts/ppt_harness.py" --help` for exact flags.
    summary cards. Pass an explicit visual-allocation JSON to `plan`; keep each
    visual within its permitted role and reuse limit.
 4. Run `begin`. Author the returned `artifact/deck.html` yourself. The HTML is
-   canonical. Stage each planned figure with `stage-visual`. Use the exact
+   canonical and the immutable plan is snapshotted under artifact provenance.
+   Match every slide's ordered role, section, assertion, and evidence refs to
+   that plan. Stage each planned figure with `stage-visual`. Use the exact
    tagged-DOM contract so native text, tables, images,
    shapes, and speaker notes can become editable PowerPoint objects. Use only
-   local, source-grounded paper assets; never invent paper facts, links, logos,
-   figures, or measurements.
+   local, regular, non-linked source-grounded paper assets; never invent paper
+   facts, links, logos, figures, or measurements. Bind every visible text box,
+   native table, and speaker-note statement to real evidence IDs.
 5. Run `validate`. Static gates run before rendering. The harness then audits
    every 1920x1080 slide in a network-denied browser, makes a contact sheet,
    verifies an exact-page-count PDF, exports `deck.pptx`, reopens its native
@@ -55,8 +58,9 @@ Run `python "$SKILL_ROOT/scripts/ppt_harness.py" --help` for exact flags.
    Record it with `record-review`; never self-certify from source code.
 7. If review fails, run `begin` again and repair only the reported slides. The
    harness allows at most three attempts. If it passes, run `finalize`. Deliver
-   only the verified `final/deck.html`, `final/deck.pptx`, `final/deck.pdf`,
-   `final/notes.json`, local assets, and provenance.
+   only the allowlisted, verified `final/deck.html`, `final/deck.pptx`,
+   `final/deck.pdf`, `final/notes.json`, local assets, and provenance. Extra,
+   symlinked, hardlinked, or unreviewed files are never delivered.
 
 Run `resume --run-dir "$RUN"` before every continuation after interruption. It
 verifies the installed `skill_root`, snapshotted instructions, source, artifact,

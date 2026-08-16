@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import errno
 import hashlib
 import json
 import os
@@ -13,11 +14,13 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from stat import S_ISREG
+from typing import Any, Iterator, Mapping, Sequence
 
 
 RUNTIME_FORMAT_VERSION = 1
@@ -31,6 +34,8 @@ PINNED_PACKAGES = {
 _INSTALL_TIMEOUT_SECONDS = 900
 _LOCK_TIMEOUT_SECONDS = 960
 _STATE_FILE = "runtime.json"
+_THREAD_GUARDS_LOCK = threading.Lock()
+_THREAD_GUARDS: dict[str, tuple[threading.Lock, int]] = {}
 
 
 class PptRuntimeError(RuntimeError):
@@ -59,8 +64,14 @@ def _slug(value: str) -> str:
     return normalized or "unknown"
 
 
-def _package_lock_text() -> str:
-    return "\n".join(f"{name}=={version}" for name, version in sorted(PINNED_PACKAGES.items())) + "\n"
+def _package_lock_path() -> Path:
+    path = Path(__file__).resolve().with_name("requirements-ppt.lock")
+    if path.is_symlink() or not path.is_file():
+        raise PptRuntimeError("PPT dependency hash lock is missing or unsafe")
+    status = path.lstat()
+    if not S_ISREG(status.st_mode) or status.st_nlink > 1:
+        raise PptRuntimeError("PPT dependency hash lock is missing or unsafe")
+    return path
 
 
 def _default_cache_root() -> Path:
@@ -87,7 +98,7 @@ def runtime_spec(*, cache_root: Path | str | None = None) -> PptRuntimeSpec:
     system = _slug(platform.system())
     machine = _slug(platform.machine())
     python_minor = f"{sys.version_info.major}.{sys.version_info.minor}"
-    lock_hash = hashlib.sha256(_package_lock_text().encode("utf-8")).hexdigest()
+    lock_hash = hashlib.sha256(_package_lock_path().read_bytes()).hexdigest()
     key = (
         f"runtime-v{RUNTIME_FORMAT_VERSION}-{system}-{machine}-py{python_minor}-"
         f"python-pptx-{PINNED_PACKAGES['python-pptx']}-{lock_hash[:12]}"
@@ -139,9 +150,8 @@ def _process_alive(pid: int) -> bool:
 
 
 @contextlib.contextmanager
-def _runtime_lock(path: Path, timeout_seconds: float):
+def _metadata_runtime_lock(path: Path, deadline: float) -> Iterator[None]:
     token = uuid.uuid4().hex
-    deadline = time.monotonic() + timeout_seconds
     while True:
         try:
             path.mkdir(parents=False)
@@ -180,7 +190,192 @@ def _runtime_lock(path: Path, timeout_seconds: float):
             shutil.rmtree(path, ignore_errors=True)
 
 
-def _state_payload(spec: PptRuntimeSpec) -> dict[str, Any]:
+def _thread_guard_for(path: Path) -> threading.Lock:
+    key = str(path.absolute())
+    with _THREAD_GUARDS_LOCK:
+        entry = _THREAD_GUARDS.get(key)
+        if entry is None:
+            guard = threading.Lock()
+            _THREAD_GUARDS[key] = (guard, 1)
+            return guard
+        guard, references = entry
+        _THREAD_GUARDS[key] = (guard, references + 1)
+        return guard
+
+
+def _release_thread_guard(path: Path, guard: threading.Lock) -> None:
+    key = str(path.absolute())
+    with _THREAD_GUARDS_LOCK:
+        entry = _THREAD_GUARDS.get(key)
+        if entry is None or entry[0] is not guard:
+            return
+        if entry[1] <= 1:
+            _THREAD_GUARDS.pop(key, None)
+        else:
+            _THREAD_GUARDS[key] = (guard, entry[1] - 1)
+
+
+def _open_guard_file(path: Path) -> int:
+    if path.is_symlink() or (path.exists() and not path.is_file()):
+        raise PptRuntimeError(f"Unsafe PPT runtime advisory lock: {path}")
+    flags = os.O_RDWR | os.O_CREAT
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags, 0o600)
+    except OSError as error:
+        raise PptRuntimeError(
+            f"Could not open PPT runtime advisory lock: {path}: {error}"
+        ) from error
+    try:
+        opened = os.fstat(descriptor)
+        published = path.lstat()
+        if (
+            not S_ISREG(opened.st_mode)
+            or not S_ISREG(published.st_mode)
+            or opened.st_nlink > 1
+            or (opened.st_dev, opened.st_ino)
+            != (published.st_dev, published.st_ino)
+        ):
+            raise PptRuntimeError(f"Unsafe PPT runtime advisory lock: {path}")
+        if opened.st_size == 0:
+            os.write(descriptor, b"\0")
+            os.fsync(descriptor)
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _try_advisory_lock(descriptor: int) -> bool:
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    if os.name == "nt":
+        import msvcrt
+
+        try:
+            msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+        except OSError as error:
+            if error.errno in {errno.EACCES, errno.EAGAIN, errno.EDEADLK}:
+                return False
+            raise
+        return True
+    import fcntl
+
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as error:
+        if error.errno in {errno.EACCES, errno.EAGAIN}:
+            return False
+        raise
+    return True
+
+
+def _unlock_advisory_lock(descriptor: int) -> None:
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    if os.name == "nt":
+        import msvcrt
+
+        msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+        return
+    import fcntl
+
+    fcntl.flock(descriptor, fcntl.LOCK_UN)
+
+
+@contextlib.contextmanager
+def _advisory_runtime_guard(path: Path, deadline: float) -> Iterator[None]:
+    thread_guard = _thread_guard_for(path)
+    remaining = max(0.0, deadline - time.monotonic())
+    if not thread_guard.acquire(timeout=remaining):
+        _release_thread_guard(path, thread_guard)
+        raise PptRuntimeError("Timed out waiting for PPT runtime installation lock")
+    descriptor: int | None = None
+    acquired = False
+    try:
+        descriptor = _open_guard_file(path)
+        while not acquired:
+            try:
+                acquired = _try_advisory_lock(descriptor)
+            except OSError as error:
+                raise PptRuntimeError(
+                    f"Could not acquire PPT runtime advisory lock: {error}"
+                ) from error
+            if acquired:
+                break
+            if time.monotonic() >= deadline:
+                raise PptRuntimeError(
+                    "Timed out waiting for PPT runtime installation lock"
+                )
+            time.sleep(0.05)
+        yield
+    finally:
+        if descriptor is not None:
+            if acquired:
+                with contextlib.suppress(OSError):
+                    _unlock_advisory_lock(descriptor)
+            os.close(descriptor)
+        thread_guard.release()
+        _release_thread_guard(path, thread_guard)
+
+
+@contextlib.contextmanager
+def _runtime_lock(path: Path, timeout_seconds: float) -> Iterator[None]:
+    deadline = time.monotonic() + timeout_seconds
+    path.parent.mkdir(parents=True, exist_ok=True)
+    guard = path.with_name(f"{path.name}.guard")
+    with _advisory_runtime_guard(guard, deadline):
+        with _metadata_runtime_lock(path, deadline):
+            yield
+
+
+def _runtime_tree_sha256(cache_dir: Path | str) -> str:
+    cache = Path(cache_dir).absolute()
+    site = (
+        cache / "venv" / "Lib" / "site-packages"
+        if os.name == "nt"
+        else cache
+        / "venv"
+        / "lib"
+        / f"python{sys.version_info.major}.{sys.version_info.minor}"
+        / "site-packages"
+    )
+    if site.is_symlink() or not site.is_dir():
+        raise PptRuntimeError("PPT runtime site-packages directory is missing or unsafe")
+    digest = hashlib.sha256()
+    file_count = 0
+    for current, directories, filenames in os.walk(site, followlinks=False):
+        current_path = Path(current)
+        kept_directories: list[str] = []
+        for name in sorted(directories):
+            child = current_path / name
+            if child.is_symlink():
+                raise PptRuntimeError("PPT runtime content tree contains a symlink")
+            if name != "__pycache__":
+                kept_directories.append(name)
+        directories[:] = kept_directories
+        for name in sorted(filenames):
+            path = current_path / name
+            if path.suffix.lower() in {".pyc", ".pyo"}:
+                continue
+            status = path.lstat()
+            if path.is_symlink() or not S_ISREG(status.st_mode) or status.st_nlink > 1:
+                raise PptRuntimeError("PPT runtime content tree contains an unsafe file")
+            relative = path.relative_to(site).as_posix().encode("utf-8")
+            digest.update(len(relative).to_bytes(8, "big"))
+            digest.update(relative)
+            with path.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            file_count += 1
+    if file_count == 0:
+        raise PptRuntimeError("PPT runtime content tree is empty")
+    return digest.hexdigest()
+
+
+def _state_payload(
+    spec: PptRuntimeSpec, runtime_tree_sha256: str
+) -> dict[str, Any]:
     return {
         "format_version": RUNTIME_FORMAT_VERSION,
         "cache_key": spec.cache_key,
@@ -189,6 +384,7 @@ def _state_payload(spec: PptRuntimeSpec) -> dict[str, Any]:
         "machine": spec.machine,
         "package_lock_sha256": spec.package_lock_sha256,
         "packages": dict(PINNED_PACKAGES),
+        "runtime_tree_sha256": runtime_tree_sha256,
         "python_relative": _venv_python(Path(".")).as_posix().removeprefix("./"),
     }
 
@@ -227,9 +423,16 @@ def inspect_runtime(cache_dir: Path | str, spec: PptRuntimeSpec | None = None) -
         state = json.loads(state_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
         raise PptRuntimeError("PPT runtime state is unreadable") from error
-    expected = _state_payload(spec or runtime_spec(cache_root=cache.parent))
+    digest = state.get("runtime_tree_sha256")
+    if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+        raise PptRuntimeError("PPT runtime state has no valid content tree hash")
+    expected = _state_payload(
+        spec or runtime_spec(cache_root=cache.parent), digest
+    )
     if state != expected:
         raise PptRuntimeError("PPT runtime state does not match the pinned contract")
+    if _runtime_tree_sha256(cache) != digest:
+        raise PptRuntimeError("PPT runtime content tree hash changed or was tampered")
     python = cache / state["python_relative"]
     if not python.exists() or not os.access(python, os.X_OK):
         raise PptRuntimeError("PPT runtime Python executable is missing")
@@ -249,7 +452,6 @@ def _install(staging: Path, spec: PptRuntimeSpec) -> None:
     if result.returncode != 0:
         raise PptRuntimeError("Could not create the isolated PPT runtime")
     python = _venv_python(staging)
-    requirements = [f"{name}=={version}" for name, version in PINNED_PACKAGES.items()]
     result = subprocess.run(
         [
             str(python),
@@ -259,7 +461,10 @@ def _install(staging: Path, spec: PptRuntimeSpec) -> None:
             "--disable-pip-version-check",
             "--no-input",
             "--only-binary=:all:",
-            *requirements,
+            "--require-hashes",
+            "--no-deps",
+            "--requirement",
+            str(_package_lock_path()),
         ],
         capture_output=True,
         text=True,
@@ -270,7 +475,10 @@ def _install(staging: Path, spec: PptRuntimeSpec) -> None:
         detail = (result.stderr or result.stdout or "no package-manager output").strip()[-1200:]
         detail = re.sub(r"(?i)(authorization|cookie|set-cookie)\s*:\s*[^\r\n]+", r"\1: [REDACTED]", detail)
         raise PptRuntimeError(f"Exact-pinned PPT dependency installation failed: {detail}")
-    _atomic_json(staging / _STATE_FILE, _state_payload(spec))
+    _atomic_json(
+        staging / _STATE_FILE,
+        _state_payload(spec, _runtime_tree_sha256(staging)),
+    )
 
 
 def ensure_ppt_runtime(
