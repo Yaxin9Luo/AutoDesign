@@ -82,15 +82,21 @@ _EXPLICIT_COUNT_PATTERNS = (
         re.IGNORECASE,
     ),
     re.compile(
-        r"(?:make|create|generate|prepare|need|want)(?:\s+\w+){0,4}\s+(?P<count>[1-5]?\d|60)\s*-?\s*pages?(?!\s+paper\b)",
+        r"(?:make|create|generate|prepare)\s+(?:it\s+)?"
+        r"(?P<count>[1-5]?\d|60)\s*-?\s*pages?"
+        r"(?=\s*(?:[.!?,;:]|$))",
         re.IGNORECASE,
     ),
     re.compile(
-        rf"(?:请\s*)?(?:生成|做成|制作|需要|想要|要|做|共)\s*(?P<count>{_COUNT_TOKEN})\s*页(?!\s*(?:论文|paper))",
+        rf"(?:请\s*)?(?:生成|做成|制作|需要|想要|要|做|共)\s*"
+        rf"(?P<count>{_COUNT_TOKEN})\s*页"
+        rf"(?=\s*(?:[。！!，,.？?；;：:]|$))",
         re.IGNORECASE,
     ),
     re.compile(
-        r"(?:slides?|pages?)\s*(?:count|total)?\s*[:=]?\s*(?P<count>[1-5]?\d|60)(?!\d)",
+        r"(?:slides?\s*(?:count|total)?|(?:deck|presentation|ppt)\s*"
+        r"(?:pages?|slides?)?\s*(?:count|total)?)\s*[:=]?\s*"
+        r"(?P<count>[1-5]?\d|60)(?!\d)",
         re.IGNORECASE,
     ),
 )
@@ -132,31 +138,115 @@ _ACADEMIC_ARC = (
 )
 
 
-_ROLE_EVIDENCE_QUERIES = {
-    "cover": "paper title authors affiliation abstract thesis 论文 标题 作者 摘要 主旨",
-    "outline": "abstract overview roadmap contribution method result conclusion 摘要 概览 贡献 方法 结果 结论",
-    "problem": "problem challenge task failure unresolved need 问题 挑战 任务 痛点",
-    "motivation": "motivation importance impact need problem significance 动机 重要 意义 需求 问题",
-    "prior-gap": "related work prior baseline limitation gap existing however 相关工作 现有 局限 差距",
-    "contributions": "contribution propose introduce present method result 贡献 提出 方法 结果",
-    "method-overview": "method approach framework architecture pipeline overview 方法 框架 架构 流程",
-    "mechanism": "mechanism module component process algorithm method 机制 模块 组件 算法 方法",
-    "objective": "objective loss equation theorem optimization training algorithm architecture 目标 损失 公式 优化 算法 架构",
-    "setup": "experiment dataset benchmark metric baseline implementation evaluation 实验 数据集 基准 指标 基线 评测",
-    "primary-results": "result performance improvement score accuracy comparison baseline 结果 性能 提升 分数 对比 基线",
-    "robustness": "robustness generalization sensitivity variance result evaluation baseline 鲁棒 泛化 敏感 结果 评测",
-    "ablation": "ablation component variant remove method result 消融 组件 变体 方法 结果",
-    "qualitative": "qualitative case example visualization figure result 定性 案例 可视化 图 结果",
-    "limitations": "limitation failure caveat uncertainty future work 局限 失败 不足 未来工作",
-    "implications": "implication application impact practice result 应用 启示 影响 结果",
-    "takeaways": "conclusion takeaway summary finding result method 总结 结论 要点 发现 结果 方法",
-    "closing": "conclusion discussion future thesis result 结论 讨论 未来 主旨 结果",
+_ROLE_DISTINCTIVE_CONCEPTS = {
+    "cover": (
+        ("title", "标题"),
+        ("author", "作者"),
+        ("affiliation", "机构"),
+        ("thesis", "主旨"),
+    ),
+    "outline": (
+        ("roadmap", "路线图"),
+        ("outline", "大纲"),
+        ("overview", "概览"),
+    ),
+    "problem": (
+        ("problem", "问题"),
+        ("challenge", "挑战"),
+        ("unresolved", "未解决"),
+        ("fail", "失败"),
+    ),
+    "motivation": (
+        ("motivation", "动机"),
+        ("significance", "意义"),
+        ("important", "重要"),
+        ("impact", "影响"),
+    ),
+    "prior-gap": (
+        ("related work", "相关工作"),
+        ("prior work", "先前工作"),
+        ("gap", "差距"),
+        ("shortcoming", "不足"),
+    ),
+    "contributions": (
+        ("contribut", "贡献"),
+        ("we propose", "我们提出"),
+        ("we introduce", "我们引入"),
+    ),
+    "method-overview": (
+        ("framework", "框架"),
+        ("architecture", "架构"),
+        ("pipeline", "流程"),
+        ("approach", "方法"),
+    ),
+    "mechanism": (
+        ("mechanism", "机制"),
+        ("module", "模块"),
+        ("algorithm", "算法"),
+        ("procedure", "过程"),
+    ),
+    "objective": (
+        ("objective", "目标函数"),
+        ("loss", "损失"),
+        ("equation", "公式"),
+        ("theorem", "定理"),
+    ),
+    "setup": (
+        ("experiment", "实验"),
+        ("dataset", "数据集"),
+        ("benchmark", "基准"),
+        ("metric", "指标"),
+    ),
+    "primary-results": (
+        ("performance", "性能"),
+        ("accuracy", "准确率"),
+        ("improvement", "提升"),
+        ("score", "分数"),
+    ),
+    "robustness": (
+        ("robust", "鲁棒"),
+        ("generaliz", "泛化"),
+        ("sensitivity", "敏感性"),
+        ("variance", "方差"),
+    ),
+    "ablation": (
+        ("ablation", "消融"),
+        ("without", "去除"),
+        ("remov", "移除"),
+        ("variant", "变体"),
+    ),
+    "qualitative": (
+        ("qualitative", "定性"),
+        ("case study", "案例"),
+        ("visualization", "可视化"),
+        ("example", "示例"),
+    ),
+    "limitations": (
+        ("limitation", "局限"),
+        ("caveat", "限制条件"),
+        ("uncertainty", "不确定"),
+        ("failure mode", "失败模式"),
+    ),
+    "implications": (
+        ("implication", "启示"),
+        ("application", "应用"),
+        ("practice", "实践"),
+        ("deployment", "部署"),
+    ),
+    "takeaways": (
+        ("takeaway", "要点"),
+        ("summary", "总结"),
+        ("key finding", "关键发现"),
+    ),
+    "closing": (
+        ("discussion", "讨论"),
+        ("future work", "未来工作"),
+        ("conclusion", "结论"),
+        ("closing", "结束"),
+    ),
 }
-_SUMMARY_EVIDENCE_QUERY = (
-    "paper problem method contribution result limitation conclusion "
-    "论文 问题 方法 贡献 结果 局限 结论"
-)
-_SUMMARY_ROLES = {"cover", "outline", "takeaways", "closing"}
+_SEMANTIC_MIN_CONCEPTS = 1
+_SEMANTIC_MARGIN = 1
 
 
 def _parse_slide_count_token(token: str) -> int | None:
@@ -221,13 +311,21 @@ def _arc_for_count(count: int) -> list[tuple[str, str, str]]:
 def _grapheme_clusters(text: str) -> list[str]:
     clusters: list[str] = []
     for character in text:
+        is_regional_indicator = "\U0001f1e6" <= character <= "\U0001f1ff"
+        previous_is_unpaired_regional_indicator = bool(
+            clusters
+            and is_regional_indicator
+            and all("\U0001f1e6" <= item <= "\U0001f1ff" for item in clusters[-1])
+            and len(clusters[-1]) % 2 == 1
+        )
         is_modifier = unicodedata.category(character).startswith("M") or (
             "\ufe00" <= character <= "\ufe0f"
-        )
+        ) or ("\U0001f3fb" <= character <= "\U0001f3ff")
         if clusters and (
             is_modifier
             or character == "\u200d"
             or clusters[-1].endswith("\u200d")
+            or previous_is_unpaired_regional_indicator
         ):
             clusters[-1] += character
         else:
@@ -269,37 +367,47 @@ def _bounded_source_anchor(text: str) -> str:
 
 def _semantic_evidence_ref(
     role: str,
-    title: str,
-    communication_job: str,
+    _title: str,
+    _communication_job: str,
     evidence: Sequence[Mapping[str, Any]],
 ) -> str:
-    query = " ".join(
-        (
-            role.replace("-", " "),
-            title,
-            communication_job,
-            _ROLE_EVIDENCE_QUERIES.get(
-                role,
-                "evidence analysis result method 证据 分析 结果 方法",
-            ),
+    concepts = _ROLE_DISTINCTIVE_CONCEPTS.get(role, ())
+    scored: list[tuple[int, str]] = []
+    for item in evidence:
+        normalized = " ".join(
+            unicodedata.normalize(
+                "NFKC",
+                str(item.get("text", "")),
+            ).casefold().split()
         )
-    )
-    ranked = portable.lexical_retrieve(evidence, query, limit=1)
-    if ranked:
-        return str(ranked[0]["id"])
-    if role in _SUMMARY_ROLES:
-        summary_ranked = portable.lexical_retrieve(
-            evidence,
-            _SUMMARY_EVIDENCE_QUERY,
-            limit=1,
+        score = sum(
+            any(_semantic_term_present(normalized, term) for term in alternatives)
+            for alternatives in concepts
         )
-        if summary_ranked:
-            return str(summary_ranked[0]["id"])
-    if len(evidence) == 1:
-        return str(evidence[0]["id"])
+        scored.append((score, str(item.get("id", ""))))
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    top_score, top_id = scored[0] if scored else (0, "")
+    runner_up = scored[1][0] if len(scored) > 1 else 0
+    if (
+        top_score >= _SEMANTIC_MIN_CONCEPTS
+        and top_score - runner_up >= _SEMANTIC_MARGIN
+    ):
+        return top_id
     raise PptHarnessError(
         f"could not semantically assign evidence for role {role}; provide --story-plan"
     )
+
+
+def _semantic_term_present(normalized_text: str, term: str) -> bool:
+    normalized_term = unicodedata.normalize("NFKC", term).casefold()
+    if any(not character.isascii() for character in normalized_term):
+        return normalized_term in normalized_text
+    if " " in normalized_term:
+        return normalized_term in normalized_text
+    return re.search(
+        rf"(?<![a-z0-9]){re.escape(normalized_term)}[a-z]*(?![a-z0-9])",
+        normalized_text,
+    ) is not None
 
 
 def _host_story_evidence_refs(

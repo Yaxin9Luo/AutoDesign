@@ -37,12 +37,15 @@ Run `python "$SKILL_ROOT/scripts/ppt_harness.py" --help` for exact flags.
    entry per slide with `slide_id`, the required academic `role`, and one or more
    real `evidence_refs`; the harness validates it before the immutable hash is
    written. If the story plan is omitted, deterministic semantic role scoring
-   selects evidence and never assigns by extraction order. Paper decks default
-   to exactly 18 slides. A true deck-target count, including Chinese numerals
-   through sixty, overrides the default; source metadata such as “12-page
-   paper” does not. Build one research argument, not disconnected summary
-   cards. Pass an explicit visual-allocation JSON to `plan`; keep each visual
-   within its permitted role and reuse limit.
+   selects evidence and never assigns by extraction order. That fallback needs
+   role-distinctive evidence with a unique winning margin; ambiguous or generic
+   overlap stops and requests `--story-plan`. Paper decks default to exactly 18
+   slides. A count attached to the requested deck/slides/presentation, including
+   Chinese numerals through sixty, overrides the default; source metadata such
+   as “12-page manuscript”, “25-page article”, or “30-page PDF” does not. Build
+   one research argument, not disconnected summary cards. Pass an explicit
+   visual-allocation JSON to `plan`; keep each visual within its permitted role
+   and reuse limit.
 4. Run `begin`. Author the returned `artifact/deck.html` yourself. The HTML is
    canonical and the immutable plan is snapshotted under artifact provenance.
    Match every slide's ordered role, section, assertion, and evidence refs to

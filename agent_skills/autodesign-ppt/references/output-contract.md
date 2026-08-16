@@ -7,8 +7,10 @@ renders, exports, binds review evidence, and finalizes.
 
 Paper decks default to exactly 18 slides unless the user explicitly requests a
 different deck or presentation count from 1 through 60. Arabic and common
-Chinese numerals are accepted. A source description such as “12-page paper” is
-not a deck count. The default arc is:
+Chinese numerals are accepted. The count must be syntactically attached to the
+requested deck, slides, presentation, or a direct resize command such as “Make
+it 14 pages.” Source metadata such as “12-page manuscript”, “25-page article”,
+or “30-page PDF” is not a deck count. The default arc is:
 
 1. cover;
 2. roadmap;
@@ -43,9 +45,11 @@ contains exactly one object per requested slide, in order, with only:
 
 The harness rejects unknown evidence, wrong roles, wrong order, and count
 mismatches before hashing the immutable plan. If no host story plan is passed,
-the deterministic fallback scores evidence against each slide's semantic role;
-it does not rotate through extraction order. If a multi-source role has no
-semantic match, planning stops and requests an explicit story plan.
+the deterministic fallback scores role-distinctive evidence concepts for each
+slide. A match must clear the minimum and beat the runner-up by a fixed margin;
+generic words such as “method” or “result” cannot stand in for missing ablation
+evidence. It does not rotate through extraction order. If a role has no unique,
+distinctive match, planning stops and requests an explicit story plan.
 
 If source visuals are needed, write a JSON list and pass it to
 `plan --visual-allocations`:
@@ -68,9 +72,11 @@ it.
 
 The visible `h1` text equals the planned assertion title. Source-derived title
 anchors stop at sentence punctuation and are bounded by words and grapheme
-clusters, so an unspaced CJK paragraph cannot become a giant heading. Every visible native
-text element and table cites exactly the slide's planned evidence refs, in plan
-order. Speaker notes equal the plan's complete note intent, not merely its
+clusters, so an unspaced CJK paragraph cannot become a giant heading. Emoji
+modifiers, ZWJ sequences, and regional-indicator flag pairs stay intact at the
+boundary. Every visible native text element and table cites exactly the slide's
+planned evidence refs, in plan order. Speaker notes equal the plan's complete
+note intent, not merely its
 `[Sources]` prefix. These native claims and notes are the canonical source-map
 inputs; changing their text or evidence IDs without a new plan fails validation.
 

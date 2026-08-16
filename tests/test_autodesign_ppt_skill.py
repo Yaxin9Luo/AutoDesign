@@ -155,6 +155,28 @@ class AutoDesignPptSkillTests(unittest.TestCase):
         html.write_text(_deck_html(slide_count, remote_asset=remote_asset), encoding="utf-8")
         return html
 
+    def _story_plan(
+        self,
+        harness: object,
+        *,
+        slide_count: int = 18,
+        evidence_ref: str = "ev-001",
+    ) -> dict[str, object]:
+        return {
+            "format_version": 1,
+            "slides": [
+                {
+                    "slide_id": f"slide-{index:02d}",
+                    "role": role,
+                    "evidence_refs": [evidence_ref],
+                }
+                for index, (role, _title, _job) in enumerate(
+                    harness._arc_for_count(slide_count),
+                    start=1,
+                )
+            ],
+        }
+
     def _initialize_run(self, brief: str = "Create a conference deck.") -> Path:
         harness = self._require(self.harness, HARNESS_PATH)
         paper = self.root / "paper.md"
@@ -173,11 +195,21 @@ class AutoDesignPptSkillTests(unittest.TestCase):
                 archive_sha256=None,
             )
         )
+        slide_count = harness._explicit_slide_count(brief) or 18
+        story_plan = self.root / "story-plan.json"
+        story_plan.write_text(
+            json.dumps(
+                self._story_plan(harness, slide_count=slide_count),
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
         harness._command_plan(
             SimpleNamespace(
                 run_dir=run,
                 brief=brief,
                 slide_count=None,
+                story_plan=story_plan,
                 visual_allocations=None,
             )
         )
@@ -185,7 +217,11 @@ class AutoDesignPptSkillTests(unittest.TestCase):
 
     def test_planner_defaults_paper_decks_to_exactly_18_slides(self) -> None:
         harness = self._require(self.harness, HARNESS_PATH)
-        plan = harness.build_deck_plan("Create a conference deck from this paper.", ["ev-001"])
+        plan = harness.build_deck_plan(
+            "Create a conference deck from this paper.",
+            ["ev-001"],
+            story_plan=self._story_plan(harness),
+        )
         self.assertEqual(plan["slide_count"], 18)
         self.assertEqual(plan["count_source"], "academic_default")
         self.assertEqual(len(plan["slides"]), 18)
@@ -206,7 +242,11 @@ class AutoDesignPptSkillTests(unittest.TestCase):
             ("Create a 15-page deck", 15),
         ):
             with self.subTest(brief=brief):
-                plan = harness.build_deck_plan(brief, ["ev-001"])
+                plan = harness.build_deck_plan(
+                    brief,
+                    ["ev-001"],
+                    story_plan=self._story_plan(harness, slide_count=expected),
+                )
                 self.assertEqual(plan["slide_count"], expected)
                 self.assertEqual(plan["count_source"], "explicit_user")
                 self.assertEqual(len(plan["slides"]), expected)
@@ -221,16 +261,32 @@ class AutoDesignPptSkillTests(unittest.TestCase):
             ("Make it 14 pages.", 14),
         ):
             with self.subTest(brief=brief):
-                chinese = harness.build_deck_plan(brief, ["ev-001"])
+                chinese = harness.build_deck_plan(
+                    brief,
+                    ["ev-001"],
+                    story_plan=self._story_plan(harness, slide_count=expected),
+                )
                 self.assertEqual(chinese["slide_count"], expected)
                 self.assertEqual(chinese["count_source"], "explicit_user")
 
-        source_metadata = harness.build_deck_plan(
+        for brief in (
             "Turn this 12-page paper into a conference deck.",
-            ["ev-001"],
-        )
-        self.assertEqual(source_metadata["slide_count"], 18)
-        self.assertEqual(source_metadata["count_source"], "academic_default")
+            "Create a presentation from this 12-page manuscript.",
+            "Make slides from the 12-page preprint.",
+            "Summarize this 25-page article as slides.",
+            "Turn the 30-page PDF into a deck.",
+        ):
+            with self.subTest(source_metadata=brief):
+                source_metadata = harness.build_deck_plan(
+                    brief,
+                    ["ev-001"],
+                    story_plan=self._story_plan(harness),
+                )
+                self.assertEqual(source_metadata["slide_count"], 18)
+                self.assertEqual(
+                    source_metadata["count_source"],
+                    "academic_default",
+                )
 
     def test_default_planner_assigns_evidence_by_slide_role_not_extraction_order(self) -> None:
         harness = self._require(self.harness, HARNESS_PATH)
@@ -239,10 +295,24 @@ class AutoDesignPptSkillTests(unittest.TestCase):
             "ev-002": "Limitations include latency, missing modalities, and future work.",
             "ev-003": "Our method uses a planner, refinement loop, and modular architecture.",
             "ev-004": "The problem is that existing systems fail on long-horizon design tasks.",
+            "ev-005": "The paper title and authors establish its identity.",
+            "ev-006": "The roadmap previews the research argument.",
+            "ev-007": "The motivation and significance explain why the work matters.",
+            "ev-008": "Related work leaves a clear gap.",
+            "ev-009": "The paper's contributions introduce three advances.",
+            "ev-010": "The core mechanism coordinates specialized modules.",
+            "ev-011": "The loss equation defines the training objective.",
+            "ev-012": "Experiments use a dataset, benchmark, and evaluation metric.",
+            "ev-013": "Robustness and generalization hold across conditions.",
+            "ev-014": "The ablation removes each variant in turn.",
+            "ev-015": "Qualitative examples visualize representative cases.",
+            "ev-016": "The implications connect the application to practice.",
+            "ev-017": "The takeaway summary distills the key finding.",
+            "ev-018": "The discussion closes with future work.",
         }
         plan = harness.build_deck_plan(
             "Create a conference deck.",
-            ["ev-001", "ev-002", "ev-003", "ev-004"],
+            list(evidence_texts),
             evidence_texts=evidence_texts,
         )
         refs_by_role = {
@@ -268,6 +338,29 @@ class AutoDesignPptSkillTests(unittest.TestCase):
                     "ev-002": "Results improve performance over the baseline.",
                 },
             )
+
+    def test_default_planner_requires_distinctive_ablation_evidence(self) -> None:
+        harness = self._require(self.harness, HARNESS_PATH)
+        for evidence in (
+            [
+                {"id": "ev-001", "text": "The method improves the result."},
+                {"id": "ev-002", "text": "The result supports the method."},
+            ],
+            [{"id": "ev-001", "text": ""}],
+        ):
+            with (
+                self.subTest(evidence=evidence),
+                self.assertRaisesRegex(
+                    harness.PptHarnessError,
+                    "role ablation; provide --story-plan",
+                ),
+            ):
+                harness._semantic_evidence_ref(
+                    "ablation",
+                    "Ablation",
+                    "Isolate which components create the gain",
+                    evidence,
+                )
 
     def test_host_story_plan_is_validated_before_becoming_immutable(self) -> None:
         harness = self._require(self.harness, HARNESS_PATH)
@@ -315,11 +408,25 @@ class AutoDesignPptSkillTests(unittest.TestCase):
             "制作学术演示文稿。",
             ["ev-001"],
             evidence_texts={"ev-001": source},
+            story_plan=self._story_plan(harness),
         )
         title = str(plan["slides"][0]["assertion_title"])
         self.assertIn("这是论文的核心方法", title)
         self.assertNotIn("后续细节后续细节后续细节", title)
         self.assertLessEqual(len(title), 100)
+
+    def test_source_anchor_does_not_split_emoji_modifiers_or_flag_pairs(self) -> None:
+        harness = self._require(self.harness, HARNESS_PATH)
+        modifier_anchor = harness._bounded_source_anchor(
+            "甲" * 71 + "👍🏽" + "乙" * 40
+        )
+        flag_anchor = harness._bounded_source_anchor(
+            "甲" * 71 + "🇨🇳" + "乙" * 40
+        )
+        self.assertIn("👍🏽", modifier_anchor)
+        self.assertNotIn("👍…", modifier_anchor)
+        self.assertIn("🇨🇳", flag_anchor)
+        self.assertNotIn("🇨…", flag_anchor)
 
     def test_saved_plan_is_hash_bound_and_snapshotted_into_each_attempt(self) -> None:
         harness = self._require(self.harness, HARNESS_PATH)
@@ -440,7 +547,11 @@ class AutoDesignPptSkillTests(unittest.TestCase):
         self.assertIn("Invented 88.8%", claim_text)
         self.assertIn("Accuracy is 99.9%", claim_text)
 
-        plan = harness.build_deck_plan("Create a conference deck.", ["ev-001"])
+        plan = harness.build_deck_plan(
+            "Create a conference deck.",
+            ["ev-001"],
+            story_plan=self._story_plan(harness),
+        )
         plan_gate = harness.validate_deck_against_plan(deck, plan)
         self.assertFalse(plan_gate["passed"])
         self.assertTrue(plan_gate["issues"])
@@ -455,7 +566,11 @@ class AutoDesignPptSkillTests(unittest.TestCase):
     def test_plan_gate_exactly_binds_assertion_native_claim_sources_and_notes(self) -> None:
         exporter = self._require(self.exporter, EXPORTER_PATH)
         harness = self._require(self.harness, HARNESS_PATH)
-        plan = harness.build_deck_plan("Create a conference deck.", ["ev-001"])
+        plan = harness.build_deck_plan(
+            "Create a conference deck.",
+            ["ev-001"],
+            story_plan=self._story_plan(harness),
+        )
         html = self._write_fixture()
         conforming = _deck_html_for_plan(plan)
 
