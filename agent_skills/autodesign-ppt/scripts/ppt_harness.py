@@ -11,6 +11,7 @@ import argparse
 import hashlib
 import importlib.util
 import json
+import math
 import os
 import re
 import shutil
@@ -62,7 +63,7 @@ exporter = _load_sibling("autodesign_ppt_exporter", "export_pptx.py")
 
 _EXPLICIT_COUNT_PATTERNS = (
     re.compile(
-        r"(?<!\d)([1-5]?\d|60)\s*-?\s*(?:slides?|pages?|页)(?![A-Za-z0-9_])",
+        r"(?<!\d)([1-5]?\d|60)\s*-?\s*(?:slides?|pages?|页|张\s*(?:幻灯片|ppt)|幻灯片|ppt)(?![A-Za-z0-9_])",
         re.IGNORECASE,
     ),
     re.compile(r"(?:slides?|pages?)\s*(?:count|total)?\s*[:=]?\s*([1-5]?\d|60)(?!\d)", re.IGNORECASE),
@@ -133,6 +134,7 @@ def build_deck_plan(
     evidence_ids: Sequence[str],
     *,
     slide_count: int | None = None,
+    evidence_texts: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """Return the shared paper-deck plan: 18 by default, explicit requests win."""
 
@@ -146,6 +148,14 @@ def build_deck_plan(
     slides: list[dict[str, Any]] = []
     for index, (role, title, communication_job) in enumerate(_arc_for_count(count), start=1):
         source_id = sources[(index - 1) % len(sources)]
+        source_text = " ".join(str((evidence_texts or {}).get(source_id, "")).split())
+        source_anchor = " ".join(source_text.lstrip("# ").split()[:12]).rstrip(".,;:")
+        assertion_title = (
+            f"{title}: {source_anchor}" if source_anchor else title
+        )
+        talk = communication_job
+        if source_anchor:
+            talk = f"{communication_job}. Ground this slide in: {source_anchor}"
         slides.append(
             {
                 "slide_id": f"slide-{index:02d}",
@@ -153,9 +163,9 @@ def build_deck_plan(
                 "role": role,
                 "chapter": "paper-talk",
                 "communication_job": communication_job,
-                "assertion_title": title,
+                "assertion_title": assertion_title,
                 "evidence_refs": [source_id],
-                "speaker_note_intent": f"[Sources] {source_id} [Talk] {communication_job}.",
+                "speaker_note_intent": f"[Sources] {source_id} [Talk] {talk}.",
                 "layout_family": "editorial-evidence",
             }
         )
@@ -275,12 +285,49 @@ def validate_deck_against_plan(
         ]
         if authored_sources != planned_sources:
             issues.append(f"slide {index}: evidence refs differ from the immutable plan")
+        assertion_elements = [
+            element
+            for element in slide.elements
+            if element.kind == "text" and element.tag == "h1"
+        ]
+        if len(assertion_elements) != 1 or (
+            assertion_elements
+            and assertion_elements[0].text
+            != str(planned.get("assertion_title", "")).strip()
+        ):
+            issues.append(
+                f"slide {index}: visible H1 differs from the immutable assertion title"
+            )
+        for element_index, element in enumerate(slide.elements, start=1):
+            if element.kind not in {"text", "table"}:
+                continue
+            element_sources = [
+                item
+                for item in re.split(
+                    r"[\s,;]+", element.attrs.get("data-source-ids", "").strip()
+                )
+                if item
+            ]
+            if element_sources != planned_sources:
+                issues.append(
+                    f"slide {index}: native {element.kind} {element_index} sources differ from the immutable plan"
+                )
         parsed_notes = exporter.parse_speaker_notes(
             slide.attrs.get("data-speaker-notes", "")
         )
         if parsed_notes is None or parsed_notes[0] != planned_sources:
             issues.append(
                 f"slide {index}: speaker-note refs differ from the immutable plan"
+            )
+        expected_note = " ".join(
+            str(planned.get("speaker_note_intent", "")).split()
+        )
+        authored_note = " ".join(
+            slide.attrs.get("data-speaker-notes", "").split()
+        )
+        if authored_note != expected_note:
+            issues.append(
+                f"slide {index}: speaker-note intent differs from the immutable plan"
             )
     return {"name": "deck_plan", "passed": not issues, "issues": issues}
 
@@ -385,7 +432,7 @@ def create_slide_audit_variants(
             "html,body{width:1920px!important;height:1080px!important;overflow:hidden!important;"
             "margin:0!important;background:#fff!important}"
             ".deck-slide{display:none!important;margin:0!important}"
-            f"#{slide_id}{{display:block!important;width:1920px!important;height:1080px!important}}"
+            f"#{slide_id}{{display:block!important}}"
             "</style>"
         )
         closing_head = re.search(r"</head\s*>", raw, re.IGNORECASE)
@@ -396,6 +443,100 @@ def create_slide_audit_variants(
         target.write_text(variant, encoding="utf-8")
         variants.append(target)
     return variants
+
+
+def validate_computed_slide_canvases(
+    measurements: Sequence[Mapping[str, Any]], expected_slide_count: int
+) -> dict[str, Any]:
+    """Fail unless every authored slide root computes to the canonical canvas."""
+
+    issues: list[str] = []
+    expected_ids = [
+        f"slide-{index:02d}" for index in range(1, expected_slide_count + 1)
+    ]
+    actual_ids = [str(item.get("slide_id", "")) for item in measurements]
+    if actual_ids != expected_ids:
+        issues.append("computed slide roots are missing, duplicated, or out of order")
+    for index, item in enumerate(measurements, start=1):
+        slide_id = str(item.get("slide_id") or f"slide-at-{index}")
+        expected = {
+            "computed_width": SLIDE_WIDTH,
+            "computed_height": SLIDE_HEIGHT,
+            "offset_width": SLIDE_WIDTH,
+            "offset_height": SLIDE_HEIGHT,
+            "rect_width": SLIDE_WIDTH,
+            "rect_height": SLIDE_HEIGHT,
+        }
+        for field, target in expected.items():
+            value = item.get(field)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or abs(float(value) - target) > 0.5
+            ):
+                issues.append(
+                    f"{slide_id}: actual {field} must be {target}, found {value!r}"
+                )
+    return {"name": "computed_slide_canvas", "passed": not issues, "issues": issues}
+
+
+def _measure_computed_slide_canvases(html_path: Path, runtime: Any) -> list[dict[str, Any]]:
+    script = r'''
+import json
+import sys
+from pathlib import Path
+from playwright.sync_api import sync_playwright
+
+source = Path(sys.argv[1]).resolve(strict=True).as_uri()
+with sync_playwright() as playwright:
+    browser = playwright.chromium.launch(headless=True, args=[
+        '--disable-background-networking', '--disable-component-update',
+        '--disable-default-apps', '--disable-domain-reliability', '--disable-sync',
+        '--metrics-recording-only', '--no-first-run', '--no-default-browser-check',
+        '--host-resolver-rules=MAP * 0.0.0.0, EXCLUDE localhost',
+    ])
+    page = browser.new_page(viewport={'width': 1920, 'height': 1080})
+    page.route('http://**/*', lambda route: route.abort('blockedbyclient'))
+    page.route('https://**/*', lambda route: route.abort('blockedbyclient'))
+    page.goto(source, wait_until='load', timeout=30000)
+    measurements = page.evaluate("""() => [...document.querySelectorAll('.deck-slide')].map(slide => {
+      const style = getComputedStyle(slide);
+      const rect = slide.getBoundingClientRect();
+      return {
+        slide_id: slide.id,
+        computed_width: Number.parseFloat(style.width),
+        computed_height: Number.parseFloat(style.height),
+        offset_width: slide.offsetWidth,
+        offset_height: slide.offsetHeight,
+        rect_width: rect.width,
+        rect_height: rect.height,
+      };
+    })""")
+    print(json.dumps(measurements, sort_keys=True))
+    browser.close()
+'''
+    environment = browser_setup.isolated_environment(
+        browsers_path=runtime.browsers_path,
+        allow_network_configuration=False,
+    )
+    result = subprocess.run(
+        [str(runtime.python_executable), "-B", "-I", "-c", script, str(html_path)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env=environment,
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "no browser output").strip()[-1000:]
+        raise PptHarnessError(f"browser could not inspect computed slide canvases: {detail}")
+    try:
+        value = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise PptHarnessError("browser returned unreadable computed slide canvases") from error
+    if not isinstance(value, list) or any(not isinstance(item, dict) for item in value):
+        raise PptHarnessError("browser returned an invalid computed slide canvas report")
+    return value
 
 
 def write_contact_sheet_html(
@@ -497,7 +638,7 @@ def _run_exporter(
     allowed_returncodes: Sequence[int] = (0,),
 ) -> int:
     result = subprocess.run(
-        [str(runtime.python_executable), "-I", str(Path(exporter.__file__).resolve()), *command],
+        [str(runtime.python_executable), "-B", "-I", str(Path(exporter.__file__).resolve()), *command],
         capture_output=True,
         text=True,
         timeout=timeout_seconds,
@@ -627,6 +768,21 @@ def render_and_validate_deck(
         cache_root=Path(browser_cache) if browser_cache is not None else None,
         allow_install=not offline_browser,
     )
+    computed_canvas = validate_computed_slide_canvases(
+        _measure_computed_slide_canvases(html, browser_runtime),
+        expected_slide_count,
+    )
+    if not computed_canvas["passed"]:
+        return {
+            "format_version": 1,
+            "passed": False,
+            "html_contract": contract,
+            "computed_slide_canvas": computed_canvas,
+            "checks": [
+                {"name": "html_contract", "passed": True},
+                computed_canvas,
+            ],
+        }
     ppt_runtime = ppt_setup.ensure_ppt_runtime(
         cache_root=Path(ppt_cache) if ppt_cache is not None else None,
         allow_install=not offline_ppt,
@@ -700,6 +856,7 @@ def render_and_validate_deck(
     )
     checks = [
         {"name": "html_contract", "passed": bool(contract["passed"])},
+        computed_canvas,
         {"name": "per_slide_browser_qa", "passed": browser_pass},
         {"name": "contact_sheet_browser_qa", "passed": contact_report.get("passed") is True},
         {"name": "pdf_page_count", "passed": page_count == expected_slide_count, "actual": page_count},
@@ -711,6 +868,7 @@ def render_and_validate_deck(
         "passed": all(check["passed"] is True for check in checks),
         "checks": checks,
         "html_contract": contract,
+        "computed_slide_canvas": computed_canvas,
         "browser_reports": browser_reports,
         "contact_sheet_report": contact_report,
         "preview_paths": [str(path) for path in [*preview_paths, contact_sheet]],
@@ -742,6 +900,68 @@ REVIEW_RUBRIC = {
         "report localized repairs and never infer quality from HTML alone."
     ),
 }
+
+
+def _passing_review_score_error(review: Mapping[str, Any]) -> str | None:
+    if review.get("verdict") != "pass":
+        return None
+    scores = review.get("dimension_scores")
+    if not isinstance(scores, dict) or set(scores) != set(REVIEW_RUBRIC["dimensions"]):
+        return "passing review must score every bound rubric dimension"
+    if any(
+        not isinstance(score, (int, float))
+        or isinstance(score, bool)
+        or not math.isfinite(float(score))
+        or not REVIEW_RUBRIC["minimum_score"] <= score <= 5
+        for score in scores.values()
+    ):
+        return "passing review requires every bound dimension score to be at least 4"
+    return None
+
+
+def _verify_persisted_review_minimum(run_dir: Path, state: Mapping[str, Any]) -> None:
+    attempt = state.get("active_attempt")
+    if not isinstance(attempt, str):
+        return
+    review_path = run_dir / "attempts" / attempt / "qa" / "semantic-review.json"
+    if not review_path.exists() and not review_path.is_symlink():
+        return
+    if (
+        review_path.is_symlink()
+        or not review_path.is_file()
+        or review_path.lstat().st_nlink != 1
+    ):
+        raise PptHarnessError("persisted semantic review is linked or unsafe")
+    try:
+        review = json.loads(review_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise PptHarnessError("persisted semantic review is unreadable") from error
+    if not isinstance(review, dict):
+        raise PptHarnessError("persisted semantic review is invalid")
+    score_error = _passing_review_score_error(review)
+    if score_error is not None:
+        raise PptHarnessError(score_error)
+
+
+def _verify_final_delivery_links(run_dir: Path) -> None:
+    final = run_dir / "final"
+    if not final.exists() and not final.is_symlink():
+        return
+    if final.is_symlink() or not final.is_dir():
+        raise PptHarnessError("final delivery directory is linked or unsafe")
+    for current, directories, filenames in os.walk(final, followlinks=False):
+        current_path = Path(current)
+        for name in directories:
+            if (current_path / name).is_symlink():
+                raise PptHarnessError("final delivery contains a symlink")
+        for name in filenames:
+            path = current_path / name
+            status = path.lstat()
+            if path.is_symlink() or not path.is_file() or status.st_nlink != 1:
+                relative = path.relative_to(final).as_posix()
+                raise PptHarnessError(
+                    f"final delivery file has an unsafe link count or hardlink: {relative}"
+                )
 
 
 def _skill_root() -> Path:
@@ -840,6 +1060,8 @@ def _snapshot_plan_for_attempt(run_dir: Path, attempt: str) -> Path:
 def _resume(run_dir: Path) -> dict[str, Any]:
     state = portable.resume_run(run_dir, skill_root=_skill_root())
     _verify_plan_binding(run_dir, state)
+    _verify_persisted_review_minimum(run_dir, state)
+    _verify_final_delivery_links(run_dir)
     return state
 
 
@@ -885,6 +1107,7 @@ def _command_plan(args: argparse.Namespace) -> dict[str, Any]:
         args.brief,
         [item["id"] for item in evidence],
         slide_count=args.slide_count,
+        evidence_texts={str(item["id"]): str(item.get("text", "")) for item in evidence},
     )
     if args.visual_allocations is not None:
         allocations = json.loads(args.visual_allocations.read_text(encoding="utf-8"))
@@ -1126,20 +1349,9 @@ def _command_record_review(args: argparse.Namespace) -> dict[str, Any]:
     _resume(args.run_dir)
     attempt = args.attempt or _active_attempt(args.run_dir)
     review = json.loads(args.review.read_text(encoding="utf-8"))
-    scores = review.get("dimension_scores")
-    if review.get("verdict") == "pass" and (
-        not isinstance(scores, dict)
-        or set(scores) != set(REVIEW_RUBRIC["dimensions"])
-        or any(
-            not isinstance(score, (int, float))
-            or isinstance(score, bool)
-            or score < REVIEW_RUBRIC["minimum_score"]
-            for score in scores.values()
-        )
-    ):
-        raise PptHarnessError(
-            "passing review requires every bound dimension score to be at least 4"
-        )
+    score_error = _passing_review_score_error(review)
+    if score_error is not None:
+        raise PptHarnessError(score_error)
     portable.record_semantic_review(args.run_dir, attempt, review)
     return _resume(args.run_dir)
 

@@ -23,7 +23,9 @@ from stat import S_ISREG
 from typing import Any, Iterator, Mapping, Sequence
 
 
-RUNTIME_FORMAT_VERSION = 1
+sys.dont_write_bytecode = True
+
+RUNTIME_FORMAT_VERSION = 2
 PINNED_PACKAGES = {
     "python-pptx": "1.0.2",
     "lxml": "6.1.0",
@@ -331,6 +333,12 @@ def _runtime_lock(path: Path, timeout_seconds: float) -> Iterator[None]:
 
 def _runtime_tree_sha256(cache_dir: Path | str) -> str:
     cache = Path(cache_dir).absolute()
+    for current, directories, filenames in os.walk(cache, followlinks=False):
+        current_path = Path(current)
+        if current_path.name == "__pycache__" or "__pycache__" in directories:
+            raise PptRuntimeError("PPT runtime contains a forbidden __pycache__ directory")
+        if any(name.lower().endswith((".pyc", ".pyo")) for name in filenames):
+            raise PptRuntimeError("PPT runtime contains forbidden executable bytecode")
     site = (
         cache / "venv" / "Lib" / "site-packages"
         if os.name == "nt"
@@ -351,13 +359,10 @@ def _runtime_tree_sha256(cache_dir: Path | str) -> str:
             child = current_path / name
             if child.is_symlink():
                 raise PptRuntimeError("PPT runtime content tree contains a symlink")
-            if name != "__pycache__":
-                kept_directories.append(name)
+            kept_directories.append(name)
         directories[:] = kept_directories
         for name in sorted(filenames):
             path = current_path / name
-            if path.suffix.lower() in {".pyc", ".pyo"}:
-                continue
             status = path.lstat()
             if path.is_symlink() or not S_ISREG(status.st_mode) or status.st_nlink > 1:
                 raise PptRuntimeError("PPT runtime content tree contains an unsafe file")
@@ -396,10 +401,11 @@ def _probe(runtime: PptRuntime, spec: PptRuntimeSpec) -> None:
         "print(json.dumps({n:importlib.metadata.version(n) for n in names},sort_keys=True))"
     )
     result = subprocess.run(
-        [str(runtime.python_executable), "-I", "-c", script],
+        [str(runtime.python_executable), "-B", "-I", "-c", script],
         capture_output=True,
         text=True,
         timeout=30,
+        env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
         check=False,
     )
     if result.returncode != 0:
@@ -447,6 +453,7 @@ def _install(staging: Path, spec: PptRuntimeSpec) -> None:
         capture_output=True,
         text=True,
         timeout=120,
+        env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
         check=False,
     )
     if result.returncode != 0:
@@ -460,6 +467,7 @@ def _install(staging: Path, spec: PptRuntimeSpec) -> None:
             "install",
             "--disable-pip-version-check",
             "--no-input",
+            "--no-compile",
             "--only-binary=:all:",
             "--require-hashes",
             "--no-deps",
@@ -469,12 +477,20 @@ def _install(staging: Path, spec: PptRuntimeSpec) -> None:
         capture_output=True,
         text=True,
         timeout=_INSTALL_TIMEOUT_SECONDS,
+        env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
         check=False,
     )
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "no package-manager output").strip()[-1200:]
         detail = re.sub(r"(?i)(authorization|cookie|set-cookie)\s*:\s*[^\r\n]+", r"\1: [REDACTED]", detail)
         raise PptRuntimeError(f"Exact-pinned PPT dependency installation failed: {detail}")
+    for path in sorted((staging / "venv").rglob("*"), reverse=True):
+        if path.is_symlink():
+            continue
+        if path.is_file() and path.suffix.lower() in {".pyc", ".pyo"}:
+            path.unlink()
+        elif path.is_dir() and path.name == "__pycache__":
+            shutil.rmtree(path)
     _atomic_json(
         staging / _STATE_FILE,
         _state_payload(spec, _runtime_tree_sha256(staging)),

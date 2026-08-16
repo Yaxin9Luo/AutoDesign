@@ -40,16 +40,22 @@ Run `python "$SKILL_ROOT/scripts/ppt_harness.py" --help` for exact flags.
 4. Run `begin`. Author the returned `artifact/deck.html` yourself. The HTML is
    canonical and the immutable plan is snapshotted under artifact provenance.
    Match every slide's ordered role, section, assertion, and evidence refs to
-   that plan. Stage each planned figure with `stage-visual`. Use the exact
+   that plan: the visible `h1` must equal the planned assertion, every visible
+   text/table source list must equal the planned evidence refs, and the speaker
+   note must equal the planned note intent. Stage each planned figure with
+   `stage-visual`. Use the exact
    tagged-DOM contract so native text, tables, images,
    shapes, and speaker notes can become editable PowerPoint objects. Use only
    local, regular, non-linked source-grounded paper assets; never invent paper
    facts, links, logos, figures, or measurements. Bind every visible text box,
    native table, and speaker-note statement to real evidence IDs.
 5. Run `validate`. Static gates run before rendering. The harness then audits
-   every 1920x1080 slide in a network-denied browser, makes a contact sheet,
-   verifies an exact-page-count PDF, exports `deck.pptx`, reopens its native
-   structure and notes, and, when LibreOffice is available, renders and compares
+   every slide in a network-denied browser, verifies that the authored slide
+   roots actually compute to 1920x1080 before any audit isolation CSS, makes a
+   contact sheet,
+   verifies an exact-page-count PDF, exports `deck.pptx`, reopens its required
+   native text/table/image counts and exact notes, and, when LibreOffice is
+   available, renders and compares
    the PowerPoint with the canonical HTML. A screenshot-only deck does not pass.
 6. Run `review-context`. Give the contact sheet and every individual preview to
    a fresh host VLM or fresh subagent that did not author the attempt. The
@@ -64,7 +70,8 @@ Run `python "$SKILL_ROOT/scripts/ppt_harness.py" --help` for exact flags.
 
 Run `resume --run-dir "$RUN"` before every continuation after interruption. It
 verifies the installed `skill_root`, snapshotted instructions, source, artifact,
-preview, and review hashes. A scaffold, fallback, stale review, failed export,
+preview, review hashes, the minimum score for persisted passing reviews, and
+single-link final files. A scaffold, fallback, stale review, failed export,
 or visually unreviewed deck is not a completed deliverable.
 
 ## Design standard

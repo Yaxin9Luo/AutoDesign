@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from html.parser import HTMLParser
 from pathlib import Path
 from stat import S_ISREG
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 from urllib.parse import unquote, urlsplit
 
 
@@ -67,6 +67,7 @@ def _external_output(path: Path | str) -> Path:
 
 @dataclass
 class ExportElement:
+    tag: str
     kind: str
     attrs: dict[str, str]
     text_parts: list[str] = field(default_factory=list)
@@ -119,7 +120,7 @@ class _DeckParser(HTMLParser):
             self.model.slides.append(self._slide)
         kind = values.get("data-pptx-kind", "").strip().lower()
         if self._slide is not None and kind:
-            self._element = ExportElement(kind, values)
+            self._element = ExportElement(lowered, kind, values)
             self._slide.elements.append(self._element)
             self._element_depth = 1
         elif self._element is not None:
@@ -829,7 +830,61 @@ def make_text_free_backgrounds(
     return backgrounds
 
 
-def inspect_pptx(path: Path | str, *, expected_slide_count: int) -> dict[str, Any]:
+def native_object_contract(deck: DeckModel) -> dict[str, Any]:
+    """Describe the native objects that must survive PPTX export and reopen."""
+
+    slides: list[dict[str, Any]] = []
+    for slide in deck.slides:
+        slides.append(
+            {
+                "slide_id": slide.slide_id,
+                "text_shapes": sum(
+                    element.kind == "text" and bool(element.text)
+                    for element in slide.elements
+                ),
+                "table_shapes": sum(
+                    element.kind == "table" for element in slide.elements
+                ),
+                "image_shapes": sum(
+                    element.kind == "image" for element in slide.elements
+                ),
+                "speaker_notes": slide.attrs.get("data-speaker-notes", "").strip(),
+            }
+        )
+    return {"format_version": 1, "slides": slides}
+
+
+def _validate_native_contract(
+    native_contract: Mapping[str, Any], expected_slide_count: int
+) -> list[Mapping[str, Any]]:
+    slides = native_contract.get("slides")
+    if native_contract.get("format_version") != 1 or not isinstance(slides, list):
+        raise PptContractError("native PPTX object contract is invalid")
+    if len(slides) != expected_slide_count or any(
+        not isinstance(slide, Mapping) for slide in slides
+    ):
+        raise PptContractError("native PPTX object contract slide count is invalid")
+    expected_ids = [f"slide-{index:02d}" for index in range(1, expected_slide_count + 1)]
+    if [slide.get("slide_id") for slide in slides] != expected_ids:
+        raise PptContractError("native PPTX object contract slide order is invalid")
+    for slide in slides:
+        for field_name in ("text_shapes", "table_shapes", "image_shapes"):
+            value = slide.get(field_name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise PptContractError(
+                    f"native PPTX object contract has invalid {field_name}"
+                )
+        if not isinstance(slide.get("speaker_notes"), str):
+            raise PptContractError("native PPTX object contract has invalid speaker notes")
+    return slides
+
+
+def inspect_pptx(
+    path: Path | str,
+    *,
+    expected_slide_count: int,
+    native_contract: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     from pptx import Presentation
     from pptx.enum.shapes import MSO_SHAPE_TYPE
 
@@ -847,9 +902,17 @@ def inspect_pptx(path: Path | str, *, expected_slide_count: int) -> dict[str, An
     tables = 0
     pictures = 0
     editable_shapes = 0
+    expected_native = (
+        _validate_native_contract(native_contract, expected_slide_count)
+        if native_contract is not None
+        else None
+    )
+    observed_native: list[dict[str, Any]] = []
     for index, slide in enumerate(presentation.slides, start=1):
         slide_id = f"slide-{index:02d}"
         slide_text = 0
+        slide_tables = 0
+        slide_images = 0
         notes = slide.notes_slide.notes_text_frame.text.strip()
         if notes:
             notes_count += 1
@@ -859,10 +922,12 @@ def inspect_pptx(path: Path | str, *, expected_slide_count: int) -> dict[str, An
             name = str(getattr(shape, "name", ""))
             if getattr(shape, "has_table", False):
                 tables += 1
+                slide_tables += 1
                 editable_shapes += 1
             elif shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
                 pictures += 1
                 if not name.startswith("background:"):
+                    slide_images += 1
                     editable_shapes += 1
             elif getattr(shape, "has_text_frame", False) and shape.text_frame.text.strip():
                 editable_text += 1
@@ -872,6 +937,37 @@ def inspect_pptx(path: Path | str, *, expected_slide_count: int) -> dict[str, An
                 editable_shapes += 1
         if slide_text == 0:
             issues.append(_issue("pptx_missing_editable_text", "slide has no editable text overlay", slide_id=slide_id))
+        observed = {
+            "slide_id": slide_id,
+            "text_shapes": slide_text,
+            "table_shapes": slide_tables,
+            "image_shapes": slide_images,
+            "speaker_notes": notes,
+        }
+        observed_native.append(observed)
+        if expected_native is not None and index <= len(expected_native):
+            expected = expected_native[index - 1]
+            for field_name, issue_code in (
+                ("text_shapes", "pptx_native_text"),
+                ("table_shapes", "pptx_native_table"),
+                ("image_shapes", "pptx_native_image"),
+            ):
+                if observed[field_name] != expected[field_name]:
+                    issues.append(
+                        _issue(
+                            issue_code,
+                            f"expected {expected[field_name]} {field_name}, found {observed[field_name]}",
+                            slide_id=slide_id,
+                        )
+                    )
+            if observed["speaker_notes"] != expected["speaker_notes"].strip():
+                issues.append(
+                    _issue(
+                        "pptx_native_notes",
+                        "speaker notes differ from the canonical deck contract",
+                        slide_id=slide_id,
+                    )
+                )
     if notes_count != expected_slide_count:
         issues.append(_issue("pptx_notes_count", f"expected {expected_slide_count} note pages, found {notes_count}"))
     return {
@@ -884,6 +980,7 @@ def inspect_pptx(path: Path | str, *, expected_slide_count: int) -> dict[str, An
         "table_shapes": tables,
         "picture_shapes": pictures,
         "editable_shape_count": editable_shapes,
+        "native_object_contract": observed_native,
         "issues": issues,
     }
 
@@ -899,6 +996,7 @@ def export_deck_to_pptx(
     from pptx.util import Inches
 
     deck = parse_deck_html(html_path)
+    object_contract = native_object_contract(deck)
     validation = validate_deck_html(deck.html_path, expected_slide_count=len(deck.slides))
     if not validation["passed"]:
         raise PptContractError("HTML deck contract failed before PPTX export")
@@ -948,7 +1046,11 @@ def export_deck_to_pptx(
         os.replace(temporary, output)
     finally:
         temporary.unlink(missing_ok=True)
-    return inspect_pptx(output, expected_slide_count=len(deck.slides))
+    return inspect_pptx(
+        output,
+        expected_slide_count=len(deck.slides),
+        native_contract=object_contract,
+    )
 
 
 def render_pptx_with_libreoffice(

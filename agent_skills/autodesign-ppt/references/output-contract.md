@@ -50,6 +50,12 @@ ordered ID, index, role, chapter, assertion title, and evidence refs. Validation
 and review bind that snapshot; repairs use a new attempt rather than rewriting
 it.
 
+The visible `h1` text equals the planned assertion title. Every visible native
+text element and table cites exactly the slide's planned evidence refs, in plan
+order. Speaker notes equal the plan's complete note intent, not merely its
+`[Sources]` prefix. These native claims and notes are the canonical source-map
+inputs; changing their text or evidence IDs without a new plan fails validation.
+
 ## Canonical HTML
 
 Write `artifact/deck.html` with:
@@ -65,7 +71,10 @@ Write `artifact/deck.html` with:
   `data-height="1080"`, and `data-speaker-notes`;
 - notes in the exact shape
   `[Sources] ev-001, ev-002 [Talk] What the presenter should explain.`;
-- CSS that fixes every slide to 1920x1080 with no overflow or clipping;
+- CSS that fixes every slide to 1920x1080 with no overflow or clipping. The
+  browser checks the actual computed width, height, and layout box of every
+  authored slide root before slide-isolation CSS is applied; a dummy rule or
+  wrapper with the right dimensions cannot satisfy this gate;
 - ArrowLeft and ArrowRight keyboard navigation plus stable `#slide-01` hash
   navigation. Navigation controls may stay invisible in the rendered slide;
 - only local regular-file dependencies. No remote URL, hotlink, iframe, web
@@ -135,7 +144,10 @@ near-full-slide image without editable overlays is rejected.
 The exporter creates a text-free background from the canonical browser render
 only to preserve CSS decoration. It then lays native PowerPoint text, tables,
 images, and shapes over that background. The harness reopens the result and
-checks slide size, notes, object types, counts, and OOXML integrity.
+checks slide size, exact notes, per-slide native text/table/image counts, and
+OOXML integrity against a contract derived from the plan-bound canonical DOM.
+Deleting a required native object fails reopen validation even if a decorative
+background screenshot still looks correct.
 
 ## Visual and content rules
 
@@ -163,4 +175,11 @@ all pages must rasterize and pass both pixel-similarity and foreground-edge
 recall against canonical HTML. A page-count-only or blank render cannot pass.
 
 Finalization adds the exact reviewed source map and a hash manifest. It refuses
-stale artifacts, stale previews, partial reviews, and unreviewed frames.
+stale artifacts, stale previews, partial reviews, and unreviewed frames. Every
+final file, including the manifest, must retain link count one; resume rejects
+an external hardlink created after finalization. A persisted `pass` review is
+rechecked against the bound minimum score of 4 on every resume and finalize.
+
+The pinned PowerPoint runtime is installed without bytecode and run with Python
+bytecode writes disabled. Any `.pyc`, `.pyo`, or `__pycache__` appearing in the
+runtime cache invalidates it rather than being ignored by the content hash.

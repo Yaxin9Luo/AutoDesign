@@ -5,6 +5,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -107,6 +108,30 @@ def _deck_html(slide_count: int = 18, *, remote_asset: bool = False) -> str:
     )
 
 
+def _deck_html_for_plan(plan: dict[str, object]) -> str:
+    html = _deck_html(int(plan["slide_count"]))
+    for slide in plan["slides"]:
+        index = int(slide["slide_index"])
+        html = html.replace(
+            f'data-slide-index="{index}" data-slide-role="evidence" '
+            'data-section="paper-talk" '
+            'data-assertion-title="The paper presents a grounded research finding."',
+            f'data-slide-index="{index}" data-slide-role="{slide["role"]}" '
+            f'data-section="{slide["chapter"]}" '
+            f'data-assertion-title="{slide["assertion_title"]}"',
+            1,
+        ).replace(
+            "The paper presents a grounded research finding.</h1>",
+            f'{slide["assertion_title"]}</h1>',
+            1,
+        ).replace(
+            f"[Sources] ev-001 [Talk] Explain slide {index}.",
+            str(slide["speaker_note_intent"]),
+            1,
+        )
+    return html
+
+
 class AutoDesignPptSkillTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -165,11 +190,17 @@ class AutoDesignPptSkillTests(unittest.TestCase):
         self.assertEqual(plan["count_source"], "academic_default")
         self.assertEqual(len(plan["slides"]), 18)
         self.assertEqual([item["slide_id"] for item in plan["slides"]], [f"slide-{i:02d}" for i in range(1, 19)])
+        self.assertEqual(
+            [item["role"] for item in plan["slides"]],
+            [item[0] for item in harness._ACADEMIC_ARC],
+        )
 
     def test_explicit_user_slide_count_overrides_the_18_slide_default(self) -> None:
         harness = self._require(self.harness, HARNESS_PATH)
         for brief, expected in (
             ("Make 12 slides.", 12),
+            ("请做12张幻灯片。", 12),
+            ("请生成12张PPT。", 12),
             ("请生成 22 页 PPT。", 22),
             ("我想要 22 页的 PPT。", 22),
             ("Create a 15-page deck", 15),
@@ -304,23 +335,51 @@ class AutoDesignPptSkillTests(unittest.TestCase):
         self.assertFalse(plan_gate["passed"])
         self.assertTrue(plan_gate["issues"])
 
-        conforming = _deck_html()
-        for slide in plan["slides"]:
-            index = slide["slide_index"]
-            conforming = conforming.replace(
-                f'data-slide-index="{index}" data-slide-role="evidence" '
-                'data-section="paper-talk" '
-                'data-assertion-title="The paper presents a grounded research finding."',
-                f'data-slide-index="{index}" data-slide-role="{slide["role"]}" '
-                f'data-section="{slide["chapter"]}" '
-                f'data-assertion-title="{slide["assertion_title"]}"',
-                1,
-            )
+        conforming = _deck_html_for_plan(plan)
         html.write_text(conforming, encoding="utf-8")
         accepted_gate = harness.validate_deck_against_plan(
             exporter.parse_deck_html(html), plan
         )
         self.assertTrue(accepted_gate["passed"], accepted_gate)
+
+    def test_plan_gate_exactly_binds_assertion_native_claim_sources_and_notes(self) -> None:
+        exporter = self._require(self.exporter, EXPORTER_PATH)
+        harness = self._require(self.harness, HARNESS_PATH)
+        plan = harness.build_deck_plan("Create a conference deck.", ["ev-001"])
+        html = self._write_fixture()
+        conforming = _deck_html_for_plan(plan)
+
+        mutations = {
+            "assertion text": conforming.replace("Opening</h1>", "Unplanned opening</h1>", 1),
+            "visible text sources": conforming.replace(
+                'data-source-ids="ev-001">A concise source-backed explanation.',
+                'data-source-ids="ev-999">A concise source-backed explanation.',
+                1,
+            ),
+            "table sources": conforming.replace(
+                'data-pptx-h="420" data-source-ids="ev-001">',
+                'data-pptx-h="420" data-source-ids="ev-999">',
+                1,
+            ),
+            "speaker note intent": conforming.replace(
+                str(plan["slides"][0]["speaker_note_intent"]),
+                "[Sources] ev-001 [Talk] A different unplanned talk track.",
+                1,
+            ),
+        }
+        for label, authored in mutations.items():
+            with self.subTest(label=label):
+                html.write_text(authored, encoding="utf-8")
+                report = harness.validate_deck_against_plan(
+                    exporter.parse_deck_html(html), plan
+                )
+                self.assertFalse(report["passed"], report)
+
+        html.write_text(conforming, encoding="utf-8")
+        deck = exporter.parse_deck_html(html)
+        self.assertTrue(harness.validate_deck_against_plan(deck, plan)["passed"])
+        claims = exporter.claims_from_deck(deck)
+        self.assertTrue(all(claim["source_ids"] == ["ev-001"] for claim in claims))
 
     def test_html_contract_rejects_visible_text_that_would_be_rasterized_in_pptx(self) -> None:
         exporter = self._require(self.exporter, EXPORTER_PATH)
@@ -369,6 +428,34 @@ class AutoDesignPptSkillTests(unittest.TestCase):
             self.assertTrue((path.parent / "theme.css").is_file())
             self.assertNotIn("http://", text)
             self.assertNotIn("https://", text)
+            audit_css = re.search(
+                r'<style data-autodesign-slide-audit>(.*?)</style>',
+                text,
+                flags=re.DOTALL,
+            )
+            self.assertIsNotNone(audit_css)
+            self.assertNotRegex(
+                audit_css.group(1),
+                rf"#{re.escape(f'slide-{index:02d}')}[^}}]*(?:width|height):",
+            )
+
+    def test_computed_canvas_gate_rejects_wrong_authored_slide_root_size(self) -> None:
+        harness = self._require(self.harness, HARNESS_PATH)
+        measurements = [
+            {
+                "slide_id": f"slide-{index:02d}",
+                "computed_width": 100 if index == 4 else 1920,
+                "computed_height": 100 if index == 4 else 1080,
+                "offset_width": 100 if index == 4 else 1920,
+                "offset_height": 100 if index == 4 else 1080,
+                "rect_width": 100 if index == 4 else 1920,
+                "rect_height": 100 if index == 4 else 1080,
+            }
+            for index in range(1, 19)
+        ]
+        report = harness.validate_computed_slide_canvases(measurements, 18)
+        self.assertFalse(report["passed"], report)
+        self.assertIn("slide-04", "\n".join(report["issues"]))
 
     def test_pptx_export_reopens_with_editable_text_table_image_shape_and_notes(self) -> None:
         exporter = self._require(self.exporter, EXPORTER_PATH)
@@ -390,6 +477,56 @@ class AutoDesignPptSkillTests(unittest.TestCase):
             slide_xml = archive.read("ppt/slides/slide3.xml")
             self.assertIn(b"<a:tbl>", slide_xml)
             self.assertIn(b"The paper presents a grounded research finding.", slide_xml)
+
+    def test_pptx_reopen_enforces_native_table_image_text_and_notes_contract(self) -> None:
+        from pptx import Presentation
+        from pptx.enum.shapes import MSO_SHAPE_TYPE
+
+        exporter = self._require(self.exporter, EXPORTER_PATH)
+        html = self._write_fixture()
+        deck = exporter.parse_deck_html(html)
+        native_contract = exporter.native_object_contract(deck)
+        original = self.root / "native-contract.pptx"
+        exporter.export_deck_to_pptx(html, original)
+
+        mutations = ("table", "image", "notes")
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                presentation = Presentation(str(original))
+                removed = False
+                for slide in presentation.slides:
+                    if mutation == "notes" and not removed:
+                        slide.notes_slide.notes_text_frame.text = ""
+                        removed = True
+                        break
+                    for shape in list(slide.shapes):
+                        name = str(getattr(shape, "name", ""))
+                        selected = (
+                            mutation == "table" and getattr(shape, "has_table", False)
+                        ) or (
+                            mutation == "image"
+                            and shape.shape_type == MSO_SHAPE_TYPE.PICTURE
+                            and not name.startswith("background:")
+                        )
+                        if selected:
+                            shape._element.getparent().remove(shape._element)
+                            removed = True
+                            break
+                    if removed:
+                        break
+                self.assertTrue(removed)
+                mutated = self.root / f"missing-{mutation}.pptx"
+                presentation.save(str(mutated))
+                report = exporter.inspect_pptx(
+                    mutated,
+                    expected_slide_count=18,
+                    native_contract=native_contract,
+                )
+                self.assertFalse(report["passed"], report)
+                self.assertIn(
+                    f"pptx_native_{mutation}",
+                    {issue["code"] for issue in report["issues"]},
+                )
 
     def test_pptx_font_sizes_use_the_same_144_pixel_canvas_scale_as_positions(self) -> None:
         from pptx import Presentation
@@ -527,25 +664,10 @@ class AutoDesignPptSkillTests(unittest.TestCase):
         (artifact / "assets").mkdir(exist_ok=True)
         (artifact / "assets" / "pixel.png").write_bytes(_png_bytes())
         plan = json.loads((run / "plan.json").read_text(encoding="utf-8"))
-        authored = _deck_html().replace(
+        authored = _deck_html_for_plan(plan).replace(
             "A concise source-backed explanation.",
             "AutoDesign reports a grounded result.",
         )
-        for slide in plan["slides"]:
-            index = slide["slide_index"]
-            authored = authored.replace(
-                f'data-slide-index="{index}" data-slide-role="evidence" '
-                'data-section="paper-talk" '
-                'data-assertion-title="The paper presents a grounded research finding."',
-                f'data-slide-index="{index}" data-slide-role="{slide["role"]}" '
-                f'data-section="{slide["chapter"]}" '
-                f'data-assertion-title="{slide["assertion_title"]}"',
-                1,
-            ).replace(
-                f"[Sources] ev-001 [Talk] Explain slide {index}.",
-                "[Sources] ev-001 [Talk] The paper presents a grounded research finding.",
-                1,
-            )
         (artifact / "deck.html").write_text(authored, encoding="utf-8")
 
         def fake_render(_html, *, qa_dir, **_kwargs):
@@ -676,6 +798,7 @@ class AutoDesignPptSkillTests(unittest.TestCase):
         pip_command = commands[1]
         self.assertIn("--require-hashes", pip_command)
         self.assertIn("--no-deps", pip_command)
+        self.assertIn("--no-compile", pip_command)
         self.assertIn("--requirement", pip_command)
         self.assertNotIn("python-pptx==1.0.2", pip_command)
 
@@ -707,6 +830,27 @@ class AutoDesignPptSkillTests(unittest.TestCase):
             self.assertRaisesRegex(setup.PptRuntimeError, "content hash|tree hash|tampered"),
         ):
             setup.inspect_runtime(cache, spec)
+
+    def test_ppt_runtime_fails_closed_when_bytecode_cache_appears(self) -> None:
+        setup = self._require(self.setup, SETUP_PATH)
+        spec = setup.runtime_spec(cache_root=self.root / "cache")
+        cache = spec.cache_dir
+        site = (
+            cache / "venv" / "Lib" / "site-packages"
+            if os.name == "nt"
+            else cache
+            / "venv"
+            / "lib"
+            / f"python{sys.version_info.major}.{sys.version_info.minor}"
+            / "site-packages"
+        )
+        site.mkdir(parents=True)
+        (site / "pptx.py").write_text("VERSION = 1\n", encoding="utf-8")
+        cache_dir = site / "__pycache__"
+        cache_dir.mkdir()
+        (cache_dir / "pptx.cpython-test.pyc").write_bytes(b"executable bytecode")
+        with self.assertRaisesRegex(setup.PptRuntimeError, "bytecode|__pycache__"):
+            setup._runtime_tree_sha256(cache)
 
     def test_ppt_runtime_lock_prevents_dual_holders_after_liveness_false_negative(self) -> None:
         setup = self._require(self.setup, SETUP_PATH)
@@ -860,21 +1004,107 @@ with module._runtime_lock(lock_path, 5.0):
 
     def test_passing_review_cannot_bypass_the_bound_minimum_scores(self) -> None:
         harness = self._require(self.harness, HARNESS_PATH)
-        scores = {dimension: 4 for dimension in harness.REVIEW_RUBRIC["dimensions"]}
-        scores["source_fidelity"] = 3
-        review_path = self.root / "review.json"
+        for invalid_score in (3, float("nan")):
+            with self.subTest(invalid_score=invalid_score):
+                scores = {
+                    dimension: 4 for dimension in harness.REVIEW_RUBRIC["dimensions"]
+                }
+                scores["source_fidelity"] = invalid_score
+                review_path = self.root / "review.json"
+                review_path.write_text(
+                    json.dumps({"verdict": "pass", "dimension_scores": scores}),
+                    encoding="utf-8",
+                )
+                args = SimpleNamespace(run_dir=self.root, attempt="01", review=review_path)
+                with (
+                    mock.patch.object(harness, "_resume", return_value={}),
+                    mock.patch.object(harness.portable, "record_semantic_review") as record,
+                    self.assertRaisesRegex(harness.PptHarnessError, "at least 4"),
+                ):
+                    harness._command_record_review(args)
+                record.assert_not_called()
+
+    def test_resume_rejects_a_persisted_passing_review_below_the_bound_minimum(self) -> None:
+        harness = self._require(self.harness, HARNESS_PATH)
+        attempt = "01"
+        review_path = self.root / "attempts" / attempt / "qa" / "semantic-review.json"
+        review_path.parent.mkdir(parents=True)
         review_path.write_text(
-            json.dumps({"verdict": "pass", "dimension_scores": scores}),
+            json.dumps(
+                {
+                    "verdict": "pass",
+                    "dimension_scores": {
+                        dimension: 1 for dimension in harness.REVIEW_RUBRIC["dimensions"]
+                    },
+                }
+            ),
             encoding="utf-8",
         )
-        args = SimpleNamespace(run_dir=self.root, attempt="01", review=review_path)
         with (
-            mock.patch.object(harness, "_resume", return_value={}),
-            mock.patch.object(harness.portable, "record_semantic_review") as record,
-            self.assertRaisesRegex(harness.PptHarnessError, "at least 4"),
+            mock.patch.object(
+                harness.portable,
+                "resume_run",
+                return_value={"state": "semantic_passed", "active_attempt": attempt},
+            ),
+            mock.patch.object(harness, "_verify_plan_binding"),
+            self.assertRaisesRegex(harness.PptHarnessError, "at least 4|minimum"),
         ):
-            harness._command_record_review(args)
-        record.assert_not_called()
+            harness._resume(self.root)
+
+    def test_resume_rejects_a_final_delivery_file_with_an_external_hardlink(self) -> None:
+        harness = self._require(self.harness, HARNESS_PATH)
+        delivered = self.root / "final" / "deck.pptx"
+        delivered.parent.mkdir(parents=True)
+        delivered.write_bytes(b"pptx")
+        os.link(delivered, self.root / "outside-copy.pptx")
+        with (
+            mock.patch.object(
+                harness.portable,
+                "resume_run",
+                return_value={"state": "finalized", "active_attempt": "01"},
+            ),
+            mock.patch.object(harness, "_verify_plan_binding"),
+            self.assertRaisesRegex(harness.PptHarnessError, "hardlink|link count"),
+        ):
+            harness._resume(self.root)
+
+    def test_final_delivery_exact_set_symlink_and_hardlink_are_rejected(self) -> None:
+        harness = self._require(self.harness, HARNESS_PATH)
+        final = self.root / "final"
+        final.mkdir()
+        deck = final / "deck.pptx"
+        deck.write_bytes(b"pptx")
+        harness.portable.atomic_write_json(
+            final / "delivery-manifest.json",
+            {
+                "format_version": 1,
+                "attempt_id": "01",
+                "verification_status": "verified",
+                "files": {"deck.pptx": harness.portable.sha256_file(deck)},
+            },
+        )
+        self.assertEqual(
+            harness.portable._verify_delivery(final)["files"],
+            {"deck.pptx": harness.portable.sha256_file(deck)},
+        )
+
+        extra = final / "unlisted.txt"
+        extra.write_text("extra\n", encoding="utf-8")
+        with self.assertRaisesRegex(Exception, "exactly match"):
+            harness.portable._verify_delivery(final)
+        extra.unlink()
+
+        outside = self.root / "outside.txt"
+        outside.write_text("outside\n", encoding="utf-8")
+        symlink = final / "linked.txt"
+        symlink.symlink_to(outside)
+        with self.assertRaisesRegex(Exception, "symlink|non-regular"):
+            harness.portable._verify_delivery(final)
+        symlink.unlink()
+
+        os.link(deck, self.root / "external-hardlink.pptx")
+        with self.assertRaisesRegex(harness.PptHarnessError, "hardlink|link count"):
+            harness._verify_final_delivery_links(self.root)
 
     @unittest.skipUnless(
         os.environ.get("AUTODESIGN_SKILL_REAL_PPT") == "1",
