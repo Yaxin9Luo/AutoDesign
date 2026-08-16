@@ -21,8 +21,14 @@ Write one JSON object:
     {"role": "takeaway", "purpose": "State a bounded conclusion and limitation."}
   ],
   "visual_allocations": [
-    {"visual_id": "vis-001", "role": "method"}
+    {"visual_id": "vis-001", "role": "method"},
+    {"visual_id": "vis-002", "role": "overview"},
+    {"visual_id": "vis-003", "role": "result"},
+    {"visual_id": "vis-004", "role": "comparison"},
+    {"visual_id": "vis-005", "role": "context"},
+    {"visual_id": "vis-006", "role": "supporting"}
   ],
+  "no_visual_fallback": null,
   "style_reference_ids": [],
   "max_attempts": 4
 }
@@ -37,7 +43,28 @@ requested size. `max_attempts` is 1–8.
 Allocate only content-eligible visuals and allowed roles from
 `evidence/source_visuals.json`. A style-reference ID cannot also be content.
 Style references remain in evidence context and are never staged into the
-artifact.
+artifact. The harness derives a distinct-visual target from the eligible catalog
+and canvas: six for wide landscape canvases and five otherwise, plus one at
+7,000,000 pixels and another at 12,000,000 pixels, capped at eight and always
+bounded by the number of eligible visuals. When distinct candidates permit it,
+cover both `method`/`overview` and `result`/`comparison`; do not fill the target
+with redundant views of one result.
+
+If the reviewed catalog has no eligible source visual or table, zero allocations
+are valid only with an explicit fallback:
+
+```json
+{
+  "no_visual_fallback": {
+    "reason": "The reviewed source catalog contains no eligible figures or tables.",
+    "strategy": "Use source-bound native tables and readouts; do not invent imagery."
+  }
+}
+```
+
+Do not use this fallback while an eligible source visual exists. A small catalog
+simply lowers the target to its available count; never invent, regenerate, or
+authorize an uncertain image to satisfy the floor.
 
 ## Authoring HTML
 
@@ -64,6 +91,11 @@ Create one standalone `artifact/poster.html` with:
   `data-source-ids="..."` set from its source-map entry;
 - every section/article grounded with `data-source-ids`; every source image
   identified with `data-source-id` and loaded from its staged local path;
+- each staged source figure/table placed as a primary local source-flow unit,
+  with a direct-sibling native readout tied to the same evidence. Preserve its
+  readable crop, axes, legends, labels, and table structure. A native table may
+  summarize or interpret an available source table but must not replace the
+  source evidence;
 - an exact dependency closure: every non-HTML file in the attempt artifact
   directory is referenced by the HTML, and every referenced file is local,
   present, non-symlinked, contained in that directory, and an approved image or

@@ -20,7 +20,10 @@ state inside this Skill directory.
 
 ## Execute
 
-Run `python "$SKILL_ROOT/scripts/poster_harness.py" --help` for exact flags.
+Resolve `<PY>` as the first available launcher in this order: `python3`,
+`python`, then Windows `py -3`. Substitute that launcher literally in every
+command. Run `<PY> "$SKILL_ROOT/scripts/poster_harness.py" --help` for exact
+flags.
 
 1. Run `doctor --install-browser`, then `init --run-dir "$RUN" --source "$PAPER"`.
    Add user-supplied content images with `--asset`; add poster references with
@@ -30,14 +33,22 @@ Run `python "$SKILL_ROOT/scripts/poster_harness.py" --help` for exact flags.
    limitations, and conclusions. For PDF visuals, inspect rendered source pages
    and candidate crops with the host VLM (or a fresh subagent), then submit a
    hash-bound authorization using `bind-visuals`. Do not authorize an uncertain
-   visual.
+   visual. Prefer the paper's framework, headline result/table, and distinct
+   ablation, analysis, or limitation evidence over prose-only panels.
 3. Write `plan.json` from the output contract and run `plan`. Honor an explicit
    user size. Otherwise use the 3072×1536 CVPR 84×42-inch default. Plan a dense
-   problem → method → evidence → takeaway story before styling.
+   problem → method → evidence → takeaway story before styling. Meet the
+   evidence- and canvas-conditioned visual target reported by the contract. If
+   the reviewed catalog genuinely has no eligible visual, record the explicit
+   `no_visual_fallback` reason and native-table/readout strategy; never invent an
+   image to meet the floor.
 4. Run `begin-attempt`. Read its `authoring-context.json`; author the requested
    `poster.html` yourself using only staged content visuals and grounded text.
-   Preserve native HTML text/tables and SVG text. Keep the header to title,
-   authors, and institutions only.
+   Make each source figure/table primary inside a local `.source-flow-unit` or
+   `.figure-flow-unit`, with its source-bound native readout as a direct sibling.
+   Preserve axes, labels, crops, native HTML tables, and SVG text; a native
+   summary may interpret source evidence but never replace it. Keep the header
+   to title, authors, and institutions only.
 5. Write the exact claim/source map, then run `validate`. Static gates run before
    the pinned, network-denied browser. Continue only when HTML, geometry,
    dependency closure, screen preview, PDF-raster preview, and the

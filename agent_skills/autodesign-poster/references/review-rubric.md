@@ -17,6 +17,12 @@ Return a failing verdict when any of these is visible or evidenced:
   figure, table, claim, or recognizable identity treatment used as content;
 - a key method or result is absent, the research arc is misleading, or the
   conclusion outruns the evidence;
+- the poster omits planned eligible source visuals, misses the required
+  method/overview or result/comparison coverage, or invokes a no-visual fallback
+  despite an eligible source figure/table;
+- a source figure/table is detached from its local source-flow readout, made an
+  unreadable thumbnail, stripped of needed axes/labels, or replaced by a native
+  reconstruction instead of preserved as evidence;
 - important text is illegible at full-poster view, overlaps, clips, or falls
   outside the canvas; a figure loses labels/legend/axes needed to understand it;
 - the output is a sparse landing page, a wallpaper of tiny paper screenshots,
@@ -37,7 +43,8 @@ Score every dimension from 1 to 5. Use 3 for competent but clearly improvable,
    evidence → takeaway has meaningful grouping, proportional panel space, and
    no dead zones, repeated boilerplate, or stranded bottom strips.
 3. `evidence_use`: Original figures/tables and native synthesis are correctly
-   selected, readable, source-bound, and integrated into the argument. Claims
+   selected, readable, source-bound, and integrated through coherent source-flow
+   units. Native readouts explain rather than replace source evidence; claims
    stay within the paper's facts and limitations.
 4. `human_effort_saved`: The poster is substantially ready for a real author to
    present, not merely a scaffold requiring wholesale rewriting, rearrangement,

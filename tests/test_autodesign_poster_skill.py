@@ -55,7 +55,15 @@ def _plan(*, preset: str = "cvpr-landscape", max_attempts: int = 4) -> dict[str,
             {"role": "takeaway", "purpose": "State the bounded conclusion."},
         ],
         "visual_allocations": [],
+        "no_visual_fallback": _no_visual_fallback(),
         "max_attempts": max_attempts,
+    }
+
+
+def _no_visual_fallback() -> dict[str, str]:
+    return {
+        "reason": "The reviewed source catalog contains no eligible figures or tables.",
+        "strategy": "Use source-bound native tables and readouts; do not invent imagery.",
     }
 
 
@@ -251,6 +259,103 @@ class AutoDesignPosterSkillTests(unittest.TestCase):
         broken["print"] = {"width_mm": 841.0, "height_mm": 1189.0}
         with self.assertRaisesRegex(harness.PosterContractError, "aspect ratio"):
             harness.normalize_plan(broken)
+
+    def test_plan_rejects_empty_allocations_when_eligible_visuals_exist(self) -> None:
+        harness = _load_harness()
+        run = self.root / "eligible-empty-run"
+        source = self.root / "paper.txt"
+        source.write_text("A paper with source-grounded visual evidence.", encoding="utf-8")
+        visual = self.root / "method.png"
+        visual.write_bytes(b"eligible-method-visual")
+        harness.initialize_poster_run(run, source, extra_assets=[visual])
+
+        plan = _plan()
+        plan["no_visual_fallback"] = None
+        with self.assertRaisesRegex(
+            harness.PosterContractError,
+            "requires 1 distinct eligible source visual",
+        ):
+            harness.save_poster_plan(run, plan)
+
+    def test_plan_allows_zero_visuals_only_with_explicit_native_fallback(self) -> None:
+        harness = _load_harness()
+        run = self.root / "no-eligible-run"
+        source = self.root / "paper.txt"
+        source.write_text("A paper with no extractable visual evidence.", encoding="utf-8")
+        harness.initialize_poster_run(run, source)
+
+        missing_fallback = _plan()
+        missing_fallback.pop("no_visual_fallback")
+        with self.assertRaisesRegex(harness.PosterContractError, "no_visual_fallback"):
+            harness.save_poster_plan(run, missing_fallback)
+
+        plan = _plan()
+        plan["no_visual_fallback"] = _no_visual_fallback()
+        saved = harness.save_poster_plan(run, plan)
+        self.assertEqual(saved["no_visual_fallback"], _no_visual_fallback())
+
+    def test_limited_eligible_catalog_uses_bounded_target_and_meaningful_roles(self) -> None:
+        harness = _load_harness()
+        run = self.root / "limited-eligible-run"
+        source = self.root / "paper.txt"
+        source.write_text("A paper with two reviewed source visuals.", encoding="utf-8")
+        visuals = []
+        for name in ("method.png", "result.png"):
+            visual = self.root / name
+            visual.write_bytes(name.encode("utf-8"))
+            visuals.append(visual)
+        harness.initialize_poster_run(run, source, extra_assets=visuals)
+
+        too_few = _plan()
+        too_few["no_visual_fallback"] = None
+        too_few["visual_allocations"] = [{"visual_id": "vis-001", "role": "method"}]
+        with self.assertRaisesRegex(
+            harness.PosterContractError,
+            "requires 2 distinct eligible source visuals",
+        ):
+            harness.save_poster_plan(run, too_few)
+
+        wrong_roles = _plan()
+        wrong_roles["no_visual_fallback"] = None
+        wrong_roles["visual_allocations"] = [
+            {"visual_id": "vis-001", "role": "method"},
+            {"visual_id": "vis-002", "role": "overview"},
+        ]
+        with self.assertRaisesRegex(harness.PosterContractError, "result/comparison"):
+            harness.save_poster_plan(run, wrong_roles)
+
+        plan = _plan()
+        plan["no_visual_fallback"] = None
+        plan["visual_allocations"] = [
+            {"visual_id": "vis-001", "role": "method"},
+            {"visual_id": "vis-002", "role": "result"},
+        ]
+        saved = harness.save_poster_plan(run, plan)
+        self.assertEqual(len(saved["visual_allocations"]), 2)
+        attempt = harness.begin_poster_attempt(run)
+        context = json.loads(
+            Path(attempt["authoring_context"]).read_text(encoding="utf-8")
+        )
+        self.assertEqual(context["visual_coverage"]["target_count"], 2)
+        self.assertEqual(
+            context["visual_coverage"]["required_role_groups"],
+            ["method/overview", "result/comparison"],
+        )
+
+    def test_skill_teaches_portable_python_resolution_and_source_flow_preservation(self) -> None:
+        skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        output_contract = (SKILL_ROOT / "references" / "output-contract.md").read_text(
+            encoding="utf-8"
+        )
+        review_rubric = (SKILL_ROOT / "references" / "review-rubric.md").read_text(
+            encoding="utf-8"
+        )
+        for launcher in ("`python3`", "`python`", "`py -3`"):
+            self.assertIn(launcher, skill)
+        self.assertIn(".source-flow-unit", skill)
+        self.assertIn("native readout", output_contract)
+        self.assertIn("must not replace", output_contract)
+        self.assertIn("source-flow", review_rubric)
 
     def test_static_lint_accepts_editable_grounded_poster_contract(self) -> None:
         harness = _load_harness()
@@ -500,6 +605,7 @@ class AutoDesignPosterSkillTests(unittest.TestCase):
         unsupported.write_text("measure,value\naccuracy,85\n", encoding="utf-8")
         harness.initialize_poster_run(run, source, extra_assets=[unsupported])
         plan = _plan()
+        plan["no_visual_fallback"] = None
         plan["visual_allocations"] = [{"visual_id": "vis-001", "role": "evidence"}]
         with self.assertRaisesRegex(harness.PosterContractError, "unsupported poster visual"):
             harness.save_poster_plan(run, plan)
@@ -707,6 +813,7 @@ class AutoDesignPosterSkillTests(unittest.TestCase):
             reference_images=[style_reference],
         )
         plan = _plan()
+        plan["no_visual_fallback"] = None
         plan["visual_allocations"] = [{"visual_id": "vis-001", "role": "method"}]
         harness.save_poster_plan(run, plan)
         attempt = harness.begin_poster_attempt(run)

@@ -89,9 +89,12 @@ _PLAN_KEYS = {
     "print",
     "narrative",
     "visual_allocations",
+    "no_visual_fallback",
     "style_reference_ids",
     "max_attempts",
 }
+_METHOD_VISUAL_ROLES = {"method", "overview"}
+_RESULT_VISUAL_ROLES = {"comparison", "result"}
 _ARC_GROUPS = {
     "problem": {"context", "introduction", "motivation", "problem"},
     "method": {"approach", "architecture", "method", "system"},
@@ -323,6 +326,22 @@ def _narrative_roles(value: Any) -> list[dict[str, str]]:
     return sections
 
 
+def _normalize_no_visual_fallback(value: Any) -> dict[str, str] | None:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping) or set(value) != {"reason", "strategy"}:
+        raise PosterContractError(
+            "no_visual_fallback requires exactly reason and strategy"
+        )
+    reason = str(value.get("reason") or "").strip()
+    strategy = str(value.get("strategy") or "").strip()
+    if len(reason) < 16 or len(strategy) < 16:
+        raise PosterContractError(
+            "no_visual_fallback reason and strategy must be explicit"
+        )
+    return {"reason": reason, "strategy": strategy}
+
+
 def normalize_plan(payload: Mapping[str, Any]) -> dict[str, Any]:
     """Normalize and validate a fixed-canvas poster plan."""
 
@@ -388,6 +407,9 @@ def normalize_plan(payload: Mapping[str, Any]) -> dict[str, Any]:
             {"visual_id": str(item["visual_id"]), "role": str(item["role"])}
             for item in allocations
         ],
+        "no_visual_fallback": _normalize_no_visual_fallback(
+            value.get("no_visual_fallback")
+        ),
         "style_reference_ids": list(references),
         "max_attempts": max_attempts,
     }
@@ -421,6 +443,106 @@ def initialize_poster_run(
     }
 
 
+def _eligible_poster_visuals(catalog: Mapping[str, Any]) -> list[dict[str, Any]]:
+    visuals = catalog.get("visuals", [])
+    if not isinstance(visuals, list):
+        raise PosterContractError("source visual catalog requires a visuals list")
+    return [
+        dict(item)
+        for item in visuals
+        if isinstance(item, Mapping)
+        and item.get("eligibility") == "eligible"
+        and Path(str(item.get("path") or "")).suffix.lower()
+        in SUPPORTED_IMAGE_SUFFIXES
+        and isinstance(item.get("allowed_content_roles"), list)
+        and item.get("allowed_content_roles")
+    ]
+
+
+def _visual_coverage_requirement(
+    plan: Mapping[str, Any], catalog: Mapping[str, Any]
+) -> dict[str, Any]:
+    eligible = _eligible_poster_visuals(catalog)
+    canvas = plan["canvas"]
+    width = int(canvas["width_px"])
+    height = int(canvas["height_px"])
+    aspect_ratio = width / height
+    recommended = 6 if aspect_ratio >= 1.5 else 5
+    if width * height >= 7_000_000:
+        recommended += 1
+    if width * height >= 12_000_000:
+        recommended += 1
+    target = min(len(eligible), min(recommended, 8))
+    method_ids = {
+        str(item.get("id") or "")
+        for item in eligible
+        if set(item.get("allowed_content_roles", [])).intersection(
+            _METHOD_VISUAL_ROLES
+        )
+    }
+    result_ids = {
+        str(item.get("id") or "")
+        for item in eligible
+        if set(item.get("allowed_content_roles", [])).intersection(
+            _RESULT_VISUAL_ROLES
+        )
+    }
+    distinct_method_result_pair = any(
+        method_id != result_id
+        for method_id in method_ids
+        for result_id in result_ids
+    )
+    required_role_groups = (
+        ["method/overview", "result/comparison"]
+        if target >= 2 and distinct_method_result_pair
+        else []
+    )
+    return {
+        "eligible_count": len(eligible),
+        "target_count": target,
+        "recommended_for_canvas": min(recommended, 8),
+        "required_role_groups": required_role_groups,
+    }
+
+
+def _validate_visual_coverage(
+    plan: Mapping[str, Any], catalog: Mapping[str, Any]
+) -> dict[str, Any]:
+    requirement = _visual_coverage_requirement(plan, catalog)
+    allocations = [dict(item) for item in plan["visual_allocations"]]
+    fallback = plan.get("no_visual_fallback")
+    if requirement["eligible_count"] == 0:
+        if fallback is None:
+            raise PosterContractError(
+                "no_visual_fallback is required when the reviewed catalog has "
+                "no eligible source visuals or tables"
+            )
+        return requirement
+    if fallback is not None:
+        raise PosterContractError(
+            "no_visual_fallback is allowed only when no eligible source visuals exist"
+        )
+    allocated_ids = {str(item["visual_id"]) for item in allocations}
+    target = int(requirement["target_count"])
+    if len(allocated_ids) < target:
+        noun = "visual" if target == 1 else "visuals"
+        raise PosterContractError(
+            f"poster plan requires {target} distinct eligible source {noun} for "
+            "this reviewed catalog and canvas"
+        )
+    if requirement["required_role_groups"]:
+        roles = {str(item["role"]) for item in allocations}
+        if not roles.intersection(_METHOD_VISUAL_ROLES):
+            raise PosterContractError(
+                "poster visual coverage requires a method/overview allocation"
+            )
+        if not roles.intersection(_RESULT_VISUAL_ROLES):
+            raise PosterContractError(
+                "poster visual coverage requires a result/comparison allocation"
+            )
+    return requirement
+
+
 def save_poster_plan(run_dir: Path | str, payload: Mapping[str, Any]) -> dict[str, Any]:
     plan = normalize_plan(payload)
     catalog = _read_json_object(Path(run_dir) / "evidence" / "source_visuals.json")
@@ -446,6 +568,7 @@ def save_poster_plan(run_dir: Path | str, payload: Mapping[str, Any]) -> dict[st
     overlap = allocated.intersection(plan["style_reference_ids"])
     if overlap:
         raise PosterContractError(f"style-only references cannot be content assets: {', '.join(sorted(overlap))}")
+    _validate_visual_coverage(plan, catalog)
     return core.save_plan(run_dir, plan)
 
 
@@ -510,6 +633,7 @@ def begin_poster_attempt(run_dir: Path | str) -> dict[str, Any]:
         "attempt_id": attempt_id,
         "poster_path": "artifact/poster.html",
         "plan": plan,
+        "visual_coverage": _visual_coverage_requirement(plan, catalog),
         "staged_content_visuals": staged,
         "style_references": style_references,
     }
