@@ -30,6 +30,9 @@ Fail before scoring when any of these is visible or evidenced:
   claim IDs that differ from the plan, generated pseudo-element prose, or a
   thesis marker that is not itself the exact thesis claim, including equivalent
   text or claim mutation injected after load;
+- a full narrative claim repeated across sections, or a `data-claim-ref` that
+  repeats claim text, points anywhere except the claim-owning section, or drifts
+  from its declared section after load;
 - paint-transparent, background-matched, clipped, masked, transformed-away,
   effectively transparent, or collapsed evidence in either the no-JS or
   JavaScript-enabled state;

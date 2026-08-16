@@ -421,10 +421,16 @@ def validate_webpage_plan(run_dir: Path | str, plan: Mapping[str, Any]) -> dict[
     section_ids: list[str] = []
     section_roles: list[str] = []
     planned_claim_ids: set[str] = set()
+    claim_owner: dict[str, str] = {}
+    planned_claim_refs: list[tuple[str, str]] = []
     for section in sections:
         if not isinstance(section, dict):
             raise WebpageContractError("each section must be an object")
-        if set(section) != {"id", "role", "claim_ids"}:
+        required_section_fields = {"id", "role", "claim_ids"}
+        if not required_section_fields.issubset(section) or set(section) - {
+            *required_section_fields,
+            "claim_refs",
+        }:
             raise WebpageContractError("section has unknown or incomplete fields")
         section_id = str(section.get("id") or "").strip()
         role = str(section.get("role") or "").strip()
@@ -437,7 +443,25 @@ def validate_webpage_plan(run_dir: Path | str, plan: Mapping[str, Any]) -> dict[
             f"section {section_id} claim_ids",
             allow_empty=True,
         )
+        claim_refs = _strings(
+            section.get("claim_refs", []),
+            f"section {section_id} claim_refs",
+            allow_empty=True,
+        )
+        if set(claim_ids).intersection(claim_refs):
+            raise WebpageContractError(
+                "a section cannot narrate and reference the same claim"
+            )
+        duplicate_claims = sorted(set(claim_ids).intersection(planned_claim_ids))
+        if duplicate_claims:
+            raise WebpageContractError(
+                "narrative claim ids must be globally unique across sections: "
+                + ", ".join(duplicate_claims)
+            )
+        for claim_id in claim_ids:
+            claim_owner[claim_id] = section_id
         planned_claim_ids.update(claim_ids)
+        planned_claim_refs.extend((section_id, claim_id) for claim_id in claim_refs)
         section_ids.append(section_id)
         section_roles.append(role)
     if len(set(section_ids)) != len(section_ids) or len(set(section_roles)) != len(section_roles):
@@ -450,6 +474,16 @@ def validate_webpage_plan(run_dir: Path | str, plan: Mapping[str, Any]) -> dict[
     required_positions = [section_roles.index(role) for role in REQUIRED_SECTION_ROLES]
     if required_positions != sorted(required_positions):
         raise WebpageContractError("research sections must follow the evidence-first narrative order")
+    for section_id, claim_id in planned_claim_refs:
+        owner = claim_owner.get(claim_id)
+        if owner is None:
+            raise WebpageContractError(
+                f"claim reference {claim_id} is not a planned narrative claim"
+            )
+        if owner == section_id:
+            raise WebpageContractError(
+                f"claim reference {claim_id} must point to another narrative section"
+            )
     identity_claims = set(
         sections[section_roles.index("identity")].get("claim_ids", [])
     )
@@ -925,17 +959,37 @@ def validate_webpage_html(run_dir: Path | str, attempt_id: str) -> dict[str, Any
             for claim in source_map.get("claims", [])
             if isinstance(claim, dict) and claim.get("id")
         }
-    planned_claims = {
-        claim_id
+    planned_claim_owner = {
+        str(claim_id): str(section["id"])
         for section in plan["sections"]
         for claim_id in section.get("claim_ids", [])
-    } | {str(plan["title_claim_id"]), str(plan["thesis_claim_id"])}
+    }
+    planned_claims = set(planned_claim_owner) | {
+        str(plan["title_claim_id"]),
+        str(plan["thesis_claim_id"]),
+    }
     missing_claims = sorted(planned_claims - set(source_claims))
     if missing_claims:
         findings.append(_finding("plan_claim_missing_from_source_map", "planned claims are not source mapped", ids=missing_claims))
     html_claims = {
         claim_id for node in nodes for claim_id in _attr_tokens(node, "data-claim-id")
     }
+    claim_occurrences = Counter(
+        claim_id for node in nodes for claim_id in _attr_tokens(node, "data-claim-id")
+    )
+    duplicate_claims = sorted(
+        claim_id
+        for claim_id in planned_claims
+        if claim_occurrences.get(claim_id, 0) > 1
+    )
+    if duplicate_claims:
+        findings.append(
+            _finding(
+                "duplicate_narrative_claim",
+                "each source claim must be narrated exactly once; use data-claim-ref for a lightweight cross-reference",
+                ids=duplicate_claims,
+            )
+        )
     unknown_html_claims = sorted(html_claims - set(source_claims))
     if unknown_html_claims:
         findings.append(_finding("unknown_html_claim", "HTML references unknown claim ids", ids=unknown_html_claims))
@@ -973,6 +1027,109 @@ def validate_webpage_html(run_dir: Path | str, attempt_id: str) -> dict[str, Any
                     line=node.line,
                 )
             )
+    claim_text_to_id = {
+        _normalized_claim_text(str(claim.get("text") or "")): claim_id
+        for claim_id, claim in source_claims.items()
+        if _normalized_claim_text(str(claim.get("text") or ""))
+    }
+    for node in nodes:
+        if (
+            _inside_tag(node, {"head", "script", "style", "template", "noscript"})
+            or _bound_claim_ancestor(node) is not None
+            or any(
+                _attr_tokens(descendant, "data-claim-id")
+                for descendant in node.descendants()
+            )
+        ):
+            continue
+        repeated_text = _normalized_claim_text(
+            node.text(omit_tags={"script", "style", "template", "noscript"})
+        )
+        repeated_claim = next(
+            (
+                claim_id
+                for claim_text, claim_id in claim_text_to_id.items()
+                if claim_text in repeated_text
+            ),
+            None,
+        )
+        if repeated_claim is not None:
+            findings.append(
+                _finding(
+                    "repeated_narrative_text",
+                    "source claim text may appear only in its single data-claim-id narrative node",
+                    claim_id=repeated_claim,
+                    line=node.line,
+                )
+            )
+    planned_reference_counts = Counter(
+        (str(section["id"]), str(claim_id))
+        for section in plan["sections"]
+        for claim_id in section.get("claim_refs", [])
+    )
+    actual_reference_counts: Counter[tuple[str, str]] = Counter()
+    for node in nodes:
+        reference_ids = sorted(_attr_tokens(node, "data-claim-ref"))
+        if not reference_ids:
+            continue
+        section = node
+        while section is not None and section.tag != "#document":
+            if section.attrs.get("data-section-role", "").strip():
+                break
+            section = section.parent
+        section_id = section.attrs.get("id", "") if section is not None else ""
+        if len(reference_ids) != 1:
+            findings.append(
+                _finding(
+                    "claim_reference_mismatch",
+                    "each explicit claim reference must bind exactly one planned claim",
+                    ids=reference_ids,
+                    line=node.line,
+                )
+            )
+            continue
+        claim_id = reference_ids[0]
+        actual_reference_counts[(section_id, claim_id)] += 1
+        expected_target = planned_claim_owner.get(claim_id)
+        reference_text = _normalized_claim_text(
+            node.text(omit_tags={"script", "style", "template", "noscript"})
+        )
+        source_text = _normalized_claim_text(
+            str(source_claims.get(claim_id, {}).get("text") or "")
+        )
+        if reference_text and source_text and source_text in reference_text:
+            findings.append(
+                _finding(
+                    "claim_reference_repeats_narrative",
+                    "data-claim-ref must be a lightweight cross-reference, not a second copy of the claim text",
+                    claim_id=claim_id,
+                    line=node.line,
+                )
+            )
+        if (
+            node.tag != "a"
+            or bool(_attr_tokens(node, "data-claim-id"))
+            or not reference_text
+            or expected_target is None
+            or node.attrs.get("href") != f"#{expected_target}"
+        ):
+            findings.append(
+                _finding(
+                    "claim_reference_mismatch",
+                    "data-claim-ref must be a visible internal link to the claim's narrative section",
+                    claim_id=claim_id,
+                    line=node.line,
+                )
+            )
+    if actual_reference_counts != planned_reference_counts:
+        findings.append(
+            _finding(
+                "claim_reference_mismatch",
+                "render each planned claim reference exactly once in its declared section",
+                expected=sorted(planned_reference_counts.elements()),
+                actual=sorted(actual_reference_counts.elements()),
+            )
+        )
     for node in nodes:
         assertion_kind = _visible_assertion_kind(node)
         if assertion_kind and _bound_claim_ancestor(node) is None:
@@ -1024,6 +1181,22 @@ def validate_webpage_html(run_dir: Path | str, attempt_id: str) -> dict[str, Any
                     role=role,
                     missing=sorted(expected_claims - actual_claims),
                     unexpected=sorted(actual_claims - expected_claims),
+                )
+            )
+        actual_refs = {
+            claim_id
+            for node in [section_node, *section_node.descendants()]
+            for claim_id in _attr_tokens(node, "data-claim-ref")
+        }
+        expected_refs = set(planned_section.get("claim_refs", []))
+        if actual_refs != expected_refs:
+            findings.append(
+                _finding(
+                    "claim_reference_mismatch",
+                    f"{role} must render exactly its planned lightweight claim references",
+                    role=role,
+                    missing=sorted(expected_refs - actual_refs),
+                    unexpected=sorted(actual_refs - expected_refs),
                 )
             )
     visible_roles = [
@@ -1582,13 +1755,24 @@ DOM_AUDIT = r"""contract => {
   const textPainted=el=>{const walker=document.createTreeWalker(el,NodeFilter.SHOW_TEXT);let node,seen=false;while((node=walker.nextNode())){if(!String(node.data||'').trim())continue;seen=true;if(!textNodePainted(node))return false;}return seen;};
   const visible=(el,text=false)=>Boolean(visibleRect(el))&&(!text||textPainted(el));
   const expected=new Map((contract.source_claims||[]).map(item=>[String(item.id),normalized(item.text)]));
+  const sections=contract.sections||[],claimOwner=new Map();
+  for(const section of sections){for(const id of section.claim_ids||[])claimOwner.set(String(id),String(section.id));}
+  const narrativeClaims=new Set(claimOwner.keys());
   const claimNodes=[...document.querySelectorAll('[data-claim-id]')];
-  const claimsExact=claimNodes.every(el=>{const ids=tokens(el,'data-claim-id');return visible(el,true)&&ids.length===1&&expected.has(ids[0])&&normalized(el.innerText)===expected.get(ids[0]);})&&[...expected].every(([id])=>claimNodes.some(el=>tokens(el,'data-claim-id').includes(id)));
-  const sections=contract.sections||[],roots=[...document.querySelectorAll('[data-section-role]')];
+  const claimsExact=claimNodes.length===narrativeClaims.size&&claimNodes.every(el=>{const ids=tokens(el,'data-claim-id');return visible(el,true)&&ids.length===1&&narrativeClaims.has(ids[0])&&expected.has(ids[0])&&normalized(el.innerText)===expected.get(ids[0]);})&&[...narrativeClaims].every(id=>claimNodes.filter(el=>tokens(el,'data-claim-id').includes(id)).length===1);
+  const expectedReferenceCounts=new Map();
+  for(const section of sections){for(const id of section.claim_refs||[]){const key=String(section.id)+'\u0000'+String(id);expectedReferenceCounts.set(key,(expectedReferenceCounts.get(key)||0)+1);}}
+  const actualReferenceCounts=new Map(),referenceNodes=[...document.querySelectorAll('[data-claim-ref]')];
+  const referencesExact=referenceNodes.length===[...expectedReferenceCounts.values()].reduce((total,count)=>total+count,0)&&referenceNodes.every(el=>{
+    const ids=tokens(el,'data-claim-ref'),section=el.closest('[data-section-role]');if(ids.length!==1||!section||el.tagName!=='A'||tokens(el,'data-claim-id').length||!visible(el,true))return false;
+    const id=ids[0],owner=claimOwner.get(id),text=normalized(el.innerText),key=String(section.id)+'\u0000'+id;actualReferenceCounts.set(key,(actualReferenceCounts.get(key)||0)+1);
+    return expected.has(id)&&owner&&el.getAttribute('href')==='#'+owner&&text&&!text.includes(expected.get(id));
+  })&&actualReferenceCounts.size===expectedReferenceCounts.size&&[...expectedReferenceCounts].every(([key,count])=>actualReferenceCounts.get(key)===count);
+  const roots=[...document.querySelectorAll('[data-section-role]')];
   const sectionsExact=roots.length===sections.length&&sections.every((section,index)=>{
     const root=roots[index];if(root.id!==section.id||root.getAttribute('data-section-role')!==section.role||!visible(root))return false;
-    const actual=new Set([root,...root.querySelectorAll('[data-claim-id]')].flatMap(el=>tokens(el,'data-claim-id')));
-    return sameSet(actual,new Set(section.claim_ids||[]));
+    const actualClaims=new Set([root,...root.querySelectorAll('[data-claim-id]')].flatMap(el=>tokens(el,'data-claim-id'))),actualRefs=new Set([root,...root.querySelectorAll('[data-claim-ref]')].flatMap(el=>tokens(el,'data-claim-ref')));
+    return sameSet(actualClaims,new Set(section.claim_ids||[]))&&sameSet(actualRefs,new Set(section.claim_refs||[]));
   });
   const h1=[...document.querySelectorAll('h1')];
   const titleExact=h1.length===1&&tokens(h1[0],'data-claim-id').length===1&&tokens(h1[0],'data-claim-id')[0]===contract.title_claim_id&&expected.has(contract.title_claim_id)&&visible(h1[0],true);
@@ -1597,6 +1781,7 @@ DOM_AUDIT = r"""contract => {
   const bodyNodes=[document.body,...document.body.querySelectorAll('*')];
   const inlineHandlersSafe=bodyNodes.every(el=>[...el.attributes].every(attribute=>!/^on/i.test(attribute.name)));
   const pseudoSafe=bodyNodes.every(el=>['::before','::after'].every(pseudo=>{const content=getComputedStyle(el,pseudo).content;return !content||['none','normal','\"\"',"''"].includes(content);}));
+  const repeatedNarrativeText=bodyNodes.some(el=>{const text=normalized(el.innerText);return !el.closest('[data-claim-id]')&&!el.querySelector('[data-claim-id]')&&visible(el,true)&&[...expected.values()].some(claim=>claim&&text.includes(claim));});
   const formula=/(?:\\\(|\\\[|\$[^$\n]+\$|\\(?:frac|sum|prod|sqrt|int)\b|[∑∏√∫≈≠≤≥±]|\b[A-Za-z][A-Za-z0-9_]*\s*(?:=|<=|>=|<|>)\s*[^,.;:]+|\^[{]?[-+]?\d)/i;
   const assertion=/(?:https?:\/\/[^\s<>\"']+|(?<![\w])[-+]?\d[\d,]*(?:\.\d+)?(?:\s*[%‰])?)/i;
   const unboundWalker=document.createTreeWalker(document.body,NodeFilter.SHOW_TEXT);let unboundNode,unboundText='';
@@ -1622,9 +1807,9 @@ DOM_AUDIT = r"""contract => {
   const identity=document.querySelector('[data-section-role="identity"]');
   const aboveFold=el=>{if(!visible(el))return false;const rect=el.getBoundingClientRect(),width=Math.max(0,Math.min(rect.right,innerWidth)-Math.max(rect.left,0)),height=Math.max(0,Math.min(rect.bottom,innerHeight)-Math.max(rect.top,0));return width>=Math.min(rect.width,innerWidth)*.5&&height>=Math.min(rect.height,innerHeight)*.5;};
   const identityAboveFold=aboveFold(identity)&&aboveFold(h1[0])&&aboveFold(thesis[0]);
-  const sourceGrounding=claimsExact&&unboundAssertionsSafe&&pseudoSafe;
-  const contractIntact=sectionsExact&&titleExact&&thesisExact&&inlineHandlersSafe&&visualsExact&&missingExact&&interactionsExact;
-  return {passed:sourceGrounding&&contractIntact,sourceGrounding,contractIntact,identityAboveFold,checks:{claimsExact,sectionsExact,titleExact,thesisExact,inlineHandlersSafe,pseudoSafe,unboundAssertionsSafe,visualsExact,missingExact,interactionsExact}};
+  const sourceGrounding=claimsExact&&!repeatedNarrativeText&&unboundAssertionsSafe&&pseudoSafe;
+  const contractIntact=claimsExact&&referencesExact&&sectionsExact&&titleExact&&thesisExact&&inlineHandlersSafe&&visualsExact&&missingExact&&interactionsExact;
+  return {passed:sourceGrounding&&contractIntact,sourceGrounding,contractIntact,identityAboveFold,checks:{claimsExact,referencesExact,repeatedNarrativeText,sectionsExact,titleExact,thesisExact,inlineHandlersSafe,pseudoSafe,unboundAssertionsSafe,visualsExact,missingExact,interactionsExact}};
 }"""
 
 def inside(path, root):
@@ -2134,7 +2319,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         else:
             value = resume_webpage_run(args.run_dir)
         _emit(value)
-        return 0
+        return 2 if args.command == "doctor" and value.get("status") != "ready" else 0
     except WebpageBlockedError as error:
         print(f"BLOCKED: {portable.redact_secrets(str(error))}", file=sys.stderr)
         return 2

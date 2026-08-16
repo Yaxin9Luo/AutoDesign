@@ -50,6 +50,9 @@ and citation. Add at least one source-bound `inspect` or `compare` interaction;
 navigation alone is not meaningful. Copy the user's actual request into
 `plan.brief`, including its language, audience, emphasis, and visual constraints.
 Declare unavailable metadata truthfully.
+Assign each full narrative claim to exactly one section. When another section
+needs to point back to it, use that section's `claim_refs` plan field rather
+than repeating the claim.
 
 ```bash
 python3 "$HARNESS" plan --run-dir "$RUN_DIR" --plan-json plan.json
@@ -70,7 +73,10 @@ binding exactly match that claim's source-map text. Bind source visuals with
 `data-source-id`, sections with `data-section-role`, and interactions with the
 IDs and accessible state in the plan. Every section must contain exactly its
 planned claim IDs; the thesis marker must itself be the exact thesis claim
-node. Put every visible number, URL, or formula inside an exact claim binding.
+node. A full claim may appear only once across the page. Render a planned
+cross-reference as a short visible `<a data-claim-ref="..." href="#owner-section">`
+label; never attach `data-claim-id` to it or repeat the source claim text. Put
+every visible number, URL, or formula inside an exact claim binding.
 Do not synthesize visible text with CSS pseudo-elements, duplicate attributes,
 or inline `on*` handlers, including through runtime DOM/style injection. Scripts
 must not mutate exact claim text after load. Copy no text, logos, claims,

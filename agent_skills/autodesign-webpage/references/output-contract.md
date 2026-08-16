@@ -19,7 +19,7 @@ harness rejects unknown, incomplete, stale, symlinked, or hash-drifted inputs.
     {"id": "identity", "role": "identity", "claim_ids": ["claim-title", "claim-thesis"]},
     {"id": "abstract", "role": "abstract", "claim_ids": ["claim-abstract"]},
     {"id": "method", "role": "method", "claim_ids": ["claim-method"]},
-    {"id": "evidence", "role": "evidence", "claim_ids": ["claim-method"]},
+    {"id": "evidence", "role": "evidence", "claim_ids": [], "claim_refs": ["claim-method"]},
     {"id": "results", "role": "results", "claim_ids": ["claim-results"]},
     {"id": "limitations", "role": "limitations", "claim_ids": ["claim-limitations"]},
     {"id": "resources", "role": "resources", "claim_ids": ["claim-paper-url"]},
@@ -46,11 +46,18 @@ harness rejects unknown, incomplete, stale, symlinked, or hash-drifted inputs.
 ```
 
 The eight roles are required once each, in the shown order. Section IDs,
-interaction IDs, controls, and targets are stable HTML identifiers. The plan
-needs at least one `inspect` or `compare` interaction bound to claims declared
-by the section plan or to approved visuals. Every interaction claim must also
-exist in the attempt source map. `navigate` may supplement it. Valid state
-attributes are `aria-current`, `aria-expanded`, `aria-pressed`,
+interaction IDs, controls, and targets are stable HTML identifiers. Every
+`claim_ids` value is a full narrative claim and must occur in exactly one
+section globally. To point back to a claim from another section, declare its ID
+in that section's optional `claim_refs` list and render one lightweight internal
+link such as `<a data-claim-ref="claim-method" href="#method">Review the method
+above</a>`. A claim reference must target the section that owns the full claim;
+it must not repeat the claim text or carry `data-claim-id`.
+
+The plan needs at least one `inspect` or `compare` interaction bound to claims
+declared by the section plan or to approved visuals. Every interaction claim
+must also exist in the attempt source map. `navigate` may supplement it. Valid
+state attributes are `aria-current`, `aria-expanded`, `aria-pressed`,
 `aria-selected`, `data-active`, and `data-state`. `max_attempts` is 1-6.
 
 Copy the user's actual request into `brief`; do not silently replace its
@@ -104,11 +111,16 @@ written by the harness itself.
   1440 x 1000 desktop viewport. Each container must render exactly its planned
   claim-ID set. The element carrying `data-thesis-claim-id` must itself carry
   exactly the thesis `data-claim-id`. Mark every visible source claim with one
-  `data-claim-id`; after whitespace normalization its visible text must exactly
-  equal that source-map claim's text. Any visible numeric, URL, or formula
-  assertion must be inside such an exact binding. Non-empty `::before`/`::after`
-  content is forbidden. Runtime scripts may not mutate exact claim text or
-  inject unbound assertions/pseudo-element text after the static audit.
+  `data-claim-id` exactly once across the whole document; after whitespace
+  normalization its visible text must exactly equal that source-map claim's
+  text. Render every planned `claim_refs` entry exactly once in its declared
+  section as a visible internal `a[data-claim-ref]` to the section that owns the
+  full claim. Reference text must be a short navigational label, never a second
+  copy of the claim. Any visible numeric, URL, or formula assertion must be
+  inside an exact narrative binding. Non-empty `::before`/`::after` content is
+  forbidden. Runtime scripts may not mutate exact claim text, duplicate a
+  narrative claim, alter claim-reference binding, or inject unbound
+  assertions/pseudo-element text after the static audit.
 - Write each unavailable field in visible native text and tag it with
   `data-missing-metadata`. The marker set must exactly equal the plan.
 - Mark a staged evidence image with `data-source-id` on the `img`, `source`, or

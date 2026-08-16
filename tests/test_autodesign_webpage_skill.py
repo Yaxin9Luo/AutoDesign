@@ -110,7 +110,12 @@ def _plan() -> dict[str, object]:
             {"id": "identity", "role": "identity", "claim_ids": ["claim-title", "claim-thesis"]},
             {"id": "abstract", "role": "abstract", "claim_ids": ["claim-abstract"]},
             {"id": "method", "role": "method", "claim_ids": ["claim-method"]},
-            {"id": "evidence", "role": "evidence", "claim_ids": ["claim-method"]},
+            {
+                "id": "evidence",
+                "role": "evidence",
+                "claim_ids": [],
+                "claim_refs": ["claim-method"],
+            },
             {"id": "results", "role": "results", "claim_ids": ["claim-results"]},
             {"id": "limitations", "role": "limitations", "claim_ids": ["claim-limitations"]},
             {"id": "resources", "role": "resources", "claim_ids": ["claim-resource"]},
@@ -196,7 +201,7 @@ def _valid_html(asset_path: str = "assets/vis-001.svg") -> str:
     <button id="inspect-method-control" type="button" data-interaction-id="inspect-method" aria-controls="method-figure" aria-pressed="false">Inspect the source method figure</button>
     <figure id="method-figure" data-source-id="vis-001"><img src="{asset_path}" data-source-id="vis-001" alt="Three-stage Atlas method pipeline"><figcaption>Source method overview linked to claim-method.</figcaption></figure>
     <p>{filler}</p></section>
-  <section id="evidence" data-section-role="evidence"><h2>Evidence map</h2><p data-claim-id="claim-method">The method plans the research story, composes source-bound sections, and validates the rendered page.</p><p>{filler}</p></section>
+  <section id="evidence" data-section-role="evidence"><h2>Evidence map</h2><p><a data-claim-ref="claim-method" href="#method">Review the source-backed method above</a></p><p>{filler}</p></section>
   <section id="results" data-section-role="results"><h2>Results</h2><p data-claim-id="claim-results">Atlas improved evidence coverage from 62% to 91% on the synthetic evaluation.</p><table><caption>Source-backed evidence coverage</caption><thead><tr><th>System</th><th>Coverage</th></tr></thead><tbody><tr><td>Baseline</td><td>Reported in the source result</td></tr><tr><td>Atlas</td><td>Reported in the source result</td></tr></tbody></table><p>{filler}</p></section>
   <section id="limitations" data-section-role="limitations"><h2>Limitations</h2><p data-claim-id="claim-limitations">The synthetic evaluation is small and browser coverage is limited to Chromium.</p><p>{filler}</p></section>
   <section id="resources" data-section-role="resources"><h2>Resources</h2><p data-claim-id="claim-resource">The paper resource is https://example.org/atlas-paper.</p><div class="resource-list"><a data-resource-link="Paper" href="https://example.org/atlas-paper" rel="noopener">Paper</a></div>
@@ -340,6 +345,27 @@ class WebpageSkillTest(unittest.TestCase):
         with self.assertRaisesRegex(self.harness.WebpageContractError, "unknown fields"):
             self.harness.validate_webpage_plan(self.run, plan)
 
+    def test_plan_rejects_duplicate_narrative_claim_ids_across_sections(self) -> None:
+        plan = _plan()
+        evidence = next(
+            section for section in plan["sections"] if section["role"] == "evidence"
+        )
+        evidence["claim_ids"] = ["claim-method"]
+        evidence.pop("claim_refs")
+        with self.assertRaisesRegex(
+            self.harness.WebpageContractError, "narrative claim ids must be globally unique"
+        ):
+            self.harness.validate_webpage_plan(self.run, plan)
+
+    def test_plan_accepts_an_explicit_non_narrative_claim_reference(self) -> None:
+        validated = self.harness.validate_webpage_plan(self.run, _plan())
+
+        evidence = next(
+            section for section in validated["sections"] if section["role"] == "evidence"
+        )
+        self.assertEqual(evidence["claim_ids"], [])
+        self.assertEqual(evidence["claim_refs"], ["claim-method"])
+
     def test_plan_rejects_interaction_claims_outside_the_section_plan(self) -> None:
         plan = _plan()
         plan["interactions"][0]["claim_ids"] = ["claim-invented"]
@@ -457,8 +483,8 @@ class WebpageSkillTest(unittest.TestCase):
         path = self.run / "attempts" / attempt_id / "artifact" / "index.html"
         path.write_text(
             path.read_text(encoding="utf-8").replace(
-                '<section id="evidence" data-section-role="evidence"><h2>Evidence map</h2><p data-claim-id="claim-method">',
-                '<section id="evidence" data-section-role="evidence"><h2>Evidence map</h2><p>',
+                '<p data-claim-id="claim-results">Atlas improved evidence coverage',
+                '<p>Atlas improved evidence coverage',
                 1,
             ),
             encoding="utf-8",
@@ -474,7 +500,12 @@ class WebpageSkillTest(unittest.TestCase):
     def test_static_contract_requires_every_planned_section(self) -> None:
         plan = _plan()
         plan["sections"].append(
-            {"id": "appendix", "role": "appendix", "claim_ids": ["claim-results"]}
+            {
+                "id": "appendix",
+                "role": "appendix",
+                "claim_ids": [],
+                "claim_refs": ["claim-results"],
+            }
         )
         self.harness.save_webpage_plan(self.run, plan)
         attempt_id = self.harness.begin_webpage_attempt(self.run)
@@ -689,6 +720,24 @@ class WebpageSkillTest(unittest.TestCase):
         self.assertIn('--attempt "$ATTEMPT_ID"', instructions)
         self.assertIn('["active_attempt"]', instructions)
 
+    def test_doctor_cli_exits_nonzero_when_browser_is_blocked(self) -> None:
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(HARNESS_PATH),
+                "doctor",
+                "--offline-browser",
+                "--browser-cache",
+                str(self.root / "empty-browser-cache"),
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(completed.returncode, 2, completed.stderr)
+        self.assertEqual(json.loads(completed.stdout)["status"], "blocked")
+
     def test_static_contract_requires_the_planned_section_ids(self) -> None:
         attempt_id = self._author_valid_attempt()
         path = self.run / "attempts" / attempt_id / "artifact" / "index.html"
@@ -706,6 +755,87 @@ class WebpageSkillTest(unittest.TestCase):
             "section_id_mismatch",
             {finding["code"] for finding in report["findings"]},
         )
+
+    def test_static_contract_accepts_bound_reference_without_repeated_claim_text(self) -> None:
+        self.harness.save_webpage_plan(self.run, _plan())
+        attempt_id = self.harness.begin_webpage_attempt(self.run)
+        staged = self.harness.stage_visual(self.run, attempt_id, "vis-001")
+        artifact = self.run / "attempts" / attempt_id / "artifact"
+        html = _valid_html(staged)
+        artifact.joinpath("index.html").write_text(html, encoding="utf-8")
+        self.harness.write_webpage_source_map(self.run, attempt_id, _claims())
+
+        report = self.harness.validate_webpage_html(self.run, attempt_id)
+
+        self.assertTrue(report["passed"], report)
+        narrative = next(
+            claim["text"] for claim in _claims() if claim["id"] == "claim-method"
+        )
+        self.assertEqual(html.count(narrative), 1)
+
+    def test_static_contract_rejects_duplicate_claim_and_invalid_reference_semantics(self) -> None:
+        cases = {
+            "duplicate-narrative": (
+                lambda html: html.replace(
+                    '<a data-claim-ref="claim-method" href="#method">Review the '
+                    'source-backed method above</a>',
+                    '<span data-claim-id="claim-method">The method plans the research '
+                    'story, composes source-bound sections, and validates the rendered '
+                    'page.</span>',
+                    1,
+                ),
+                "duplicate_narrative_claim",
+            ),
+            "wrong-target": (
+                lambda html: html.replace(
+                    'data-claim-ref="claim-method" href="#method"',
+                    'data-claim-ref="claim-method" href="#results"',
+                    1,
+                ),
+                "claim_reference_mismatch",
+            ),
+            "repeated-full-text": (
+                lambda html: html.replace(
+                    "Review the source-backed method above",
+                    "See: The method plans the research story, composes source-bound sections, "
+                    "and validates the rendered page.",
+                    1,
+                ),
+                "claim_reference_repeats_narrative",
+            ),
+            "unbound-full-text": (
+                lambda html: html.replace(
+                    "</footer>",
+                    "<p>Context: The method plans the research story, composes source-bound "
+                    "sections, and validates the rendered page.</p></footer>",
+                    1,
+                ),
+                "repeated_narrative_text",
+            ),
+        }
+        for label, (mutate, expected) in cases.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as raw:
+                root = Path(raw)
+                source = root / "paper.md"
+                source.write_text(_source_text(), encoding="utf-8")
+                visual = root / "pipeline.svg"
+                visual.write_text(_svg(), encoding="utf-8")
+                run = root / "run"
+                self.harness.initialize_webpage_run(
+                    run, source, extra_assets=[visual], install_browser=False
+                )
+                self.harness.save_webpage_plan(run, _plan())
+                attempt_id = self.harness.begin_webpage_attempt(run)
+                staged = self.harness.stage_visual(run, attempt_id, "vis-001")
+                artifact = run / "attempts" / attempt_id / "artifact"
+                artifact.joinpath("index.html").write_text(
+                    mutate(_valid_html(staged)), encoding="utf-8"
+                )
+                self.harness.write_webpage_source_map(run, attempt_id, _claims())
+
+                report = self.harness.validate_webpage_html(run, attempt_id)
+
+                self.assertIn(expected, {item["code"] for item in report["findings"]})
 
     def test_static_contract_rejects_remote_assets_and_invented_links(self) -> None:
         attempt_id = self._author_valid_attempt()
@@ -1081,6 +1211,67 @@ class WebpageSkillRealBrowserTest(unittest.TestCase):
             browser_cache=cls._browser_cache(),
             allow_install=False,
         )
+
+    def test_live_dom_enforces_unique_narrative_and_explicit_reference_binding(self) -> None:
+        harness = _load_harness()
+        scripts = {
+            "duplicate-narrative": (
+                "const duplicate=document.createElement('p');"
+                "duplicate.dataset.claimId='claim-method';"
+                "duplicate.textContent='The method plans the research story, composes "
+                "source-bound sections, and validates the rendered page.';"
+                "document.getElementById('evidence').append(duplicate);"
+            ),
+            "wrong-reference-target": (
+                "document.querySelector('[data-claim-ref=claim-method]')."
+                "setAttribute('href','#results');"
+            ),
+            "repeated-reference-text": (
+                "document.querySelector('[data-claim-ref=claim-method]').textContent="
+                "'See: The method plans the research story, composes source-bound sections, "
+                "and validates the rendered page.';"
+            ),
+            "unbound-repeated-text": (
+                "const repeated=document.createElement('p');"
+                "repeated.textContent='Context: The method plans the research story, composes "
+                "source-bound sections, and validates the rendered page.';"
+                "document.querySelector('footer').append(repeated);"
+            ),
+        }
+        for label, script in scripts.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as raw:
+                root = Path(raw)
+                source = root / "paper.md"
+                source.write_text(_source_text(), encoding="utf-8")
+                visual = root / "pipeline.svg"
+                visual.write_text(_svg(), encoding="utf-8")
+                run = root / "run"
+                harness.initialize_webpage_run(
+                    run, source, extra_assets=[visual], install_browser=False
+                )
+                harness.save_webpage_plan(run, _plan())
+                attempt = harness.begin_webpage_attempt(run)
+                staged = harness.stage_visual(run, attempt, "vis-001")
+                artifact = run / "attempts" / attempt / "artifact"
+                artifact.joinpath("index.html").write_text(
+                    _valid_html(staged).replace(
+                        "</script>", script + "</script>", 1
+                    ),
+                    encoding="utf-8",
+                )
+                harness.write_webpage_source_map(run, attempt, _claims())
+
+                report = self._run_probe(
+                    root, harness, artifact, plan=_plan()
+                )
+
+                self.assertFalse(report["passed"], (label, report))
+                check = (
+                    "runtime_source_grounding"
+                    if label == "unbound-repeated-text"
+                    else "runtime_contract_intact"
+                )
+                self.assertFalse(report["checks"][check])
 
     def test_real_browser_checks_desktop_mobile_keyboard_no_js_and_reduced_motion(self) -> None:
         cache = self._browser_cache()
