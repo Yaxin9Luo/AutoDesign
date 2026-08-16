@@ -46,7 +46,7 @@ _SECRET_ASSIGNMENT = re.compile(
 _BEARER = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+")
 _SK_TOKEN = re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b")
 _SENSITIVE_HEADER = re.compile(
-    r"(?im)^(?P<name>Cookie|Set-Cookie|Authorization)\s*:\s*[^\r\n]*$"
+    r"(?im)\b(?P<name>Cookie|Set-Cookie|Authorization)\s*:\s*[^\r\n]*$"
 )
 _WORD = re.compile(r"[A-Za-z][A-Za-z0-9_-]{1,}")
 _NUMBER = re.compile(
@@ -646,7 +646,7 @@ def prepare_source(
     if state.get("state") not in {"initialized", "blocked"}:
         raise StateError("source preparation must occur before planning")
     existing_manifest = _read_json(run / "evidence" / "source_manifest.json")
-    if state.get("state") == "initialized" and existing_manifest.get("status") == "ready":
+    if existing_manifest.get("status") == "ready":
         raise StateError("a ready source cannot be replaced; initialize a new run")
     _clear_stale_source_outputs(run)
     source = Path(source_path).absolute()
@@ -712,6 +712,15 @@ def prepare_source(
         )
         commands = {"pdfinfo": info, "pdftotext": text_result, "pdftoppm": page_result, "pdfimages_list": image_list, "pdfimages_extract": image_result}
         failed = sorted(name for name, result in commands.items() if result.returncode != 0)
+        rendered_page_paths = sorted((run / "evidence" / "pages").iterdir())
+        if any(path.is_symlink() or not path.is_file() for path in rendered_page_paths):
+            raise PathSafetyError("PDF renderer produced a non-regular page output")
+        rendered_pages = {
+            path.relative_to(run).as_posix(): sha256_file(path)
+            for path in rendered_page_paths
+        }
+        if not rendered_pages:
+            failed.append("pdftoppm_output")
         manifest["commands"] = {name: {"returncode": result.returncode, "stderr": redact_secrets(result.stderr)} for name, result in commands.items()}
         if failed or not text_path.is_file():
             manifest.update({"status": "blocked", "failed_commands": failed or ["pdftotext_output"]})
@@ -720,6 +729,7 @@ def prepare_source(
             _persist_source_manifest(run, manifest)
             mark_side_state(run, "blocked", reason=f"PDF preparation failed: {', '.join(manifest['failed_commands'])}")
             return manifest
+        manifest["rendered_pages"] = rendered_pages
         text = text_path.read_text(encoding="utf-8", errors="replace")
         evidence = _pdf_evidence(text)
         image_mappings = _parse_pdfimages_list(image_list.stdout)
@@ -845,6 +855,24 @@ def _verify_source_contract(run: Path, state: Mapping[str, Any]) -> dict[str, An
     for field, path in expected.items():
         if sha256_file(path) != manifest.get(field):
             raise IntegrityError(f"source contract hash mismatch: {field}")
+    if manifest.get("source_type") == "pdf":
+        rendered_pages = manifest.get("rendered_pages")
+        if not isinstance(rendered_pages, dict) or not rendered_pages:
+            raise IntegrityError("PDF source manifest has no rendered page bindings")
+        pages_root = run / "evidence" / "pages"
+        page_entries = list(pages_root.iterdir())
+        if any(path.is_symlink() or not path.is_file() for path in page_entries):
+            raise IntegrityError("PDF rendered pages contain an unexpected entry")
+        actual_pages = {
+            path.relative_to(run).as_posix()
+            for path in page_entries
+        }
+        if actual_pages != set(rendered_pages):
+            raise IntegrityError("PDF rendered page set differs from source manifest")
+        for relative, digest in rendered_pages.items():
+            page = safe_path(run, relative, must_exist=True)
+            if page.parent != pages_root or sha256_file(page) != digest:
+                raise IntegrityError(f"PDF rendered page hash mismatch: {relative}")
     load_evidence(run)
     visuals = _load_visuals(run)
     for visual in visuals["visuals"]:
@@ -1045,8 +1073,12 @@ def validate_grounding(
                     errors.append({"claim_id": claim_id, "code": "unsupported_formula_input"})
                 expression_numbers = _numbers(str(formula["expression"]))
                 expression_values = {_number_without_unit(value) for value in expression_numbers}
+                unit_signatures = {
+                    value.endswith("%") for value in inputs | ({result} if result else set())
+                }
                 if (
                     not result
+                    or len(unit_signatures) != 1
                     or _number_without_unit(result) not in expression_values
                     or not {
                         _number_without_unit(value) for value in inputs
@@ -1104,7 +1136,9 @@ def bind_host_vlm_visuals(run_dir: Path | str, review: Mapping[str, Any]) -> dic
             or match.get("visual_sha256") != visual.get("sha256")
             or match.get("caption_evidence_sha256") != caption.get("sha256")
             or not isinstance(confidence, (int, float))
-            or confidence < 0.8
+            or isinstance(confidence, bool)
+            or not math.isfinite(confidence)
+            or not 0.8 <= confidence <= 1
         ):
             raise ContractError(f"insufficient visual-caption binding: {visual_id}")
         if not isinstance(roles, list) or not roles or any(role not in _DEFAULT_VISUAL_ROLES for role in roles):
@@ -1172,18 +1206,14 @@ def write_source_map(
     }:
         raise StateError("source map must target the active attempt")
     _verify_source_contract(run, state)
-    clean_claims = [dict(claim) for claim in claims]
-    grounding = validate_grounding(clean_claims, load_evidence(run))
-    if not grounding["valid"]:
-        codes = ", ".join(error["code"] for error in grounding["errors"])
-        raise ContractError(f"source map grounding failed: {codes}")
     contract = {
         "format_version": FORMAT_VERSION,
         "attempt_id": attempt_id,
         "source_manifest_sha256": sha256_file(run / "evidence" / "source_manifest.json"),
-        "claims": clean_claims,
-        "grounding": grounding,
+        "claims": [dict(claim) for claim in claims],
     }
+    contract["grounding"] = validate_grounding(contract["claims"], load_evidence(run))
+    _validate_source_map_contract(run, attempt_id, contract)
     attempt = safe_path(run / "attempts", attempt_id, must_exist=True)
     destination = safe_path(attempt, "provenance/source-map.json")
     if destination.exists():
@@ -1193,6 +1223,35 @@ def write_source_map(
         return existing
     atomic_write_json(destination, contract)
     return contract
+
+
+def _validate_source_map_contract(
+    run: Path, attempt_id: str, contract: Mapping[str, Any]
+) -> dict[str, Any]:
+    required = {
+        "format_version", "attempt_id", "source_manifest_sha256", "claims", "grounding"
+    }
+    value = dict(contract)
+    if set(value) != required or value.get("format_version") != FORMAT_VERSION:
+        raise ContractError("source map has an unknown or incomplete schema")
+    if value.get("attempt_id") != attempt_id:
+        raise ContractError("source map targets the wrong attempt")
+    if value.get("source_manifest_sha256") != sha256_file(
+        run / "evidence" / "source_manifest.json"
+    ):
+        raise ContractError("source map source binding is stale")
+    claims = value.get("claims")
+    if not isinstance(claims, list) or any(
+        not isinstance(claim, Mapping) for claim in claims
+    ):
+        raise ContractError("source map claims must be a list of objects")
+    grounding = validate_grounding(claims, load_evidence(run))
+    if not grounding["valid"]:
+        codes = ", ".join(error["code"] for error in grounding["errors"])
+        raise ContractError(f"source map grounding failed: {codes}")
+    if value.get("grounding") != grounding:
+        raise ContractError("source map grounding result is stale")
+    return value
 
 
 def _hash_paths(root: Path, paths: Iterable[str]) -> dict[str, str]:
@@ -1521,13 +1580,7 @@ def finalize_attempt(
         )
         if not source_map.is_file():
             raise IntegrityError("finalization requires the active attempt source map")
-        source_map_contract = _read_json(source_map)
-        if source_map_contract.get("attempt_id") != attempt_id:
-            raise IntegrityError("source map targets the wrong attempt")
-        if source_map_contract.get("source_manifest_sha256") != sha256_file(
-            run / "evidence" / "source_manifest.json"
-        ):
-            raise IntegrityError("source map source binding is stale")
+        _validate_source_map_contract(run, attempt_id, _read_json(source_map))
         target = stage / "provenance" / "source-map.json"
         target.parent.mkdir(parents=True, exist_ok=True)
         atomic_write_bytes(target, source_map.read_bytes())

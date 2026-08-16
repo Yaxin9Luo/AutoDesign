@@ -10,6 +10,7 @@ Do not invent evidence IDs or treat a citation ID as proof by itself.
 2. Prepare the user's source. Text and Markdown receive stable section/line
    anchors. Fully verified PDF preparation requires `pdftotext`, `pdfinfo`,
    `pdftoppm`, and `pdfimages`; a missing or failing command is `blocked`.
+   Every rendered PDF page is exact-set and hash-bound in the source manifest.
    A blocked preparation may be retried after stale partial PDF outputs are
    cleared. A ready source is immutable; use a new run for another source.
 3. Read `evidence/evidence.jsonl` and retrieve relevant entries lexically before
@@ -29,7 +30,8 @@ images begin eligible. PDF-extracted candidates remain `review_required` until
 a fresh host-VLM or reviewer sidecar binds the visual to caption evidence with
 adequate confidence and declares allowed content roles. The sidecar repeats the
 source-manifest, visual-catalog, visual-file, and caption-evidence hashes, so a
-review from another source cannot authorize reuse. Plans must respect each
+review from another source cannot authorize reuse. Confidence must be a finite
+number from 0.8 through 1, excluding booleans. Plans must respect each
 visual's role allowlist and reuse limit.
 
 Reference images are style-only. Never copy their text, logos, claims, figures,

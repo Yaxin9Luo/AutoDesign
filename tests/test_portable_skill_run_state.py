@@ -245,6 +245,21 @@ elif name == "pdfimages":
             "X-Visible: keep",
         )
 
+    def test_secret_redaction_removes_prefixed_trace_header_values(self) -> None:
+        redacted = core.redact_secrets(
+            "curl trace: > Authorization: Basic Zm9vOmJhcg==\n"
+            "debug: < Cookie: sid=abc; theme=dark\n"
+            "proxy: < Set-Cookie: session=secret; HttpOnly\n"
+            "visible: keep"
+        )
+        self.assertEqual(
+            redacted,
+            "curl trace: > Authorization: [REDACTED]\n"
+            "debug: < Cookie: [REDACTED]\n"
+            "proxy: < Set-Cookie: [REDACTED]\n"
+            "visible: keep",
+        )
+
     def test_initialize_snapshots_all_runtime_files_without_writing_install(self) -> None:
         before = core.tree_hash(self.skill)
         state = self._initialize()
@@ -470,6 +485,22 @@ elif name == "pdfimages":
             (self.run / "evidence" / "source_manifest.json").read_bytes(), before
         )
 
+    def test_ready_source_cannot_be_replaced_after_unrelated_blocked_side_state(self) -> None:
+        self._initialize()
+        first = self.root / "ready-first.txt"
+        second = self.root / "ready-second.txt"
+        first.write_text("Source A.\n", encoding="utf-8")
+        second.write_text("Source B.\n", encoding="utf-8")
+        core.prepare_source(self.run, first)
+        before = (self.run / "evidence" / "source_manifest.json").read_bytes()
+        core.mark_side_state(self.run, "blocked", reason="unrelated downstream blocker")
+
+        with self.assertRaises(core.StateError):
+            core.prepare_source(self.run, second)
+        self.assertEqual(
+            (self.run / "evidence" / "source_manifest.json").read_bytes(), before
+        )
+
     def test_pdf_visuals_record_pdfimages_page_and_object_number(self) -> None:
         self._initialize()
         manifest = self._prepare_pdf(
@@ -504,6 +535,31 @@ elif name == "pdfimages":
             (self.run / "evidence" / "source_visuals.json").read_text(encoding="utf-8")
         )["visuals"]
         self.assertEqual(visuals, [])
+
+    def test_pdf_rendered_pages_are_exact_set_and_hash_bound(self) -> None:
+        mutations = {
+            "extra": lambda pages: (pages / "page-3.png").write_bytes(b"extra"),
+            "missing": lambda pages: (pages / "page-2.png").unlink(),
+            "tampered": lambda pages: (pages / "page-1.png").write_bytes(b"tampered"),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name=name):
+                self.run = self.root / "workspace" / f"pdf-pages-{name}"
+                self._initialize()
+                manifest = self._prepare_pdf(
+                    tools=self._fake_poppler(
+                        f"poppler-pages-{name}",
+                        page_count=2,
+                        image_rows=((1, 0),),
+                    )
+                )
+                self.assertEqual(
+                    set(manifest["rendered_pages"]),
+                    {"evidence/pages/page-1.png", "evidence/pages/page-2.png"},
+                )
+                mutate(self.run / "evidence" / "pages")
+                with self.assertRaises(core.IntegrityError):
+                    core.resume_run(self.run)
 
     def test_read_only_install_tree_remains_unchanged(self) -> None:
         before = core.tree_hash(self.skill)
@@ -640,6 +696,43 @@ elif name == "pdfimages":
         with self.assertRaises(core.ContractError):
             core.bind_host_vlm_visuals(other_run, review)
 
+    def test_host_vlm_visual_review_requires_finite_real_confidence_in_range(self) -> None:
+        self._initialize()
+        self._prepare_pdf(
+            tools=self._fake_poppler(
+                "poppler-confidence", text="Figure caption.\n", image_rows=((1, 2),)
+            )
+        )
+        visual = json.loads(
+            (self.run / "evidence" / "source_visuals.json").read_text(encoding="utf-8")
+        )["visuals"][0]
+        evidence = core.load_evidence(self.run)[0]
+        base_review = {
+            "reviewer_mode": "fresh_host_vlm",
+            "source_manifest_sha256": core.sha256_file(
+                self.run / "evidence" / "source_manifest.json"
+            ),
+            "source_visuals_sha256": core.sha256_file(
+                self.run / "evidence" / "source_visuals.json"
+            ),
+            "matches": [
+                {
+                    "visual_id": visual["id"],
+                    "visual_sha256": visual["sha256"],
+                    "caption_evidence_id": evidence["id"],
+                    "caption_evidence_sha256": evidence["sha256"],
+                    "confidence": 0.9,
+                    "allowed_content_roles": ["method"],
+                }
+            ],
+        }
+        for confidence in (True, float("nan"), float("inf"), 1.01):
+            with self.subTest(confidence=confidence):
+                review = json.loads(json.dumps(base_review))
+                review["matches"][0]["confidence"] = confidence
+                with self.assertRaises(core.ContractError):
+                    core.bind_host_vlm_visuals(self.run, review)
+
     def test_reference_images_are_separate_and_style_only(self) -> None:
         self._initialize()
         source = self.root / "paper.txt"
@@ -775,6 +868,38 @@ elif name == "pdfimages":
         )
         self.assertTrue(percent_formula["valid"], percent_formula)
 
+    def test_derived_formula_rejects_mixed_percent_and_unitless_values(self) -> None:
+        text = "Accuracy is 85% across 80 evaluation cases."
+        evidence = [
+            {
+                "id": "ev-001",
+                "kind": "text",
+                "text": text,
+                "safe_to_quote": True,
+                "anchor": {"line_start": 1, "line_end": 1},
+                "sha256": hashlib.sha256(text.encode()).hexdigest(),
+            }
+        ]
+        result = core.validate_grounding(
+            [
+                {
+                    "id": "mixed-units",
+                    "text": "The mixed difference is 5%.",
+                    "source_ids": ["ev-001"],
+                    "derived_formula": {
+                        "expression": "85 - 80 = 5",
+                        "inputs": ["85%", "80"],
+                        "result": "5%",
+                    },
+                }
+            ],
+            evidence,
+        )
+        self.assertFalse(result["valid"])
+        self.assertIn(
+            "invalid_derived_formula", {error["code"] for error in result["errors"]}
+        )
+
     def test_visual_role_and_reuse_limits_are_enforced(self) -> None:
         self._initialize()
         source = self.root / "paper.txt"
@@ -817,6 +942,39 @@ elif name == "pdfimages":
                 attempt,
                 [{"id": "claim-002", "text": "Accuracy reaches 99%.", "source_ids": ["ev-001"]}],
             )
+
+    def test_finalize_revalidates_persisted_source_map_schema_and_grounding(self) -> None:
+        for mutation in ("unknown_field", "regrounded_tampered_claim"):
+            with self.subTest(mutation=mutation):
+                self.run = self.root / "workspace" / f"source-map-{mutation}"
+                attempt, _review = self._semantic_attempt()
+                source_map_path = (
+                    self.run
+                    / "attempts"
+                    / attempt
+                    / "provenance"
+                    / "source-map.json"
+                )
+                source_map = json.loads(source_map_path.read_text(encoding="utf-8"))
+                if mutation == "unknown_field":
+                    source_map["unexpected"] = "accepted-before-fix"
+                else:
+                    source_map["claims"] = [
+                        {
+                            "id": "tampered",
+                            "text": "The source reports 99% accuracy.",
+                            "source_ids": ["ev-001"],
+                        }
+                    ]
+                    source_map["grounding"] = {
+                        "format_version": 1,
+                        "valid": True,
+                        "errors": [],
+                    }
+                core.atomic_write_json(source_map_path, source_map)
+
+                with self.assertRaises(core.ContractError):
+                    core.finalize_attempt(self.run, attempt)
 
     def test_source_maps_are_attempt_scoped_and_final_promotes_only_selected_attempt(self) -> None:
         self._initialize()
