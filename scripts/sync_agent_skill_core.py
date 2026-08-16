@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Deterministically vendor the portable core and grounding contract."""
+"""Deterministically vendor the portable core and runtime contracts."""
 
 from __future__ import annotations
 
@@ -45,6 +45,16 @@ def sync(root: Path, *, check: bool = False) -> list[str]:
         Path("scripts/_portable.py"): shared / "portable_core.py",
         Path("references/source-grounding.md"): shared / "source-grounding.md",
     }
+    browser_sources = {
+        Path("scripts/browser_worker.py"): shared / "browser_worker.py",
+        Path("scripts/setup_browser.py"): shared / "setup_browser.py",
+        Path("scripts/requirements-browser.lock"): shared / "requirements-browser.lock",
+    }
+    present_browser_sources = [source.is_file() for source in browser_sources.values()]
+    if any(present_browser_sources) and not all(present_browser_sources):
+        raise FileNotFoundError("portable browser runtime sources must be present as a complete set")
+    if all(present_browser_sources):
+        sources.update(browser_sources)
     drift: list[str] = []
     for skill_name in SKILL_NAMES:
         package = root / skill_name
