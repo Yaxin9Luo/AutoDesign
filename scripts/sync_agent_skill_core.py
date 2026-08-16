@@ -50,11 +50,12 @@ def sync(root: Path, *, check: bool = False) -> list[str]:
         Path("scripts/setup_browser.py"): shared / "setup_browser.py",
         Path("scripts/requirements-browser.lock"): shared / "requirements-browser.lock",
     }
-    present_browser_sources = [source.is_file() for source in browser_sources.values()]
-    if any(present_browser_sources) and not all(present_browser_sources):
-        raise FileNotFoundError("portable browser runtime sources must be present as a complete set")
-    if all(present_browser_sources):
-        sources.update(browser_sources)
+    sources.update(browser_sources)
+    for source in sources.values():
+        if source.is_symlink():
+            raise ValueError(f"canonical source must not be a symlink: {source}")
+        if not source.is_file():
+            raise FileNotFoundError(f"missing canonical source: {source}")
     drift: list[str] = []
     for skill_name in SKILL_NAMES:
         package = root / skill_name
@@ -69,10 +70,6 @@ def sync(root: Path, *, check: bool = False) -> list[str]:
             if not directory.is_dir():
                 raise FileNotFoundError(f"missing Skill runtime directory: {directory}")
         for relative, source in sources.items():
-            if source.is_symlink():
-                raise ValueError(f"canonical source must not be a symlink: {source}")
-            if not source.is_file():
-                raise FileNotFoundError(f"missing canonical source: {source}")
             target = package / relative
             if target.is_symlink():
                 raise ValueError(f"vendored target must not be a symlink: {target}")

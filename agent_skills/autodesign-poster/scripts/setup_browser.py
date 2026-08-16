@@ -5,19 +5,23 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import errno
 import hashlib
 import json
 import os
 import platform
 import re
+import signal
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
+from stat import S_ISREG
 from typing import Callable, Iterator, Mapping, Sequence
 
 
@@ -30,11 +34,28 @@ _EXPECTED_PYTHON_PACKAGES = {
     "typing-extensions": "4.15.0",
 }
 _STATE_FILE = "runtime-state.json"
-_DEFAULT_LOCK_TIMEOUT_SECONDS = 300.0
-_STALE_LOCK_SECONDS = 1800.0
+_VENV_CREATE_TIMEOUT_SECONDS = 180
+_PIP_INSTALL_TIMEOUT_SECONDS = 600
+_CHROMIUM_INSTALL_TIMEOUT_SECONDS = 900
+_CHROMIUM_PROBE_TIMEOUT_SECONDS = 60
+_MAX_FIRST_INSTALL_SECONDS = (
+    _VENV_CREATE_TIMEOUT_SECONDS
+    + _PIP_INSTALL_TIMEOUT_SECONDS
+    + _CHROMIUM_INSTALL_TIMEOUT_SECONDS
+    + (2 * _CHROMIUM_PROBE_TIMEOUT_SECONDS)
+)
+_DEFAULT_LOCK_TIMEOUT_SECONDS = float(_MAX_FIRST_INSTALL_SECONDS + 120)
+_LOCK_OWNER_GRACE_SECONDS = 5.0
+_LOCK_HEARTBEAT_SECONDS = 2.0
+_PROCESS_TREE_TERMINATION_GRACE_SECONDS = 1.0
+_PROCESS_OUTPUT_DRAIN_SECONDS = 5.0
+_THREAD_GUARDS_LOCK = threading.Lock()
+_THREAD_GUARDS: dict[str, tuple[threading.Lock, int]] = {}
 _SAFE_ENVIRONMENT_NAMES = {
     "COMSPEC",
     "HOME",
+    "HOMEDRIVE",
+    "HOMEPATH",
     "LANG",
     "LC_ALL",
     "PATH",
@@ -42,6 +63,7 @@ _SAFE_ENVIRONMENT_NAMES = {
     "TEMP",
     "TMP",
     "TMPDIR",
+    "USERPROFILE",
     "WINDIR",
 }
 _NETWORK_ENVIRONMENT_NAMES = {
@@ -50,6 +72,7 @@ _NETWORK_ENVIRONMENT_NAMES = {
     "HTTPS_PROXY",
     "HTTP_PROXY",
     "NO_PROXY",
+    "NODE_EXTRA_CA_CERTS",
     "PIP_CERT",
     "PIP_INDEX_URL",
     "PIP_TRUSTED_HOST",
@@ -319,17 +342,93 @@ def inspect_browser_runtime(
     return BrowserRuntime(cache, python, browsers_path, browser, state_path)
 
 
+def _terminate_process_tree(process: subprocess.Popen[str]) -> None:
+    if os.name == "nt":
+        try:
+            result = subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+                check=False,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            if result.returncode != 0:
+                process.kill()
+        except (OSError, subprocess.SubprocessError):
+            with contextlib.suppress(OSError):
+                process.kill()
+        return
+
+    process_group = process.pid
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.killpg(process_group, signal.SIGTERM)
+    deadline = time.monotonic() + _PROCESS_TREE_TERMINATION_GRACE_SECONDS
+    while time.monotonic() < deadline:
+        try:
+            os.killpg(process_group, 0)
+        except ProcessLookupError:
+            return
+        except PermissionError:
+            break
+        time.sleep(0.02)
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.killpg(process_group, signal.SIGKILL)
+
+
+def _process_timeout_output(value: str | bytes | None) -> str:
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return value or ""
+
+
+def _drain_terminated_process(process: subprocess.Popen[str]) -> tuple[str, str]:
+    try:
+        return process.communicate(timeout=_PROCESS_OUTPUT_DRAIN_SECONDS)
+    except subprocess.TimeoutExpired as first_timeout:
+        with contextlib.suppress(OSError):
+            process.kill()
+        try:
+            return process.communicate(timeout=1)
+        except subprocess.TimeoutExpired as second_timeout:
+            return (
+                _process_timeout_output(second_timeout.output or first_timeout.output),
+                _process_timeout_output(second_timeout.stderr or first_timeout.stderr),
+            )
+
+
 def _default_command_runner(
     command: Sequence[str], *, env: Mapping[str, str], timeout: int
 ) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
+    popen_options: dict[str, object] = {}
+    if os.name == "nt":
+        popen_options["creationflags"] = getattr(
+            subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200
+        )
+    else:
+        popen_options["start_new_session"] = True
+    process = subprocess.Popen(
         list(command),
         env=dict(env),
         text=True,
-        capture_output=True,
-        timeout=timeout,
-        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        **popen_options,
     )
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired as error:
+        _terminate_process_tree(process)
+        stdout, stderr = _drain_terminated_process(process)
+        raise subprocess.TimeoutExpired(
+            list(command), timeout, output=stdout, stderr=stderr
+        ) from error
+    except BaseException:
+        _terminate_process_tree(process)
+        _drain_terminated_process(process)
+        raise
+    return subprocess.CompletedProcess(list(command), process.returncode, stdout, stderr)
 
 
 def _safe_process_detail(result: subprocess.CompletedProcess[str]) -> str:
@@ -382,7 +481,7 @@ def _probe_runtime(runtime: BrowserRuntime, spec: RuntimeSpec) -> None:
                 str(report),
             ],
             env=env,
-            timeout=60,
+            timeout=_CHROMIUM_PROBE_TIMEOUT_SECONDS,
             action="fresh Chromium launch probe",
         )
         try:
@@ -400,7 +499,20 @@ def _probe_runtime(runtime: BrowserRuntime, spec: RuntimeSpec) -> None:
             raise BrowserRuntimeError("Chromium launch probe reported an unexpected binary hash")
 
 
+def _ensure_supported_install_target(spec: RuntimeSpec) -> None:
+    if (
+        spec.system == "windows"
+        and spec.machine in {"arm64", "aarch64"}
+        and spec.python_major_minor == "3.10"
+    ):
+        raise BrowserRuntimeError(
+            "Windows ARM64 with Python 3.10 is unsupported because greenlet 3.5.0 "
+            "has no compatible hash-locked wheel; use Python 3.11 or newer"
+        )
+
+
 def _install_runtime(staging: Path, spec: RuntimeSpec) -> None:
+    _ensure_supported_install_target(spec)
     browsers = staging / "browsers"
     browsers.mkdir(parents=True)
     install_env = isolated_environment(
@@ -410,7 +522,7 @@ def _install_runtime(staging: Path, spec: RuntimeSpec) -> None:
     _run_checked(
         [sys.executable, "-I", "-m", "venv", str(staging / "venv")],
         env=install_env,
-        timeout=180,
+        timeout=_VENV_CREATE_TIMEOUT_SECONDS,
         action="isolated browser virtual environment creation",
     )
     python = staging / venv_python_relative_path()
@@ -428,13 +540,13 @@ def _install_runtime(staging: Path, spec: RuntimeSpec) -> None:
             str(spec.requirements_path),
         ],
         env=install_env,
-        timeout=600,
+        timeout=_PIP_INSTALL_TIMEOUT_SECONDS,
         action="hash-locked Playwright dependency installation",
     )
     _run_checked(
         [str(python), "-I", "-m", "playwright", "install", "chromium"],
         env=install_env,
-        timeout=900,
+        timeout=_CHROMIUM_INSTALL_TIMEOUT_SECONDS,
         action="pinned Chromium installation",
     )
     probe_report = staging / ".install-probe.json"
@@ -445,7 +557,7 @@ def _install_runtime(staging: Path, spec: RuntimeSpec) -> None:
     _run_checked(
         [str(python), "-I", str(spec.worker_path), "probe", "--report", str(probe_report)],
         env=probe_env,
-        timeout=60,
+        timeout=_CHROMIUM_PROBE_TIMEOUT_SECONDS,
         action="pre-promotion Chromium launch probe",
     )
     try:
@@ -464,42 +576,299 @@ def _install_runtime(staging: Path, spec: RuntimeSpec) -> None:
         probe_report.unlink(missing_ok=True)
 
 
+def _read_lock_owner(lock: Path) -> dict[str, object] | None:
+    try:
+        payload = json.loads((lock / "owner.json").read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    pid = payload.get("pid")
+    token = payload.get("token")
+    created = payload.get("created_epoch")
+    if (
+        not isinstance(pid, int)
+        or pid <= 0
+        or not isinstance(token, str)
+        or re.fullmatch(r"[0-9a-f]{32}", token) is None
+        or not isinstance(created, (int, float))
+    ):
+        return None
+    return payload
+
+
+def _windows_process_is_alive(pid: int) -> bool:
+    import ctypes
+    from ctypes import wintypes
+
+    if pid > 0xFFFFFFFF:
+        return False
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.GetExitCodeProcess.argtypes = (wintypes.HANDLE, wintypes.LPDWORD)
+    kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    process_query_limited_information = 0x1000
+    error_invalid_parameter = 87
+    still_active = 259
+    handle = kernel32.OpenProcess(process_query_limited_information, False, pid)
+    if not handle:
+        return ctypes.get_last_error() != error_invalid_parameter
+    try:
+        exit_code = wintypes.DWORD()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+            return True
+        return exit_code.value == still_active
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _process_is_alive(pid: int) -> bool:
+    if pid == os.getpid():
+        return True
+    if os.name == "nt":
+        return _windows_process_is_alive(pid)
+    try:
+        os.kill(pid, 0)
+    except (OverflowError, ValueError):
+        return False
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError as error:
+        return error.errno not in {errno.ESRCH, errno.EINVAL}
+    return True
+
+
+def _quarantine_and_remove(path: Path, *, marker: str) -> None:
+    quarantine = path.with_name(f".{path.name}.{marker}-{uuid.uuid4().hex}")
+    try:
+        os.replace(path, quarantine)
+    except FileNotFoundError:
+        return
+    if quarantine.is_symlink() or quarantine.is_file():
+        quarantine.unlink(missing_ok=True)
+    else:
+        shutil.rmtree(quarantine)
+
+
+def _heartbeat_lock(lock: Path, token: str, stop: threading.Event) -> None:
+    while not stop.wait(_LOCK_HEARTBEAT_SECONDS):
+        owner = _read_lock_owner(lock)
+        if owner is None or owner.get("token") != token:
+            return
+        try:
+            os.utime(lock)
+            os.utime(lock / "owner.json")
+        except OSError:
+            return
+
+
+def _thread_guard_for(path: Path) -> threading.Lock:
+    key = str(path.absolute())
+    with _THREAD_GUARDS_LOCK:
+        entry = _THREAD_GUARDS.get(key)
+        if entry is None:
+            guard = threading.Lock()
+            _THREAD_GUARDS[key] = (guard, 1)
+            return guard
+        guard, references = entry
+        _THREAD_GUARDS[key] = (guard, references + 1)
+        return guard
+
+
+def _release_thread_guard(path: Path, guard: threading.Lock) -> None:
+    key = str(path.absolute())
+    with _THREAD_GUARDS_LOCK:
+        entry = _THREAD_GUARDS.get(key)
+        if entry is None or entry[0] is not guard:
+            return
+        if entry[1] <= 1:
+            _THREAD_GUARDS.pop(key, None)
+        else:
+            _THREAD_GUARDS[key] = (guard, entry[1] - 1)
+
+
+def _open_guard_file(path: Path) -> int:
+    if path.is_symlink() or (path.exists() and not path.is_file()):
+        raise BrowserRuntimeError(f"Unsafe browser runtime advisory lock: {path}")
+    flags = os.O_RDWR | os.O_CREAT
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags, 0o600)
+    except OSError as error:
+        raise BrowserRuntimeError(
+            f"Could not open browser runtime advisory lock: {path}: {error}"
+        ) from error
+    try:
+        opened = os.fstat(descriptor)
+        published = path.lstat()
+        if (
+            not S_ISREG(opened.st_mode)
+            or not S_ISREG(published.st_mode)
+            or (opened.st_dev, opened.st_ino) != (published.st_dev, published.st_ino)
+        ):
+            raise BrowserRuntimeError(f"Unsafe browser runtime advisory lock: {path}")
+        if opened.st_size == 0:
+            os.write(descriptor, b"\0")
+            os.fsync(descriptor)
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _try_advisory_lock(descriptor: int) -> bool:
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    if os.name == "nt":
+        import msvcrt
+
+        try:
+            msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+        except OSError as error:
+            if error.errno in {errno.EACCES, errno.EAGAIN, errno.EDEADLK}:
+                return False
+            raise
+        return True
+
+    import fcntl
+
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as error:
+        if error.errno in {errno.EACCES, errno.EAGAIN}:
+            return False
+        raise
+    return True
+
+
+def _unlock_advisory_lock(descriptor: int) -> None:
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    if os.name == "nt":
+        import msvcrt
+
+        msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+        return
+
+    import fcntl
+
+    fcntl.flock(descriptor, fcntl.LOCK_UN)
+
+
 @contextlib.contextmanager
-def _cache_lock(lock: Path, timeout_seconds: float) -> Iterator[None]:
-    deadline = time.monotonic() + timeout_seconds
+def _advisory_cache_guard(path: Path, deadline: float) -> Iterator[None]:
+    thread_guard = _thread_guard_for(path)
+    remaining = max(0.0, deadline - time.monotonic())
+    if not thread_guard.acquire(timeout=remaining):
+        _release_thread_guard(path, thread_guard)
+        raise BrowserRuntimeError("Timed out waiting for browser runtime installation lock")
+    descriptor: int | None = None
+    acquired = False
+    try:
+        descriptor = _open_guard_file(path)
+        while not acquired:
+            try:
+                acquired = _try_advisory_lock(descriptor)
+            except OSError as error:
+                raise BrowserRuntimeError(
+                    f"Could not acquire browser runtime advisory lock: {error}"
+                ) from error
+            if acquired:
+                break
+            if time.monotonic() >= deadline:
+                raise BrowserRuntimeError(
+                    "Timed out waiting for browser runtime installation lock"
+                )
+            time.sleep(0.05)
+        yield
+    finally:
+        if descriptor is not None:
+            if acquired:
+                with contextlib.suppress(OSError):
+                    _unlock_advisory_lock(descriptor)
+            os.close(descriptor)
+        thread_guard.release()
+        _release_thread_guard(path, thread_guard)
+
+
+@contextlib.contextmanager
+def _metadata_cache_lock(lock: Path, deadline: float) -> Iterator[None]:
     lock.parent.mkdir(parents=True, exist_ok=True)
     acquired = False
+    owner_token = ""
+    heartbeat_stop = threading.Event()
+    heartbeat: threading.Thread | None = None
     while not acquired:
         try:
             lock.mkdir(mode=0o700)
-            (lock / "owner.json").write_text(
-                json.dumps({"pid": os.getpid(), "created_epoch": time.time()}),
-                encoding="utf-8",
-            )
+            owner_token = uuid.uuid4().hex
+            try:
+                (lock / "owner.json").write_text(
+                    json.dumps(
+                        {
+                            "pid": os.getpid(),
+                            "token": owner_token,
+                            "created_epoch": time.time(),
+                        },
+                        sort_keys=True,
+                    ),
+                    encoding="utf-8",
+                )
+            except BaseException:
+                shutil.rmtree(lock, ignore_errors=True)
+                raise
             acquired = True
         except FileExistsError:
             if lock.is_symlink() or not lock.is_dir():
                 raise BrowserRuntimeError(f"Unsafe browser runtime lock: {lock}")
-            try:
-                age = time.time() - lock.stat().st_mtime
-            except OSError:
-                age = 0
-            if age > _STALE_LOCK_SECONDS:
-                stale = lock.with_name(f".{lock.name}.stale-{uuid.uuid4().hex}")
+            owner = _read_lock_owner(lock)
+            if owner is not None:
+                if not _process_is_alive(int(owner["pid"])):
+                    _quarantine_and_remove(lock, marker="orphaned")
+                    continue
+            else:
                 try:
-                    os.replace(lock, stale)
-                    shutil.rmtree(stale, ignore_errors=True)
+                    age = time.time() - lock.stat().st_mtime
                 except OSError:
-                    pass
-                continue
+                    age = 0.0
+                if age > _LOCK_OWNER_GRACE_SECONDS:
+                    _quarantine_and_remove(lock, marker="ownerless")
+                    continue
             if time.monotonic() >= deadline:
                 raise BrowserRuntimeError("Timed out waiting for browser runtime installation lock")
             time.sleep(0.05)
+    heartbeat = threading.Thread(
+        target=_heartbeat_lock,
+        args=(lock, owner_token, heartbeat_stop),
+        name="autodesign-browser-cache-heartbeat",
+        daemon=True,
+    )
+    heartbeat.start()
     try:
         yield
     finally:
+        heartbeat_stop.set()
+        if heartbeat is not None:
+            heartbeat.join(timeout=max(1.0, _LOCK_HEARTBEAT_SECONDS * 2))
         if acquired:
-            shutil.rmtree(lock, ignore_errors=True)
+            owner = _read_lock_owner(lock)
+            if owner is not None and owner.get("token") == owner_token:
+                _quarantine_and_remove(lock, marker="released")
+
+
+@contextlib.contextmanager
+def _cache_lock(lock: Path, timeout_seconds: float) -> Iterator[None]:
+    deadline = time.monotonic() + timeout_seconds
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    guard = lock.with_name(f"{lock.name}.guard")
+    with _advisory_cache_guard(guard, deadline):
+        with _metadata_cache_lock(lock, deadline):
+            yield
 
 
 def _discard_corrupt_cache(cache: Path) -> None:
@@ -511,6 +880,15 @@ def _discard_corrupt_cache(cache: Path) -> None:
         quarantine.unlink(missing_ok=True)
     else:
         shutil.rmtree(quarantine)
+
+
+def _discard_abandoned_staging(spec: RuntimeSpec) -> None:
+    pattern = f".{spec.cache_key}.installing-*"
+    for candidate in spec.cache_root.glob(pattern):
+        if candidate.is_symlink() or candidate.is_file():
+            candidate.unlink(missing_ok=True)
+        elif candidate.is_dir():
+            shutil.rmtree(candidate)
 
 
 def ensure_browser_runtime(
@@ -542,6 +920,7 @@ def ensure_browser_runtime(
     spec.cache_root.mkdir(parents=True, exist_ok=True)
     lock = spec.cache_root / f".{spec.cache_key}.lock"
     with _cache_lock(lock, lock_timeout_seconds):
+        _discard_abandoned_staging(spec)
         try:
             runtime = inspect_browser_runtime(spec.cache_dir, spec)
         except BrowserRuntimeError:
