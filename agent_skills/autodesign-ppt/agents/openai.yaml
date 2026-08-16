@@ -1,0 +1,4 @@
+interface:
+  display_name: "AutoDesign PPT"
+  short_description: "Create source-grounded conference slide decks"
+  default_prompt: "Use $autodesign-ppt to turn my paper into a conference slide deck."

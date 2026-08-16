@@ -1,0 +1,4 @@
+interface:
+  display_name: "AutoDesign Webpage"
+  short_description: "Create source-grounded research webpages"
+  default_prompt: "Use $autodesign-webpage to turn my paper into a research project webpage."
