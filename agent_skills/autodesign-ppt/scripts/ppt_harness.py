@@ -368,6 +368,7 @@ _CONDITIONAL_ROLE_SIGNAL_RULES = {
         (
             (
                 "with and without",
+                "w/o",
                 "component removal",
                 "module removal",
                 "remov",
@@ -416,6 +417,7 @@ _CONDITIONAL_ROLE_SIGNAL_RULES = {
                 "across dataset",
                 "across condition",
                 "distribution shift",
+                "shifted dataset",
                 "out-of-domain",
                 "perturb",
                 "noisy input",
@@ -499,6 +501,59 @@ _CONDITIONAL_ROLE_SIGNAL_RULES = {
 }
 _SEMANTIC_MIN_CONCEPTS = 1
 _SEMANTIC_MARGIN = 1
+
+_CONDITIONAL_ROLE_ABSENCE_TERMS = {
+    "ablation": (
+        "ablation",
+        "component removal",
+        "module removal",
+        "variant comparison",
+        "remove a component",
+        "remove the component",
+        "remove a module",
+        "remove the module",
+        "消融",
+        "组件移除",
+        "模块移除",
+        "变体比较",
+    ),
+    "robustness": (
+        "robustness",
+        "robust",
+        "distribution shift",
+        "shifted dataset",
+        "sensitivity analysis",
+        "鲁棒性",
+        "鲁棒",
+        "分布偏移",
+        "敏感性分析",
+    ),
+    "qualitative": (
+        "qualitative analysis",
+        "qualitative evidence",
+        "qualitative result",
+        "qualitative evaluation",
+        "qualitative example",
+        "qualitative comparison",
+        "case study",
+        "representative case",
+        "failure example",
+        "visual example",
+        "visualization",
+        "定性分析",
+        "定性证据",
+        "定性结果",
+        "定性评估",
+        "定性示例",
+        "定性对比",
+        "案例分析",
+        "代表案例",
+        "失败示例",
+        "可视化",
+    ),
+}
+
+_NUMERIC_VALUE_PATTERN = r"(?<![\w.])\d+(?:\.\d+)?\s*%?"
 
 
 def _parse_slide_count_token(token: str) -> int | None:
@@ -637,6 +692,81 @@ def _semantic_role_key(role: str) -> str:
     return role
 
 
+def _conditional_role_declares_absence(role: str, normalized: str) -> bool:
+    role_terms = _CONDITIONAL_ROLE_ABSENCE_TERMS.get(role, ())
+    if not role_terms:
+        return False
+    role_pattern = "(?:" + "|".join(re.escape(term) for term in role_terms) + ")"
+    english_patterns = (
+        rf"\b(?:do|does|did|will|would|can|could|is|are|was|were|has|have|had)\s+"
+        rf"(?:not|never)\b[^.!?]{{0,80}}{role_pattern}",
+        rf"\bno\b[^.!?]{{0,50}}{role_pattern}",
+        rf"{role_pattern}[^.!?]{{0,80}}\b(?:not|never|absent|missing|omitted|unavailable)\b",
+        rf"{role_pattern}[^.!?]{{0,70}}\b"
+        rf"(?:left|deferred|reserved|postponed|planned|considered)\b"
+        rf"[^.!?]{{0,40}}\b(?:future work|future studies?|future evaluation)\b",
+        rf"\b(?:defer(?:s|red)?|leave|leaves|left|reserv(?:e|es|ed)|"
+        rf"postpon(?:e|es|ed)|plan(?:s|ned)?)\b"
+        rf"[^.!?]{{0,50}}{role_pattern}[^.!?]{{0,50}}"
+        rf"\b(?:future work|future studies?|future evaluation)\b",
+        rf"\bwill\s+(?:evaluate|study|analy[sz]e|provide|conduct|perform)\b"
+        rf"[^.!?]{{0,50}}{role_pattern}[^.!?]{{0,50}}\bfuture work\b",
+    )
+    if any(re.search(pattern, normalized) for pattern in english_patterns):
+        return True
+    chinese_patterns = (
+        rf"(?:未|没有|不(?:进行|提供|评估|评价|报告|包含|涉及|开展|考虑))"
+        rf"[^。！？]{{0,30}}{role_pattern}",
+        rf"{role_pattern}[^。！？]{{0,40}}"
+        rf"(?:未提供|未进行|没有|缺失|留待未来|未来工作)",
+    )
+    return any(re.search(pattern, normalized) for pattern in chinese_patterns)
+
+
+def _has_numeric_observed_comparison(normalized: str) -> bool:
+    if len(re.findall(_NUMERIC_VALUE_PATTERN, normalized)) < 2:
+        return False
+    return any(
+        re.search(pattern, normalized)
+        for pattern in (
+            r"\bfrom\b.{0,80}\bto\b",
+            r"\b(?:versus|vs\.?)\b",
+            r"\bcompared\s+(?:with|to)\b",
+            r"\bw/o\b.{0,100}\bfull\b",
+            r"\bfull\b.{0,100}\bw/o\b",
+            r"从[^。！？]{0,40}到",
+            r"(?:相比|对比|比较)[^。！？]{0,80}",
+        )
+    )
+
+
+def _conditional_role_signal_supported(
+    role: str,
+    normalized: str,
+    rules: Sequence[Sequence[Sequence[str]]],
+) -> bool:
+    if _conditional_role_declares_absence(role, normalized):
+        return False
+    numeric_comparison = (
+        role in {"ablation", "robustness"}
+        and _has_numeric_observed_comparison(normalized)
+    )
+    for alternative in rules:
+        group_matches = [
+            any(_semantic_term_present(normalized, term) for term in group)
+            for group in alternative
+        ]
+        if all(group_matches):
+            return True
+        if (
+            numeric_comparison
+            and len(group_matches) > 1
+            and all(group_matches[:-1])
+        ):
+            return True
+    return False
+
+
 def _role_evidence_score(role: str, text: str) -> int:
     semantic_role = _semantic_role_key(role)
     concepts = _ROLE_DISTINCTIVE_CONCEPTS.get(semantic_role, ())
@@ -644,12 +774,10 @@ def _role_evidence_score(role: str, text: str) -> int:
         unicodedata.normalize("NFKC", text).casefold().split()
     )
     rules = _CONDITIONAL_ROLE_SIGNAL_RULES.get(semantic_role)
-    if rules is not None and not any(
-        all(
-            any(_semantic_term_present(normalized, term) for term in group)
-            for group in alternative
-        )
-        for alternative in rules
+    if rules is not None and not _conditional_role_signal_supported(
+        semantic_role,
+        normalized,
+        rules,
     ):
         return 0
     score = sum(

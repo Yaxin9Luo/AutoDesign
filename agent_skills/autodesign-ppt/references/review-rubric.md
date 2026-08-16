@@ -39,6 +39,7 @@ localized evidence are invalid repair instructions.
   backbone;
 - a conditional experiment role authorized only by a generic token instead of
   explicit terminology or the required condition/comparison plus observed result;
+- a negated, not-provided, or future-work statement used as positive evidence;
 - a slide not inspected by the reviewer;
 - illegible, clipped, overlapping, or blank content;
 - visible remote/missing asset or runtime error;

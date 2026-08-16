@@ -63,6 +63,11 @@ ablation terminology or a component/variant comparison plus measured effect;
 robustness needs explicit robustness terminology or a changed condition plus a
 measured stability/result signal; qualitative evidence needs explicit
 qualitative terminology or a case/visual plus an observed behavior or finding.
+A component operation or changed condition followed by a two-value comparison
+(`from`/`to`, `versus`, `vs.`, or `w/o`/`full`) is a measured result. Statements
+that negate an evaluation, say evidence was not provided, or defer it to future
+work are rejected before positive signal matching; declared absence cannot
+ground an experimental slide.
 If no host story plan is passed, the deterministic fallback
 scores role-distinctive evidence concepts for each slide and applies the same
 conditional substitutions. A match must clear the minimum and beat the

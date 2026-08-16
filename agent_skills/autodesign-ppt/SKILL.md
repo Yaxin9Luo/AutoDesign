@@ -51,7 +51,11 @@ of `<PYTHON3>` below. Run
    Ablation requires explicit ablation terminology, or a component/variant
    comparison with a measured effect; bare words such as `without` or `variant`
    do not qualify. Robustness and qualitative roles likewise require explicit
-   terminology or a condition/case plus an observed result. That fallback needs
+   terminology or a condition/case plus an observed result. A two-value numeric
+   comparison can provide the observed result when the component operation or
+   shifted condition is explicit. Reject negated, not-provided, or future-work
+   statements before evaluating positive signals: stating that an experiment is
+   absent is not evidence that it was performed. That fallback needs
    role-distinctive evidence with a unique winning margin; ambiguous or generic
    overlap stops and requests `--story-plan`. Paper decks default to exactly 18
    slides. A count attached to the requested deck/slides/presentation, including

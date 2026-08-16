@@ -472,6 +472,8 @@ class AutoDesignPptSkillTests(unittest.TestCase):
             "robustness": (
                 "The robustness evaluation remains stable under distribution shift.",
                 "Across datasets, accuracy remains stable under noisy inputs.",
+                "我们不仅评估鲁棒性，还报告了扰动下保持稳定的结果。",
+                "Robustness results remain stable and motivate future work.",
             ),
             "qualitative": (
                 "Qualitative analysis shows representative failure examples.",
@@ -490,6 +492,89 @@ class AutoDesignPptSkillTests(unittest.TestCase):
                         ),
                         "ev-001",
                     )
+
+    def test_conditional_roles_reject_negated_or_future_work_absence(self) -> None:
+        harness = self._require(self.harness, HARNESS_PATH)
+        absent_evidence = {
+            "ablation": (
+                "We do not conduct an ablation study.",
+                "Ablation studies are left to future work.",
+                "No component removal is performed; accuracy drops from 82% to 79%.",
+                "我们没有进行消融实验。",
+            ),
+            "robustness": (
+                "We do not evaluate robustness.",
+                "Robustness evaluation is left for future work.",
+                "No shifted dataset is evaluated; accuracy is 78.5% versus 79.0%.",
+                "我们未评估鲁棒性。",
+            ),
+            "qualitative": (
+                "No qualitative analysis is provided.",
+                "Qualitative evidence will be considered in future work.",
+                "No representative case is shown.",
+                "论文未提供定性分析。",
+            ),
+        }
+        for role, examples in absent_evidence.items():
+            for text in examples:
+                with (
+                    self.subTest(role=role, text=text),
+                    self.assertRaisesRegex(
+                        harness.PptHarnessError,
+                        f"role {role}; provide --story-plan",
+                    ),
+                ):
+                    harness._semantic_evidence_ref(
+                        role,
+                        role.title(),
+                        "Do not treat stated absence as evidence",
+                        [{"id": "ev-001", "text": text}],
+                    )
+
+    def test_conditional_roles_accept_numeric_observed_comparisons(self) -> None:
+        harness = self._require(self.harness, HARNESS_PATH)
+        measured_evidence = {
+            "ablation": (
+                "Removing the routing module changes accuracy from 82.1% to 79.4%.",
+                "W/o routing module: 79.4%; full model: 82.1%.",
+            ),
+            "robustness": (
+                "On the shifted dataset, accuracy is 78.5% versus 79.0% in-domain.",
+            ),
+        }
+        for role, examples in measured_evidence.items():
+            for text in examples:
+                with self.subTest(role=role, text=text):
+                    self.assertEqual(
+                        harness._semantic_evidence_ref(
+                            role,
+                            role.title(),
+                            "Accept an observed numeric comparison",
+                            [{"id": "ev-001", "text": text}],
+                        ),
+                        "ev-001",
+                    )
+
+    def test_default_planner_uses_supported_numeric_experimental_roles(self) -> None:
+        harness = self._require(self.harness, HARNESS_PATH)
+        evidence_texts, roles, _role_refs = self._conditioned_story_fixture()
+        evidence_texts["ev-012"] = (
+            "On the shifted dataset, accuracy is 78.5% versus 79.0% in-domain."
+        )
+        evidence_texts["ev-013"] = (
+            "W/o routing module: 79.4%; full model: 82.1%."
+        )
+        roles[11] = "robustness"
+        roles[12] = "ablation"
+        plan = harness.build_deck_plan(
+            "Create a conference deck.",
+            list(evidence_texts),
+            evidence_texts=evidence_texts,
+        )
+        self.assertEqual(
+            [str(slide["role"]) for slide in plan["slides"]],
+            roles,
+        )
 
     def test_default_planner_substitutes_unsupported_experimental_roles(self) -> None:
         harness = self._require(self.harness, HARNESS_PATH)
@@ -574,6 +659,79 @@ class AutoDesignPptSkillTests(unittest.TestCase):
                     evidence_texts=evidence_texts,
                     story_plan=story_plan,
                 )
+
+    def test_host_story_plan_rejects_negated_conditional_roles(self) -> None:
+        harness = self._require(self.harness, HARNESS_PATH)
+        cases = (
+            (11, "robustness", "We do not evaluate robustness."),
+            (12, "ablation", "We do not conduct an ablation study."),
+            (13, "qualitative", "No qualitative analysis is provided."),
+        )
+        for slot, role, text in cases:
+            evidence_texts, roles, role_refs = self._conditioned_story_fixture()
+            evidence_texts["ev-019"] = text
+            roles[slot] = role
+            role_refs[role] = "ev-019"
+            with (
+                self.subTest(role=role),
+                self.assertRaisesRegex(
+                    harness.PptHarnessError,
+                    f"role {role}.*evidence|evidence.*role {role}",
+                ),
+            ):
+                harness.build_deck_plan(
+                    "Create a conference deck.",
+                    list(evidence_texts),
+                    evidence_texts=evidence_texts,
+                    story_plan={
+                        "format_version": 1,
+                        "slides": [
+                            {
+                                "slide_id": f"slide-{index:02d}",
+                                "role": planned_role,
+                                "evidence_refs": [role_refs[planned_role]],
+                            }
+                            for index, planned_role in enumerate(roles, start=1)
+                        ],
+                    },
+                )
+
+    def test_host_story_plan_accepts_numeric_experimental_comparisons(self) -> None:
+        harness = self._require(self.harness, HARNESS_PATH)
+        cases = (
+            (
+                11,
+                "robustness",
+                "On the shifted dataset, accuracy is 78.5% versus 79.0% in-domain.",
+            ),
+            (
+                12,
+                "ablation",
+                "W/o routing module: 79.4%; full model: 82.1%.",
+            ),
+        )
+        for slot, role, text in cases:
+            evidence_texts, roles, role_refs = self._conditioned_story_fixture()
+            evidence_texts["ev-019"] = text
+            roles[slot] = role
+            role_refs[role] = "ev-019"
+            plan = harness.build_deck_plan(
+                "Create a conference deck.",
+                list(evidence_texts),
+                evidence_texts=evidence_texts,
+                story_plan={
+                    "format_version": 1,
+                    "slides": [
+                        {
+                            "slide_id": f"slide-{index:02d}",
+                            "role": planned_role,
+                            "evidence_refs": [role_refs[planned_role]],
+                        }
+                        for index, planned_role in enumerate(roles, start=1)
+                    ],
+                },
+            )
+            self.assertEqual(str(plan["slides"][slot]["role"]), role)
 
     def test_host_story_plan_rejects_wrong_slot_and_duplicate_substitutions(self) -> None:
         harness = self._require(self.harness, HARNESS_PATH)
