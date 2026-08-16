@@ -61,9 +61,12 @@ exact `data-start`, `data-duration`, `data-source-ids`, `data-narration`,
 The visible heading carries the exact `data-claim-id`. `data-hf-clip` is
 optional metadata and never replaces the literal `clip` class. Source images
 are regular local files with `data-source-id` matching the authorized visual
-catalog and its SHA-256. Scene allocations retain each visual's eligibility,
-allowed content roles, and reuse limit, and pass the shared visual-plan
-validator. Preserve native text, SVG text, tables, and equations.
+catalog and its SHA-256. The actual image `data-source-id` set inside each scene
+equals that scene's canonical `visual_ids` exactly; images may not be omitted,
+moved to another scene, or added without a plan binding. Scene allocations
+retain each visual's eligibility, allowed content roles, and reuse limit, and
+pass the shared visual-plan validator. Preserve native text, SVG text, tables,
+and equations.
 
 Include exactly one narration element before delivery:
 
@@ -81,14 +84,16 @@ selectable in the MP4 and toggleable in the editable project. They must not be
 burned in or forced. Default the HTML overlay off so the video remains
 intentionally composed without captions.
 
-Reject duplicate attributes, meta refresh, remote URLs, protocol-relative
-URLs, data/blob/javascript URLs, remote fonts, scripts, styles, media, iframes,
-executable downloads, dynamic `new Image`, `fetch`, XHR, WebSocket, EventSource,
-`sendBeacon`, dynamic imports, and CSS URLs that are absolute, encoded escapes,
-or traverse `..`. Every project path stays inside the project and is neither a
-symlink nor hard link. Rendering runs without provider credentials. A real
-Chromium preflight blocks non-project requests and clicks the subtitle control
-twice, proving `aria-pressed` and overlay visibility transition off → on → off
+Reject duplicate attributes, every inline `on*` event handler, meta refresh,
+remote URLs, protocol-relative URLs, data/blob/javascript URLs, remote fonts,
+scripts, styles, media, iframes, executable downloads, dynamic `new Image`,
+`fetch`, XHR, WebSocket, EventSource, `sendBeacon`, dynamic imports, and CSS
+URLs that are absolute, encoded escapes, or traverse `..`. Every project path
+stays inside the project and is neither a symlink nor hard link. Rendering runs
+without provider credentials. A real Chromium preflight blocks non-project
+requests and exercises every enabled interactive control. It clicks the
+subtitle control twice, proving `aria-pressed`, computed
+`display`/`visibility`, and nonzero rendered bounds transition off → on → off
 against cues from the locally generated VTT.
 
 ## Non-negotiable delivery order
@@ -144,4 +149,6 @@ Finalization is forbidden unless every delivered byte, preview, source map,
 review context, and reviewer verdict still matches its recorded hash. Before
 publishing, the project must equal the plan-derived allowlist exactly. Hidden
 files, `.env`, logs, render scratch files, and unreferenced assets are rejected,
-not copied.
+not copied. Allowlisted files are copied into a same-parent staging directory
+and atomically promoted only after the staged set is complete; a failed copy
+leaves the live artifact empty and an exact retry remains idempotent.

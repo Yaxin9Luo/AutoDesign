@@ -56,7 +56,9 @@ Run `python "$SKILL_ROOT/scripts/video_harness.py" --help` and
    [output-contract.md](references/output-contract.md). Use native HTML/CSS/SVG
    text, real paper figures, deterministic seekable timelines, one composition
    root, literal `class="clip"` scenes, literal narration audio, and a working
-   subtitle toggle. Do not add remote resources or runtime network behavior.
+   subtitle toggle. Each scene's actual source-bound image IDs must equal its
+   canonical `visual_ids` exactly. Do not add inline `on*` handlers, remote
+   resources, or runtime network behavior.
 5. Write a non-empty claims JSON list. Every planned title and narration must
    equal the text of its named claim exactly; visible numbers must occur in one
    of that scene's `visible_claim_ids`. Every claim cites real evidence IDs.
@@ -70,13 +72,16 @@ Run `python "$SKILL_ROOT/scripts/video_harness.py" --help` and
    `deliver PROJECT RUN/plan.json --run RUN --attempt ID --claims claims.json`.
    The harness enforces this order: structural validation; per-scene
    HyperFrames/Kokoro TTS and timed WAV mix; transcript/SRT/VTT and metadata;
-   strict offline Chromium interaction of the subtitle toggle; full real
+   strict offline Chromium interaction of every enabled control, including
+   computed visibility and bounds for the subtitle toggle; full real
    HyperFrames lint; strict real HyperFrames render; subtitle mux; exact
    ffprobe; representative frames and contact sheet. ffmpeg may mix audio, mux
    subtitles, and extract frames; it must never replace HyperFrames as the final
    renderer. A stale or invalid MP4 is deleted and cannot pass. Publishing uses
-   an exact generated allowlist: hidden files, `.env`, debug files, and
-   unreferenced assets fail instead of leaking into the artifact.
+   an exact generated allowlist through a sibling staging directory and atomic
+   promotion: copy failures are retryable and never expose a partial live
+   artifact. Hidden files, `.env`, debug files, and unreferenced assets fail
+   instead of leaking into the artifact.
 7. Run `review-context RUN ID`. Give the exact MP4, narration WAV, contact sheet,
    and all six individual frames to a fresh vision- and audio-capable host or
    subagent that did not author the project. The returned context exposes

@@ -315,6 +315,7 @@ class _ProjectParser(HTMLParser):
         self.srcsets: list[str] = []
         self.scripts: list[str] = []
         self.duplicate_attributes: list[dict[str, str]] = []
+        self.inline_event_handlers: list[dict[str, str]] = []
         self.meta_refreshes: list[dict[str, str]] = []
         self.scene_text: dict[str, list[str]] = {}
         self.claim_text: dict[str, list[str]] = {}
@@ -328,6 +329,9 @@ class _ProjectParser(HTMLParser):
         if duplicates:
             self.duplicate_attributes.append({"tag": tag.lower(), "attributes": " ".join(duplicates)})
         values = {name.lower(): value or "" for name, value in attrs}
+        for name in names:
+            if name.startswith("on"):
+                self.inline_event_handlers.append({"tag": tag.lower(), "attribute": name})
         if values.get("id"):
             self.elements_by_id[values["id"]] = values
         if "data-composition-id" in values:
@@ -510,6 +514,14 @@ def validate_project(
                 "duplicate_attribute",
                 "duplicate HTML attributes are forbidden because browser parsing is ambiguous",
                 elements=parser.duplicate_attributes,
+            )
+        )
+    if parser.inline_event_handlers:
+        issues.append(
+            _issue(
+                "inline_event_handler",
+                "inline on* event handlers are forbidden; use one audited local script",
+                elements=parser.inline_event_handlers,
             )
         )
     if parser.meta_refreshes:
@@ -724,6 +736,34 @@ def validate_project(
             issues.append(_issue("unsafe_local_asset", str(error), reference=reference))
 
     catalog = dict(visual_catalog or {})
+    actual_visuals_by_scene: dict[str, set[str]] = {}
+    for image in parser.images:
+        visual_id = image.get("data-source-id", "")
+        if visual_id:
+            actual_visuals_by_scene.setdefault(image.get("_scene_id", ""), set()).add(visual_id)
+    for scene_id, scene in expected_scenes.items():
+        expected_visuals = set(scene["visual_ids"])
+        actual_visuals = actual_visuals_by_scene.pop(scene_id, set())
+        if actual_visuals != expected_visuals:
+            issues.append(
+                _issue(
+                    "scene_visual_binding",
+                    "scene image source ids must exactly equal the canonical visual_ids",
+                    scene_id=scene_id,
+                    missing=sorted(expected_visuals - actual_visuals),
+                    unplanned=sorted(actual_visuals - expected_visuals),
+                )
+            )
+    for scene_id, actual_visuals in sorted(actual_visuals_by_scene.items()):
+        issues.append(
+            _issue(
+                "scene_visual_binding",
+                "source-bound image is outside a canonical scene",
+                scene_id=scene_id,
+                missing=[],
+                unplanned=sorted(actual_visuals),
+            )
+        )
     for image in parser.images:
         visual_id = image.get("data-source-id", "")
         if not visual_id:
@@ -1084,8 +1124,8 @@ const inside = value => value === projectRoot || value.startsWith(projectRoot + 
     headless: true,
     args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
   });
-  const blocked = [];
-  const pageErrors = [];
+    const blocked = [];
+    const pageErrors = [];
   try {
     const page = await browser.newPage();
     await page.setViewport({width: 1920, height: 1080, deviceScaleFactor: 1});
@@ -1106,13 +1146,29 @@ const inside = value => value === projectRoot || value.startsWith(projectRoot + 
       }
     });
     page.on('pageerror', error => pageErrors.push(String(error && error.message || error)));
+    page.on('popup', popup => {
+      blocked.push(`popup:${popup.url()}`);
+      popup.close().catch(() => {});
+    });
     await page.goto(pathToFileURL(indexPath).href, {waitUntil: 'load', timeout: 30000});
     const state = async () => page.$eval('[data-subtitle-toggle]', button => {
       const overlay = document.getElementById(button.getAttribute('aria-controls'));
       if (!overlay) throw new Error('subtitle overlay is missing');
-      return {aria_pressed: button.getAttribute('aria-pressed'), overlay_hidden: overlay.hidden};
+      const style = getComputedStyle(overlay);
+      const bounds = overlay.getBoundingClientRect();
+      return {
+        semantic: {aria_pressed: button.getAttribute('aria-pressed'), overlay_hidden: overlay.hidden},
+        computed: {
+          display: style.display,
+          visibility: style.visibility,
+          width: bounds.width,
+          height: bounds.height,
+          visible: style.display !== 'none' && !['hidden', 'collapse'].includes(style.visibility)
+            && bounds.width > 0 && bounds.height > 0,
+        },
+      };
     });
-    const initial = await state();
+    const initialState = await state();
     const subtitle = await page.$eval('[data-subtitle-toggle]', button => {
       const overlay = document.getElementById(button.getAttribute('aria-controls'));
       return {
@@ -1121,14 +1177,31 @@ const inside = value => value === projectRoot || value.startsWith(projectRoot + 
       };
     });
     await page.click('[data-subtitle-toggle]');
-    const afterFirst = await state();
+    const afterFirstState = await state();
     await page.click('[data-subtitle-toggle]');
-    const afterSecond = await state();
+    const afterSecondState = await state();
+    const controls = await page.$$('button:not([disabled]), input[type="button"]:not([disabled]), input[type="submit"]:not([disabled]), [role="button"]:not([aria-disabled="true"]), a[href^="#"]');
+    let controlsExercised = 0;
+    for (const control of controls) {
+      const isSubtitle = await control.evaluate(element => element.hasAttribute('data-subtitle-toggle'));
+      if (!isSubtitle) {
+        await control.click();
+        await new Promise(resolve => setTimeout(resolve, 50));
+      }
+      controlsExercised += 1;
+    }
     process.stdout.write(JSON.stringify({
       passed: blocked.length === 0 && pageErrors.length === 0,
-      initial,
-      after_first_click: afterFirst,
-      after_second_click: afterSecond,
+      initial: initialState.semantic,
+      after_first_click: afterFirstState.semantic,
+      after_second_click: afterSecondState.semantic,
+      computed_states: {
+        initial: initialState.computed,
+        after_first_click: afterFirstState.computed,
+        after_second_click: afterSecondState.computed,
+      },
+      control_count: controls.length,
+      controls_exercised: controlsExercised,
       blocked_requests: blocked,
       page_errors: pageErrors,
       subtitle_source: subtitle.source,
@@ -1164,6 +1237,60 @@ const inside = value => value === projectRoot || value.startsWith(projectRoot + 
     for key, expected in expected_states.items():
         if payload.get(key) != expected:
             raise StageError("browser_preflight", f"subtitle toggle state failed at {key}", failure_class="authoring")
+    computed_states = payload.get("computed_states")
+    if not isinstance(computed_states, Mapping):
+        raise StageError("browser_preflight", "computed subtitle states are missing", failure_class="runtime")
+    for key, expected_visible in (
+        ("initial", False),
+        ("after_first_click", True),
+        ("after_second_click", False),
+    ):
+        computed = computed_states.get(key)
+        if not isinstance(computed, Mapping):
+            raise StageError("browser_preflight", f"computed subtitle state is missing at {key}", failure_class="runtime")
+        visible = computed.get("visible")
+        width = computed.get("width")
+        height = computed.get("height")
+        if (
+            not isinstance(visible, bool)
+            or isinstance(width, bool)
+            or not isinstance(width, (int, float))
+            or isinstance(height, bool)
+            or not isinstance(height, (int, float))
+        ):
+            raise StageError("browser_preflight", f"computed subtitle state is invalid at {key}", failure_class="runtime")
+        if visible is not expected_visible:
+            raise StageError(
+                "browser_preflight",
+                f"computed subtitle visibility failed at {key}",
+                failure_class="authoring",
+            )
+        if expected_visible and (
+            computed.get("display") == "none"
+            or computed.get("visibility") in {"hidden", "collapse"}
+            or float(width) <= 0
+            or float(height) <= 0
+        ):
+            raise StageError(
+                "browser_preflight",
+                f"computed subtitle bounds failed at {key}",
+                failure_class="authoring",
+            )
+    control_count = payload.get("control_count")
+    controls_exercised = payload.get("controls_exercised")
+    if (
+        isinstance(control_count, bool)
+        or not isinstance(control_count, int)
+        or isinstance(controls_exercised, bool)
+        or not isinstance(controls_exercised, int)
+    ):
+        raise StageError("browser_preflight", "interactive control counts are missing", failure_class="runtime")
+    if control_count < 1 or controls_exercised != control_count:
+        raise StageError(
+            "browser_preflight",
+            "every enabled interactive control must be exercised offline",
+            failure_class="authoring",
+        )
     if payload.get("blocked_requests") or payload.get("page_errors"):
         raise StageError("browser_preflight", "offline browser observed a network request or page error", failure_class="authoring")
     cues = _vtt_cues(vtt)
@@ -1627,11 +1754,31 @@ def _actual_project_files(source: Path) -> list[str]:
     return sorted(paths)
 
 
+def _remove_tree_no_follow(path: Path) -> None:
+    if path.is_symlink():
+        path.unlink()
+        return
+    if not path.exists():
+        return
+    if not path.is_dir():
+        path.unlink()
+        return
+    for current, directories, files in os.walk(path, topdown=False, followlinks=False):
+        current_path = Path(current)
+        for name in files:
+            (current_path / name).unlink(missing_ok=True)
+        for name in directories:
+            child = current_path / name
+            if child.is_symlink():
+                child.unlink(missing_ok=True)
+            else:
+                child.rmdir()
+    path.rmdir()
+
+
 def _copy_tree_allowlist(source: Path, destination: Path, allowlist: Sequence[str]) -> list[str]:
     if source.is_symlink() or not source.is_dir():
         raise VideoContractError("delivered project must be a regular directory")
-    if destination.exists() and any(destination.iterdir()):
-        raise VideoContractError("attempt artifact directory must be empty")
     expected = sorted(dict.fromkeys(str(path) for path in allowlist))
     actual = _actual_project_files(source)
     if actual != expected:
@@ -1640,13 +1787,30 @@ def _copy_tree_allowlist(source: Path, destination: Path, allowlist: Sequence[st
         raise VideoContractError(
             f"publish allowlist mismatch; missing={missing}; unknown={unknown}"
         )
-    paths: list[str] = []
-    for relative_text in expected:
-        path = _safe_project_file(source, relative_text)
-        target = destination / relative_text
-        core.atomic_write_bytes(target, path.read_bytes())
-        paths.append(f"artifact/{relative_text}")
-    return paths
+    if destination.is_symlink() or (destination.exists() and not destination.is_dir()):
+        raise VideoContractError("attempt artifact destination must be a regular directory")
+    if destination.exists() and any(destination.iterdir()):
+        if _actual_project_files(destination) != expected or any(
+            sha256_file(_safe_project_file(destination, relative_text))
+            != sha256_file(_safe_project_file(source, relative_text))
+            for relative_text in expected
+        ):
+            raise VideoContractError("attempt artifact directory contains a partial or stale delivery")
+        return [f"artifact/{relative_text}" for relative_text in expected]
+
+    staging = destination.parent / f".artifact.stage-{uuid.uuid4().hex}"
+    staging.mkdir(mode=0o700)
+    try:
+        for relative_text in expected:
+            path = _safe_project_file(source, relative_text)
+            core.atomic_write_bytes(staging / relative_text, path.read_bytes())
+        if _actual_project_files(staging) != expected:
+            raise VideoContractError("staged artifact set differs from the publish allowlist")
+        os.replace(staging, destination)
+    except Exception:
+        _remove_tree_no_follow(staging)
+        raise
+    return [f"artifact/{relative_text}" for relative_text in expected]
 
 
 def record_attempt_delivery(
@@ -1880,11 +2044,12 @@ html,body{{margin:0;width:1920px;height:1080px;overflow:hidden;background:#10182
 [data-composition-id]{{position:relative;width:1920px;height:1080px}}.clip{{position:absolute;inset:0;display:grid;place-content:center;padding:120px}}
 h1{{font-size:120px;margin:20px 0}}p{{font-size:34px}}.subtitle-overlay[hidden]{{display:none}}
 [data-subtitle-toggle]{{position:absolute;right:48px;bottom:40px;z-index:100;padding:16px 20px}}
+#smoke-details{{position:absolute;left:48px;bottom:40px;z-index:100;padding:16px 20px}}
 .subtitle-overlay{{position:absolute;left:20%;right:20%;bottom:100px;z-index:99;background:#000c;padding:20px}}
 </style></head><body><main data-composition-id="smoke" data-start="0" data-duration="{plan["duration_s"]}" data-width="1920" data-height="1080" data-no-timeline>
 {''.join(sections)}<audio id="narration" class="clip" src="assets/narration.wav" data-start="0" data-duration="{plan["duration_s"]}" data-track-index="2" data-media-start="0"></audio>
-<button type="button" data-subtitle-toggle aria-pressed="false" aria-controls="subtitles">CC</button><div id="subtitles" class="subtitle-overlay" data-subtitle-source="narration/subtitles.en.vtt" hidden>{''.join(f'<span data-subtitle-cue>{html.escape(scene["narration"])}</span>' for scene in plan["scenes"])}</div></main>
-<script>document.querySelector('[data-subtitle-toggle]').addEventListener('click',event=>{{const button=event.currentTarget;const target=document.getElementById('subtitles');const shown=button.getAttribute('aria-pressed')==='true';button.setAttribute('aria-pressed',String(!shown));target.hidden=shown;}});</script></body></html>'''
+<button type="button" data-subtitle-toggle aria-pressed="false" aria-controls="subtitles">CC</button><button type="button" id="smoke-details">Details</button><div id="subtitles" class="subtitle-overlay" data-subtitle-source="narration/subtitles.en.vtt" hidden>{''.join(f'<span data-subtitle-cue>{html.escape(scene["narration"])}</span>' for scene in plan["scenes"])}</div></main>
+<script>document.querySelector('[data-subtitle-toggle]').addEventListener('click',event=>{{const button=event.currentTarget;const target=document.getElementById('subtitles');const shown=button.getAttribute('aria-pressed')==='true';button.setAttribute('aria-pressed',String(!shown));target.hidden=shown;}});document.getElementById('smoke-details').addEventListener('click',event=>event.currentTarget.setAttribute('data-exercised','true'));</script></body></html>'''
     _write_text(project / "index.html", html_text)
     _write_json(project / "hyperframes.json", {"version": 1, "entry": "index.html"})
     return project
@@ -2003,9 +2168,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             if not isinstance(claims_value, list):
                 raise VideoContractError("claims JSON must be a list")
             evidence_ids, catalog = _source_contract(args.run)
+            canonical_plan, _canonical_plan_sha256 = load_canonical_delivery_plan(
+                args.run, args.plan_json
+            )
             result = validate_project(
                 args.project,
-                _read_json(args.plan_json),
+                canonical_plan,
                 run_dir=args.run,
                 evidence_ids=evidence_ids,
                 visual_catalog=catalog,

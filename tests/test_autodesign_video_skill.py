@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import contextlib
 import importlib.util
 import hashlib
 import html
+import io
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -157,6 +160,21 @@ def _project_html(plan: dict[str, object], *, bad: str = "") -> str:
     duplicate_attr = ' src="https://example.com/second.png"' if bad == "duplicate-attr" else ""
     css_escape = "<div style=\"background:url('../escape.png')\"></div>" if bad == "css-escape" else ""
     css_absolute = "<div style=\"background:url('/etc/passwd')\"></div>" if bad == "css-absolute" else ""
+    inline_handler = (
+        '<button type="button" onclick="fetch(\'https://example.com/track\')">Track</button>'
+        if bad == "inline-handler"
+        else ""
+    )
+    secondary_control = (
+        '<button type="button" id="secondary-control">Details</button>'
+        if bad == "secondary-control"
+        else ""
+    )
+    subtitle_override = (
+        ".subtitle-overlay[hidden]{display:block !important;visibility:visible !important}"
+        if bad == "subtitle-css-override"
+        else ""
+    )
     subtitle_button = "" if bad == "no-subtitle-toggle" else (
         f'<button type="button" data-subtitle-toggle aria-pressed="{str(bad == "subtitles-default-on").lower()}" '
         'aria-controls="subtitles">CC</button>'
@@ -173,6 +191,7 @@ def _project_html(plan: dict[str, object], *, bad: str = "") -> str:
 html,body{{margin:0;width:1920px;height:1080px;overflow:hidden}}
 [data-composition-id]{{position:relative;width:1920px;height:1080px;background:#101820;color:white}}
 .clip{{position:absolute;inset:0}} .subtitle-overlay[hidden]{{display:none}}
+{subtitle_override}
 </style></head><body>
 <main data-composition-id="conference-video" data-start="{root_start}"
       data-duration="{plan['duration_s']}" data-width="1920" data-height="1080"
@@ -181,7 +200,7 @@ html,body{{margin:0;width:1920px;height:1080px;overflow:hidden}}
     data-subtitle-source="narration/subtitles.en.vtt"{subtitle_hidden}>
     {''.join(f'<span>{html.escape(str(scene["narration"]))}</span>' for scene in scenes)}
   </div>
-  {remote}{data_url}{remote_css}{iframe}{css_escape}{css_absolute}
+  {remote}{data_url}{remote_css}{iframe}{css_escape}{css_absolute}{inline_handler}{secondary_control}
   {f'<img src="assets/figure.png"{duplicate_attr} data-source-id="vis-001" alt="duplicate">' if duplicate_attr else ''}
 </main>{extra_root}
 <script>{unsafe_script}
@@ -209,7 +228,15 @@ def _make_executable(path: Path, body: str) -> Path:
     return path
 
 
-def _fake_runtime(root: Path, *, fail_stage: str = "", stale_render: bool = False) -> dict[str, str]:
+def _fake_runtime(
+    root: Path,
+    *,
+    fail_stage: str = "",
+    stale_render: bool = False,
+    subtitle_css_override: bool = False,
+    control_count: int = 1,
+    controls_exercised: int = 1,
+) -> dict[str, str]:
     bin_dir = root / "fake-bin"
     bin_dir.mkdir(parents=True)
     log = root / "commands.jsonl"
@@ -284,6 +311,8 @@ def _fake_runtime(root: Path, *, fail_stage: str = "", stale_render: bool = Fals
         """,
     )
     browser = _make_executable(bin_dir / "chrome-headless-shell", "raise SystemExit(0)")
+    hidden_display = "block" if subtitle_css_override else "none"
+    hidden_extent = 640 if subtitle_css_override else 0
     node = _make_executable(
         bin_dir / "node",
         """
@@ -296,6 +325,16 @@ def _fake_runtime(root: Path, *, fail_stage: str = "", stale_render: bool = Fals
           'initial': {'aria_pressed': 'false', 'overlay_hidden': True},
           'after_first_click': {'aria_pressed': 'true', 'overlay_hidden': False},
           'after_second_click': {'aria_pressed': 'false', 'overlay_hidden': True},
+          'computed_states': {
+            'initial': {'display': %r, 'visibility': 'visible',
+                        'width': %d, 'height': %d, 'visible': %r},
+            'after_first_click': {'display': 'block', 'visibility': 'visible',
+                                  'width': 640, 'height': 80, 'visible': True},
+            'after_second_click': {'display': %r, 'visibility': 'visible',
+                                   'width': %d, 'height': %d, 'visible': %r},
+          },
+          'control_count': %d,
+          'controls_exercised': %d,
           'blocked_requests': [],
           'page_errors': [],
           'cue_count': len(cues),
@@ -304,7 +343,18 @@ def _fake_runtime(root: Path, *, fail_stage: str = "", stale_render: bool = Fals
           'overlay_texts': cues,
           'subtitle_source_sha256': hashlib.sha256(vtt.read_bytes()).hexdigest() if vtt else '',
         }))
-        """,
+        """ % (
+            hidden_display,
+            hidden_extent,
+            80 if subtitle_css_override else 0,
+            subtitle_css_override,
+            hidden_display,
+            hidden_extent,
+            80 if subtitle_css_override else 0,
+            subtitle_css_override,
+            control_count,
+            controls_exercised,
+        ),
     )
     return {
         "status": "ready",
@@ -592,6 +642,62 @@ class AutoDesignVideoSkillTests(unittest.TestCase):
         self.assertFalse(report["passed"])
         self.assertIn("visual_reuse_limit", {item["code"] for item in report["issues"]})
 
+    def test_each_scene_image_set_must_equal_its_canonical_visual_ids(self) -> None:
+        """Catches omitted, moved, or extra source visuals that still hash correctly."""
+        harness = self._require(self.harness, HARNESS_PATH)
+        plan = _plan()
+        image = (
+            '<img src="assets/figure.png" data-source-id="vis-001" '
+            'alt="Source method figure">'
+        )
+        catalog = {
+            "vis-001": {
+                "path": "",
+                "sha256": "",
+            }
+        }
+        for case in ("missing", "wrong-scene", "unplanned"):
+            with self.subTest(case=case):
+                project = _write_project(self.root / case, plan)
+                index = project / "index.html"
+                text = index.read_text(encoding="utf-8")
+                if case == "missing":
+                    text = text.replace(image, "", 1)
+                elif case == "wrong-scene":
+                    text = text.replace(image, "", 1)
+                    text = re.sub(
+                        r'(<section id="scene_05".*?<h2[^>]*>.*?</h2>)',
+                        rf"\1{image}",
+                        text,
+                        count=1,
+                        flags=re.DOTALL,
+                    )
+                else:
+                    text = re.sub(
+                        r'(<section id="scene_01".*?<h2[^>]*>.*?</h2>)',
+                        rf"\1{image}",
+                        text,
+                        count=1,
+                        flags=re.DOTALL,
+                    )
+                index.write_text(text, encoding="utf-8")
+                catalog["vis-001"]["path"] = str(project / "assets" / "figure.png")
+                catalog["vis-001"]["sha256"] = harness.sha256_file(
+                    project / "assets" / "figure.png"
+                )
+                report = harness.validate_project(
+                    project,
+                    plan,
+                    evidence_ids={"ev-001"},
+                    visual_catalog=catalog,
+                    claims=_claims(plan),
+                )
+                self.assertFalse(report["passed"], case)
+                self.assertIn(
+                    "scene_visual_binding",
+                    {item["code"] for item in report["issues"]},
+                )
+
     def test_structural_validation_rejects_unsafe_or_noncanonical_projects(self) -> None:
         harness = self._require(self.harness, HARNESS_PATH)
         for bad, code in (
@@ -619,6 +725,36 @@ class AutoDesignVideoSkillTests(unittest.TestCase):
                 self.assertFalse(report["passed"])
                 self.assertIn(code, {item["code"] for item in report["issues"]})
 
+    def test_inline_event_handlers_are_rejected_and_all_controls_must_be_exercised(self) -> None:
+        """Catches hidden onclick network behavior and untested secondary controls."""
+        harness = self._require(self.harness, HARNESS_PATH)
+        plan = _plan()
+        inline = _write_project(self.root / "inline", plan, bad="inline-handler")
+        structural = harness.validate_project(
+            inline,
+            plan,
+            evidence_ids={"ev-001"},
+            claims=_claims(plan),
+        )
+        self.assertFalse(structural["passed"])
+        self.assertIn("inline_event_handler", {item["code"] for item in structural["issues"]})
+
+        secondary = _write_project(self.root / "secondary", plan, bad="secondary-control")
+        report = harness.deliver_project(
+            secondary,
+            plan,
+            _fake_runtime(
+                self.root / "secondary-runtime",
+                control_count=2,
+                controls_exercised=1,
+            ),
+            claims=_claims(plan),
+            smoke=True,
+        )
+        self.assertFalse(report["passed"])
+        self.assertEqual(report["failed_stage"], "browser_preflight")
+        self.assertIn("control", report["error"].lower())
+
     def test_delivery_runs_strict_offline_browser_toggle_and_binds_generated_vtt(self) -> None:
         harness = self._require(self.harness, HARNESS_PATH)
         plan = _plan()
@@ -642,6 +778,22 @@ class AutoDesignVideoSkillTests(unittest.TestCase):
             browser["subtitle_source_sha256"],
             harness.sha256_file(project / "narration" / "subtitles.en.vtt"),
         )
+
+    def test_subtitle_toggle_uses_computed_visibility_not_only_hidden_attribute(self) -> None:
+        """Catches CSS !important rules that visually override the hidden attribute."""
+        harness = self._require(self.harness, HARNESS_PATH)
+        plan = _plan()
+        project = _write_project(self.root, plan, bad="subtitle-css-override")
+        report = harness.deliver_project(
+            project,
+            plan,
+            _fake_runtime(self.root, subtitle_css_override=True),
+            claims=_claims(plan),
+            smoke=True,
+        )
+        self.assertFalse(report["passed"])
+        self.assertEqual(report["failed_stage"], "browser_preflight")
+        self.assertIn("computed", report["error"].lower())
 
     def test_source_visual_binding_rejects_missing_hash_symlink_and_hardlink(self) -> None:
         harness = self._require(self.harness, HARNESS_PATH)
@@ -850,6 +1002,71 @@ class AutoDesignVideoSkillTests(unittest.TestCase):
         with self.assertRaisesRegex(harness.VideoContractError, "canonical run plan"):
             harness.load_canonical_delivery_plan(run, supplied)
 
+    def test_validate_cli_rejects_a_reserialized_or_drifted_noncanonical_plan(self) -> None:
+        """Catches validate accepting plan bytes that deliver must later reject."""
+        harness = self._require(self.harness, HARNESS_PATH)
+        core = harness.core
+        plan = _plan()
+        for scene in plan["scenes"]:
+            scene["visual_ids"] = []
+        source = self.root / "source.md"
+        source.write_text(
+            "# Grounded video\n\n"
+            + "\n\n".join(str(claim["text"]) for claim in _claims(plan))
+            + "\n",
+            encoding="utf-8",
+        )
+        run = self.root / "validate-run"
+        core.initialize_run(run, SKILL_ROOT, release_version="0.1.0")
+        core.prepare_source(run, source)
+        core.save_plan(run, harness.normalize_plan(plan))
+        project = _write_project(self.root / "validate-project", plan)
+        claims_path = self.root / "claims.json"
+        claims_path.write_text(json.dumps(_claims(plan)), encoding="utf-8")
+        canonical_plan = harness.normalize_plan(plan)
+        drifted_plan = json.loads(json.dumps(canonical_plan))
+        drifted_plan["max_attempts"] = 5
+        for label, payload in (
+            ("reserialized", canonical_plan),
+            ("drifted", drifted_plan),
+        ):
+            with self.subTest(label=label):
+                supplied = self.root / f"{label}-plan.json"
+                supplied.write_text(json.dumps(payload), encoding="utf-8")
+                stdout = io.StringIO()
+                stderr = io.StringIO()
+                with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                    result = harness.main(
+                        [
+                            "validate",
+                            str(project),
+                            str(supplied),
+                            "--run",
+                            str(run),
+                            "--claims",
+                            str(claims_path),
+                        ]
+                    )
+                self.assertEqual(result, 2)
+                self.assertIn("canonical run plan", stderr.getvalue())
+
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            result = harness.main(
+                [
+                    "validate",
+                    str(project),
+                    str(run / "plan.json"),
+                    "--run",
+                    str(run),
+                    "--claims",
+                    str(claims_path),
+                ]
+            )
+        self.assertEqual(result, 0, stderr.getvalue())
+        self.assertTrue(json.loads(stdout.getvalue())["passed"])
+
     def test_publish_allowlist_rejects_hidden_unknown_and_unreferenced_files(self) -> None:
         harness = self._require(self.harness, HARNESS_PATH)
         core = harness.core
@@ -886,6 +1103,68 @@ class AutoDesignVideoSkillTests(unittest.TestCase):
                     )
                 path.unlink()
         self.assertEqual(list((run / "attempts" / attempt_id / "artifact").iterdir()), [])
+
+    def test_publish_copy_failure_is_crash_atomic_and_retryable(self) -> None:
+        """Catches partial live artifacts that make an identical retry impossible."""
+        harness = self._require(self.harness, HARNESS_PATH)
+        core = harness.core
+        plan = _plan()
+        source = self.root / "source.md"
+        source.write_text(
+            "# Grounded video\n\n"
+            + "\n\n".join(str(claim["text"]) for claim in _claims(plan))
+            + "\n",
+            encoding="utf-8",
+        )
+        run = self.root / "atomic-run"
+        core.initialize_run(run, SKILL_ROOT, release_version="0.1.0")
+        core.prepare_source(run, source)
+        core.save_plan(run, harness.normalize_plan(plan))
+        attempt_id = core.begin_attempt(run)
+        project = _write_project(self.root / "atomic-project", plan)
+        report = harness.deliver_project(
+            project,
+            plan,
+            _fake_runtime(self.root / "atomic-runtime"),
+            claims=_claims(plan),
+            canonical_plan_sha256=harness.sha256_file(run / "plan.json"),
+            smoke=True,
+        )
+        self.assertTrue(report["passed"], report)
+        original_write = core.atomic_write_bytes
+        failed = False
+
+        def fail_mid_publish(path: Path | str, data: bytes) -> None:
+            nonlocal failed
+            destination = Path(path)
+            if destination.name == "contact-sheet.png" and "qa" not in destination.parts and not failed:
+                failed = True
+                raise OSError("simulated publish crash")
+            original_write(path, data)
+
+        with mock.patch.object(core, "atomic_write_bytes", side_effect=fail_mid_publish):
+            with self.assertRaisesRegex(OSError, "simulated publish crash"):
+                harness.record_attempt_delivery(
+                    run,
+                    attempt_id,
+                    project,
+                    report,
+                    claims=_claims(plan),
+                )
+        artifact = run / "attempts" / attempt_id / "artifact"
+        self.assertEqual(list(artifact.iterdir()), [])
+        self.assertEqual(
+            list((run / "attempts" / attempt_id).glob(".artifact.stage-*")),
+            [],
+        )
+        result = harness.record_attempt_delivery(
+            run,
+            attempt_id,
+            project,
+            report,
+            claims=_claims(plan),
+        )
+        self.assertTrue(result["passed"], result)
 
     def test_stale_render_output_cannot_satisfy_delivery(self) -> None:
         harness = self._require(self.harness, HARNESS_PATH)
@@ -1286,6 +1565,15 @@ class AutoDesignVideoSkillTests(unittest.TestCase):
         self.assertEqual(probe["subtitle_language"], "eng")
         self.assertFalse(probe["subtitle_forced"])
         self.assertTrue(Path(evidence["contact_sheet"]).is_file())
+        browser = next(
+            stage for stage in evidence["report"]["stages"]
+            if stage["id"] == "browser_preflight"
+        )
+        self.assertEqual(browser["control_count"], 2)
+        self.assertEqual(browser["controls_exercised"], 2)
+        self.assertFalse(browser["computed_states"]["initial"]["visible"])
+        self.assertTrue(browser["computed_states"]["after_first_click"]["visible"])
+        self.assertFalse(browser["computed_states"]["after_second_click"]["visible"])
 
 
 if __name__ == "__main__":
