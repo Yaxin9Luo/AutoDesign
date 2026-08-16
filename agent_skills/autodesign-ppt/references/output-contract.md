@@ -57,7 +57,13 @@ contains exactly one object per requested slide, in order, with only:
 The harness rejects unknown evidence, ungrounded or out-of-phase substitutions,
 duplicated roles, a broken or reordered narrative backbone, and count
 mismatches before hashing the immutable plan. Every role must be supported by
-its cited evidence. If no host story plan is passed, the deterministic fallback
+its cited evidence. A bare `without`, `variant`, `variance`, `generalization`,
+`example`, or `visualization` token is not sufficient. Ablation needs explicit
+ablation terminology or a component/variant comparison plus measured effect;
+robustness needs explicit robustness terminology or a changed condition plus a
+measured stability/result signal; qualitative evidence needs explicit
+qualitative terminology or a case/visual plus an observed behavior or finding.
+If no host story plan is passed, the deterministic fallback
 scores role-distinctive evidence concepts for each slide and applies the same
 conditional substitutions. A match must clear the minimum and beat the
 runner-up by a fixed margin; generic words such as “method” or “result” cannot

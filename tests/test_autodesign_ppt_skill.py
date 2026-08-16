@@ -429,6 +429,68 @@ class AutoDesignPptSkillTests(unittest.TestCase):
                     evidence,
                 )
 
+    def test_conditional_roles_reject_generic_single_token_evidence(self) -> None:
+        harness = self._require(self.harness, HARNESS_PATH)
+        weak_evidence = {
+            "ablation": (
+                "The framework operates without external supervision.",
+                "The architecture uses a model variant.",
+                "We remove a module from the configuration; accuracy is the metric.",
+            ),
+            "robustness": (
+                "The appendix reports the variance definition.",
+                "The architecture targets generalization.",
+                "Across datasets, accuracy is the evaluation metric.",
+            ),
+            "qualitative": (
+                "For example, the repository includes visualization tooling.",
+            ),
+        }
+        for role, examples in weak_evidence.items():
+            for text in examples:
+                with (
+                    self.subTest(role=role, text=text),
+                    self.assertRaisesRegex(
+                        harness.PptHarnessError,
+                        f"role {role}; provide --story-plan",
+                    ),
+                ):
+                    harness._semantic_evidence_ref(
+                        role,
+                        role.title(),
+                        "Use only distinctive experimental evidence",
+                        [{"id": "ev-001", "text": text}],
+                    )
+
+    def test_conditional_roles_accept_explicit_or_combined_experimental_evidence(self) -> None:
+        harness = self._require(self.harness, HARNESS_PATH)
+        supported_evidence = {
+            "ablation": (
+                "The ablation study removes the router and reports an accuracy drop.",
+                "Comparing the model with and without the routing module reduces accuracy by two points.",
+            ),
+            "robustness": (
+                "The robustness evaluation remains stable under distribution shift.",
+                "Across datasets, accuracy remains stable under noisy inputs.",
+            ),
+            "qualitative": (
+                "Qualitative analysis shows representative failure examples.",
+                "A representative case study illustrates the model's failure behavior.",
+            ),
+        }
+        for role, examples in supported_evidence.items():
+            for text in examples:
+                with self.subTest(role=role, text=text):
+                    self.assertEqual(
+                        harness._semantic_evidence_ref(
+                            role,
+                            role.title(),
+                            "Use only distinctive experimental evidence",
+                            [{"id": "ev-001", "text": text}],
+                        ),
+                        "ev-001",
+                    )
+
     def test_default_planner_substitutes_unsupported_experimental_roles(self) -> None:
         harness = self._require(self.harness, HARNESS_PATH)
         evidence_texts, expected_roles, role_refs = self._conditioned_story_fixture()
@@ -479,31 +541,39 @@ class AutoDesignPptSkillTests(unittest.TestCase):
 
     def test_host_story_plan_rejects_an_ungrounded_conditional_role(self) -> None:
         harness = self._require(self.harness, HARNESS_PATH)
-        evidence_texts, roles, role_refs = self._conditioned_story_fixture()
-        evidence_texts["ev-019"] = "The method improves the result."
-        roles[12] = "ablation"
-        role_refs["ablation"] = "ev-019"
-        story_plan = {
-            "format_version": 1,
-            "slides": [
-                {
-                    "slide_id": f"slide-{index:02d}",
-                    "role": role,
-                    "evidence_refs": [role_refs[role]],
-                }
-                for index, role in enumerate(roles, start=1)
-            ],
-        }
-        with self.assertRaisesRegex(
-            harness.PptHarnessError,
-            "role ablation.*evidence|evidence.*role ablation",
+        for weak_ablation in (
+            "The method improves the result.",
+            "The architecture uses a model variant.",
+            "The framework operates without external supervision.",
         ):
-            harness.build_deck_plan(
-                "Create a conference deck.",
-                list(evidence_texts),
-                evidence_texts=evidence_texts,
-                story_plan=story_plan,
-            )
+            evidence_texts, roles, role_refs = self._conditioned_story_fixture()
+            evidence_texts["ev-019"] = weak_ablation
+            roles[12] = "ablation"
+            role_refs["ablation"] = "ev-019"
+            story_plan = {
+                "format_version": 1,
+                "slides": [
+                    {
+                        "slide_id": f"slide-{index:02d}",
+                        "role": role,
+                        "evidence_refs": [role_refs[role]],
+                    }
+                    for index, role in enumerate(roles, start=1)
+                ],
+            }
+            with (
+                self.subTest(weak_ablation=weak_ablation),
+                self.assertRaisesRegex(
+                    harness.PptHarnessError,
+                    "role ablation.*evidence|evidence.*role ablation",
+                ),
+            ):
+                harness.build_deck_plan(
+                    "Create a conference deck.",
+                    list(evidence_texts),
+                    evidence_texts=evidence_texts,
+                    story_plan=story_plan,
+                )
 
     def test_host_story_plan_rejects_wrong_slot_and_duplicate_substitutions(self) -> None:
         harness = self._require(self.harness, HARNESS_PATH)

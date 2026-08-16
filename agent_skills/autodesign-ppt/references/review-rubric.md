@@ -37,6 +37,8 @@ localized evidence are invalid repair instructions.
 - an unsupported conditional experiment role, an ungrounded or out-of-phase
   role substitution, or a broken problem -> method -> evidence -> takeaway
   backbone;
+- a conditional experiment role authorized only by a generic token instead of
+  explicit terminology or the required condition/comparison plus observed result;
 - a slide not inspected by the reviewer;
 - illegible, clipped, overlapping, or blank content;
 - visible remote/missing asset or runtime error;

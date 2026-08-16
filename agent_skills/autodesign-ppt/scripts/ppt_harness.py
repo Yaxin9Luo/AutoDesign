@@ -361,6 +361,142 @@ _ROLE_DISTINCTIVE_CONCEPTS = {
         ("table", "表"),
     ),
 }
+
+_CONDITIONAL_ROLE_SIGNAL_RULES = {
+    "ablation": (
+        (("ablation", "消融"),),
+        (
+            (
+                "with and without",
+                "component removal",
+                "module removal",
+                "remov",
+                "去除",
+                "移除",
+            ),
+            ("component", "module", "block", "组件", "模块"),
+            (
+                "compare",
+                "comparison",
+                "effect",
+                "drop",
+                "decreas",
+                "increas",
+                "reduc",
+                "improv",
+                "gain",
+                "比较",
+                "影响",
+                "下降",
+                "提升",
+                "增益",
+            ),
+        ),
+        (
+            ("variant comparison", "compare variants", "变体比较", "变体对比"),
+            (
+                "effect",
+                "drop",
+                "decreas",
+                "increas",
+                "reduc",
+                "improv",
+                "gain",
+                "影响",
+                "下降",
+                "提升",
+                "增益",
+            ),
+        ),
+    ),
+    "robustness": (
+        (("robustness", "robust", "鲁棒性", "鲁棒"),),
+        (
+            (
+                "across dataset",
+                "across condition",
+                "distribution shift",
+                "out-of-domain",
+                "perturb",
+                "noisy input",
+                "sensitivity",
+                "variance",
+                "generalization",
+                "跨数据集",
+                "跨条件",
+                "分布偏移",
+                "域外",
+                "扰动",
+                "噪声",
+                "敏感性",
+                "方差",
+                "泛化",
+            ),
+            (
+                "stable",
+                "consistent",
+                "remain",
+                "hold",
+                "degrad",
+                "drop",
+                "decreas",
+                "increas",
+                "improv",
+                "稳定",
+                "一致",
+                "保持",
+                "下降",
+                "提升",
+            ),
+        ),
+    ),
+    "qualitative": (
+        (
+            (
+                "qualitative analysis",
+                "qualitative evidence",
+                "qualitative result",
+                "qualitative evaluation",
+                "qualitative example",
+                "qualitative comparison",
+                "定性分析",
+                "定性证据",
+                "定性结果",
+                "定性评估",
+                "定性示例",
+                "定性对比",
+            ),
+        ),
+        (
+            (
+                "case study",
+                "case-study",
+                "representative case",
+                "failure example",
+                "visual example",
+                "visualization",
+                "案例",
+                "示例",
+                "可视化",
+            ),
+            (
+                "show",
+                "illustrat",
+                "demonstrat",
+                "visualize",
+                "behavior",
+                "finding",
+                "failure",
+                "表明",
+                "展示",
+                "说明",
+                "行为",
+                "发现",
+                "失败",
+            ),
+        ),
+    ),
+}
 _SEMANTIC_MIN_CONCEPTS = 1
 _SEMANTIC_MARGIN = 1
 
@@ -502,14 +638,25 @@ def _semantic_role_key(role: str) -> str:
 
 
 def _role_evidence_score(role: str, text: str) -> int:
-    concepts = _ROLE_DISTINCTIVE_CONCEPTS.get(_semantic_role_key(role), ())
+    semantic_role = _semantic_role_key(role)
+    concepts = _ROLE_DISTINCTIVE_CONCEPTS.get(semantic_role, ())
     normalized = " ".join(
         unicodedata.normalize("NFKC", text).casefold().split()
     )
-    return sum(
+    rules = _CONDITIONAL_ROLE_SIGNAL_RULES.get(semantic_role)
+    if rules is not None and not any(
+        all(
+            any(_semantic_term_present(normalized, term) for term in group)
+            for group in alternative
+        )
+        for alternative in rules
+    ):
+        return 0
+    score = sum(
         any(_semantic_term_present(normalized, term) for term in alternatives)
         for alternatives in concepts
     )
+    return max(score, 1) if rules is not None else score
 
 
 def _semantic_evidence_candidate(
