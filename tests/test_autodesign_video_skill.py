@@ -2011,7 +2011,9 @@ class AutoDesignVideoSkillTests(unittest.TestCase):
         self.assertTrue(probe["passed"], probe)
         self.assertEqual(probe["subtitle_language"], "eng")
         self.assertFalse(probe["subtitle_forced"])
-        self.assertTrue(Path(evidence["contact_sheet"]).is_file())
+        self.assertTrue(
+            (Path(evidence["project"]) / evidence["contact_sheet"]).is_file()
+        )
         browser = next(
             stage for stage in evidence["report"]["stages"]
             if stage["id"] == "browser_preflight"
