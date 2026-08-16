@@ -11,13 +11,14 @@ import platform
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import time
 import urllib.error
 import urllib.request
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
 
@@ -33,6 +34,8 @@ import setup_browser  # noqa: E402
 HYPERFRAMES_VERSION = "0.7.86"
 KOKORO_ONNX_VERSION = "0.5.0"
 SOUNDFILE_VERSION = "0.14.0"
+PYTHON_LOCK_PATH = SKILL_ROOT / "assets" / "video-runtime" / "requirements-kokoro.lock"
+PYTHON_LOCK_SHA256 = "f4ecd858f55479aa689578d66cae8e9e7d9568827b6292a016aba54a35b197b3"
 MIN_TTS_PYTHON = (3, 10)
 MAX_TTS_PYTHON = (3, 12)
 KOKORO_MODEL_SHA256 = (
@@ -62,6 +65,8 @@ _NETWORK_ENV_NAMES = {
     "https_proxy", "http_proxy", "no_proxy",
 }
 _STATE_KEYS = {
+    "browser_relative",
+    "browser_sha256",
     "browser_ensured",
     "cache_key",
     "ffmpeg_binary",
@@ -80,12 +85,21 @@ _STATE_KEYS = {
     "node_major",
     "package_lock_sha256",
     "package_sha256",
+    "python_lock_sha256",
     "python_major_minor",
     "python_relative",
     "soundfile_version",
     "system",
     "tts_smoke_relative",
     "tts_smoke_sha256",
+}
+_SUPPORTED_TARGETS = {
+    ("darwin", "arm64"),
+    ("darwin", "x86_64"),
+    ("linux", "aarch64"),
+    ("linux", "x86_64"),
+    ("windows", "amd64"),
+    ("windows", "x86_64"),
 }
 
 
@@ -100,8 +114,10 @@ class VideoRuntimeSpec:
     cache_dir: Path
     package_json: Path
     package_lock: Path
+    python_lock: Path
     package_sha256: str
     package_lock_sha256: str
+    python_lock_sha256: str
     system: str
     machine: str
     python_major_minor: str
@@ -120,6 +136,7 @@ class VideoRuntime:
     hyperframes_executable: Path
     python_executable: Path
     node_binary: Path
+    browser_executable: Path
     ffmpeg_binary: Path
     ffprobe_binary: Path
     state_path: Path
@@ -133,6 +150,8 @@ class VideoRuntime:
             "hyperframes": str(self.hyperframes_executable),
             "python": str(self.python_executable),
             "node": str(self.node_binary),
+            "node_root": str(self.hyperframes_executable.parents[2]),
+            "browser": str(self.browser_executable),
             "ffmpeg": str(self.ffmpeg_binary),
             "ffprobe": str(self.ffprobe_binary),
             "hyperframes_version": self.hyperframes_version,
@@ -252,17 +271,29 @@ def runtime_spec(*, cache_root: Path | None = None) -> VideoRuntimeSpec:
     package_root = SKILL_ROOT / "assets" / "video-runtime"
     package_json = (package_root / "package.json").resolve(strict=True)
     package_lock = (package_root / "package-lock.json").resolve(strict=True)
+    python_lock = PYTHON_LOCK_PATH.resolve(strict=True)
+    observed_python_lock_sha256 = _sha256(python_lock)
+    if observed_python_lock_sha256 != PYTHON_LOCK_SHA256:
+        raise VideoRuntimeError("Python lock checksum does not match this Skill release")
     node = shutil.which("node")
     npm = shutil.which("npm")
     _, node_major = _node_version(Path(node) if node else None)
     system = _slug(platform.system())
     machine = _slug(platform.machine())
+    if (system, machine) not in _SUPPORTED_TARGETS:
+        raise VideoRuntimeError(
+            f"unsupported video runtime platform: {system}/{machine}"
+        )
     python_binary, python = _select_tts_python()
     identity = (
         f"v{RUNTIME_FORMAT_VERSION}|{system}|{machine}|py{python}|"
-        f"node{node_major or 'missing'}|hyperframes{HYPERFRAMES_VERSION}"
+        f"node{node_major or 'missing'}|hyperframes{HYPERFRAMES_VERSION}|"
+        f"python-lock={observed_python_lock_sha256}"
     )
-    key = f"runtime-v{RUNTIME_FORMAT_VERSION}-hf0786-{hashlib.sha256(identity.encode()).hexdigest()[:12]}"
+    key = (
+        f"v{RUNTIME_FORMAT_VERSION}-hf0786-"
+        f"{observed_python_lock_sha256[:12]}-{hashlib.sha256(identity.encode()).hexdigest()[:4]}"
+    )
     cache_dir = root / key
     if system == "darwin" and python != "missing":
         espeak_data_path = (
@@ -285,8 +316,10 @@ def runtime_spec(*, cache_root: Path | None = None) -> VideoRuntimeSpec:
         cache_dir=cache_dir,
         package_json=package_json,
         package_lock=package_lock,
+        python_lock=python_lock,
         package_sha256=_sha256(package_json),
         package_lock_sha256=_sha256(package_lock),
+        python_lock_sha256=observed_python_lock_sha256,
         system=system,
         machine=machine,
         python_major_minor=python,
@@ -377,6 +410,7 @@ def _runtime_from_state(spec: VideoRuntimeSpec, state: Mapping[str, object]) -> 
         allow_executable_symlink=True,
         allowed_external_target=spec.python_binary,
     )
+    browser = _safe_runtime_file(spec.cache_dir, str(state["browser_relative"]))
     home = spec.cache_dir / str(state["home_relative"])
     if home.is_symlink() or not home.is_dir() or not _is_within(home.resolve(), spec.cache_dir.resolve()):
         raise VideoRuntimeError("Runtime HOME is missing, symlinked, or outside the cache")
@@ -392,10 +426,118 @@ def _runtime_from_state(spec: VideoRuntimeSpec, state: Mapping[str, object]) -> 
         hyperframes_executable=hyperframes,
         python_executable=python,
         node_binary=node,
+        browser_executable=browser,
         ffmpeg_binary=ffmpeg,
         ffprobe_binary=ffprobe,
         state_path=spec.cache_dir / "runtime-state.json",
     )
+
+
+def _python_site_packages(venv: Path) -> list[Path]:
+    if os.name == "nt":
+        candidates = [venv / "Lib" / "site-packages"]
+    else:
+        candidates = sorted((venv / "lib").glob("python*/site-packages"))
+    return [path for path in candidates if path.is_dir() and not path.is_symlink()]
+
+
+def _make_python_packages_read_only(venv: Path) -> None:
+    roots = _python_site_packages(venv)
+    if len(roots) != 1:
+        raise VideoRuntimeError("Python runtime must contain exactly one regular site-packages directory")
+    root = roots[0]
+    for current, directories, files in os.walk(root, topdown=False, followlinks=False):
+        current_path = Path(current)
+        for name in files:
+            path = current_path / name
+            if path.is_symlink() or path.stat().st_nlink != 1:
+                raise VideoRuntimeError("Python package cache contains a linked file")
+            executable = bool(path.stat().st_mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH))
+            path.chmod(0o555 if executable else 0o444)
+        for name in directories:
+            path = current_path / name
+            if path.is_symlink():
+                raise VideoRuntimeError("Python package cache contains a symlinked directory")
+            path.chmod(0o555)
+    root.chmod(0o555)
+
+
+def _verify_python_packages_read_only(venv: Path) -> None:
+    roots = _python_site_packages(venv)
+    if len(roots) != 1:
+        raise VideoRuntimeError("Python runtime must contain exactly one regular site-packages directory")
+    root = roots[0]
+    for current, directories, files in os.walk(root, followlinks=False):
+        current_path = Path(current)
+        for name in directories:
+            path = current_path / name
+            if path.is_symlink() or path.stat().st_mode & 0o222:
+                raise VideoRuntimeError(f"Python package directory is writable or linked: {path}")
+        for name in files:
+            path = current_path / name
+            if path.is_symlink() or path.stat().st_nlink != 1 or path.stat().st_mode & 0o222:
+                raise VideoRuntimeError(f"Python package file is writable or linked: {path}")
+
+
+def _discover_hyperframes_browser(runtime: VideoRuntime) -> Path:
+    chrome_root = runtime.home_dir / ".cache" / "hyperframes" / "chrome"
+    if chrome_root.is_symlink() or not chrome_root.is_dir():
+        raise VideoRuntimeError("HyperFrames browser cache is missing or linked")
+    names = {"chrome", "chrome.exe", "chrome-headless-shell", "chrome-headless-shell.exe"}
+    candidates = sorted(
+        path for path in chrome_root.rglob("*")
+        if path.name in names and path.is_file() and not path.is_symlink()
+    )
+    executable = [
+        path for path in candidates
+        if os.name == "nt" or bool(path.stat().st_mode & stat.S_IXUSR)
+    ]
+    if len(executable) != 1:
+        raise VideoRuntimeError(
+            f"HyperFrames browser cache must contain exactly one launchable browser, found {len(executable)}"
+        )
+    browser = executable[0]
+    if browser.stat().st_nlink != 1 or not _is_within(browser.resolve(), runtime.cache_dir.resolve()):
+        raise VideoRuntimeError("HyperFrames browser executable is linked or outside the cache")
+    return browser
+
+
+def _probe_hyperframes_browser(runtime: VideoRuntime) -> dict[str, object]:
+    puppeteer = runtime.hyperframes_executable.parents[2] / "node_modules" / "puppeteer-core"
+    if puppeteer.is_symlink() or not (puppeteer / "package.json").is_file():
+        raise VideoRuntimeError("HyperFrames Puppeteer runtime is missing or linked")
+    script = r"""
+const puppeteer = require(process.argv[1]);
+(async () => {
+  const browser = await puppeteer.launch({
+    executablePath: process.argv[2],
+    headless: true,
+    args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
+  });
+  try {
+    const page = await browser.newPage();
+    await page.setContent('<!doctype html><title>AutoDesign browser probe</title><main id="ok">ready</main>');
+    const value = await page.$eval('#ok', element => element.textContent);
+    if (value !== 'ready') throw new Error('browser DOM probe failed');
+    process.stdout.write(JSON.stringify({passed: true, browser_version: await browser.version()}));
+  } finally {
+    await browser.close();
+  }
+})().catch(error => { console.error(error && error.stack || String(error)); process.exit(2); });
+"""
+    result = _run_checked(
+        [str(runtime.node_binary), "-e", script, str(puppeteer), str(runtime.browser_executable)],
+        cwd=runtime.cache_dir,
+        env=runtime_environment(runtime),
+        timeout=60,
+    )
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise VideoRuntimeError("HyperFrames browser launch probe returned invalid JSON") from error
+    if not isinstance(payload, dict) or payload.get("passed") is not True:
+        raise VideoRuntimeError("HyperFrames browser launch probe did not pass")
+    return payload
 
 
 def verify_kokoro_assets(
@@ -475,6 +617,7 @@ def inspect_video_runtime(
             "hyperframes_version": HYPERFRAMES_VERSION,
             "package_sha256": spec.package_sha256,
             "package_lock_sha256": spec.package_lock_sha256,
+            "python_lock_sha256": spec.python_lock_sha256,
             "kokoro_onnx_version": KOKORO_ONNX_VERSION,
             "soundfile_version": SOUNDFILE_VERSION,
             "kokoro_model_sha256": KOKORO_MODEL_SHA256,
@@ -485,6 +628,9 @@ def inspect_video_runtime(
             if state.get(key) != value:
                 raise VideoRuntimeError(f"runtime state mismatch: {key}")
         runtime = _runtime_from_state(spec, state)
+        if sha256_reader(runtime.browser_executable) != state["browser_sha256"]:
+            raise VideoRuntimeError("HyperFrames browser checksum mismatch")
+        _verify_python_packages_read_only(runtime.python_executable.parents[1])
         observed = verify_kokoro_assets(runtime, sha256_reader=sha256_reader)
         smoke = _safe_runtime_file(cache, str(state["tts_smoke_relative"]))
         if sha256_reader(smoke) != state["tts_smoke_sha256"]:
@@ -504,6 +650,7 @@ def inspect_video_runtime(
                 )
                 if actual != expected_version:
                     raise VideoRuntimeError(f"{module} version mismatch: {actual}")
+            _probe_hyperframes_browser(runtime)
         return {
             "ready": True,
             "status": "ready",
@@ -656,6 +803,7 @@ def _staging_runtime(spec: VideoRuntimeSpec, staging: Path) -> VideoRuntime:
         hyperframes_executable=hyperframes,
         python_executable=python,
         node_binary=spec.node_binary or Path("node"),
+        browser_executable=staging / "browser-not-yet-installed",
         ffmpeg_binary=spec.ffmpeg_binary or Path("ffmpeg"),
         ffprobe_binary=spec.ffprobe_binary or Path("ffprobe"),
         state_path=staging / "runtime-state.json",
@@ -680,6 +828,7 @@ def _write_runtime_state(spec: VideoRuntimeSpec, runtime: VideoRuntime, smoke: P
         "home_relative": runtime.home_dir.relative_to(runtime.cache_dir).as_posix(),
         "package_sha256": spec.package_sha256,
         "package_lock_sha256": spec.package_lock_sha256,
+        "python_lock_sha256": spec.python_lock_sha256,
         "kokoro_onnx_version": KOKORO_ONNX_VERSION,
         "soundfile_version": SOUNDFILE_VERSION,
         "kokoro_model_relative": (tts_root / "models" / "kokoro-v1.0.onnx").relative_to(runtime.cache_dir).as_posix(),
@@ -688,6 +837,8 @@ def _write_runtime_state(spec: VideoRuntimeSpec, runtime: VideoRuntime, smoke: P
         "kokoro_voices_sha256": KOKORO_VOICES_SHA256,
         "tts_smoke_relative": smoke.relative_to(runtime.cache_dir).as_posix(),
         "tts_smoke_sha256": _sha256(smoke),
+        "browser_relative": runtime.browser_executable.relative_to(runtime.cache_dir).as_posix(),
+        "browser_sha256": _sha256(runtime.browser_executable),
         "browser_ensured": True,
     }
     _atomic_write_json(runtime.state_path, payload)
@@ -745,9 +896,8 @@ def ensure_video_runtime(
             _run_checked(
                 [
                     str(runtime.python_executable), "-m", "pip", "install",
-                    "--disable-pip-version-check", "--no-input",
-                    f"kokoro-onnx=={KOKORO_ONNX_VERSION}",
-                    f"soundfile=={SOUNDFILE_VERSION}",
+                    "--disable-pip-version-check", "--no-input", "--require-hashes",
+                    "--only-binary=:all:", "--no-deps", "-r", str(spec.python_lock),
                 ],
                 cwd=staging,
                 env=install_env,
@@ -767,6 +917,8 @@ def ensure_video_runtime(
                 env=install_env,
                 timeout=_INSTALL_TIMEOUT_SECONDS,
             )
+            runtime = replace(runtime, browser_executable=_discover_hyperframes_browser(runtime))
+            _probe_hyperframes_browser(runtime)
             tts_root = runtime.home_dir / ".cache" / "hyperframes" / "tts"
             _download_verified(
                 KOKORO_MODEL_URL,
@@ -807,6 +959,8 @@ def ensure_video_runtime(
                 env=install_env,
                 timeout=30,
             )
+            _make_python_packages_read_only(staging / "p")
+            _verify_python_packages_read_only(staging / "p")
             _write_runtime_state(spec, runtime, smoke_wav)
             if spec.cache_dir.exists():
                 raise VideoRuntimeError("Video cache appeared during atomic install")
@@ -840,6 +994,16 @@ def remove_video_runtime(
         removal = spec.cache_root / f".{spec.cache_key}.remove-{uuid.uuid4().hex[:10]}"
         spec.cache_dir.rename(removal)
         try:
+            for current, directories, files in os.walk(removal, topdown=False, followlinks=False):
+                for name in files:
+                    path = Path(current) / name
+                    if not path.is_symlink():
+                        path.chmod(path.stat().st_mode | stat.S_IWUSR)
+                for name in directories:
+                    path = Path(current) / name
+                    if not path.is_symlink():
+                        path.chmod(path.stat().st_mode | stat.S_IWUSR | stat.S_IXUSR)
+            removal.chmod(removal.stat().st_mode | stat.S_IWUSR | stat.S_IXUSR)
             shutil.rmtree(removal)
         except OSError as error:
             raise VideoRuntimeError(
@@ -858,9 +1022,12 @@ def run_real_smoke(runtime: VideoRuntime, *, output_dir: Path) -> dict[str, obje
     import video_harness
 
     plan = video_harness.synthetic_smoke_plan()
+    claims = video_harness.synthetic_smoke_claims(plan)
     project = output_dir / "project"
     video_harness.write_synthetic_smoke_project(project, plan)
-    report = video_harness.deliver_project(project, plan, runtime.as_dict(), smoke=True)
+    report = video_harness.deliver_project(
+        project, plan, runtime.as_dict(), claims=claims, smoke=True
+    )
     if not report.get("passed"):
         raise VideoRuntimeError(f"Real HyperFrames smoke failed: {report.get('error')}")
     return {

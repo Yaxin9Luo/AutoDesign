@@ -27,22 +27,29 @@ Run `python "$SKILL_ROOT/scripts/video_harness.py" --help` and
    Node 22+, npm, ffmpeg, ffprobe, and Python 3.10–3.12. It installs exact
    `hyperframes@0.7.86`, its rendering browser, `kokoro-onnx==0.5.0`, and
    `soundfile==0.14.0` in an atomic versioned user cache. It prefetches and
-   SHA-256 verifies the exact Kokoro model and voice blobs. Never substitute a
-   global or newer HyperFrames version. Setup does not modify the Skill or
-   global packages; `setup_video.py remove` deletes only this version's locked
-   cache and is safe to repeat.
+   SHA-256 verifies the complete platform-aware Python lock, exact Kokoro model,
+   voice blobs, and installed HyperFrames browser. Doctor launches that exact
+   browser and rejects a writable or tampered Python package cache. Never
+   substitute a global or newer HyperFrames version. Unsupported platforms fail
+   closed. Setup does not modify the Skill or global packages;
+   `setup_video.py remove` deletes only this version's locked cache and is safe
+   to repeat.
 2. Run `init RUN`, then `evidence RUN PAPER`. Pass user-provided content images
    with `--asset` and style references with `--reference`. Read
    `evidence/evidence.jsonl`, the rendered paper pages, and
    `evidence/source_visuals.json`. A fresh host VLM or subagent must inspect PDF
    visual candidates against their captions before `bind-visuals`. Uncertain
    visuals stay unused. References are style-only; never copy their content.
-3. Author and save a complete `plan.json`, then run `plan RUN plan.json`.
+3. Author and save a complete input plan, then run `plan RUN input-plan.json`.
    Default to 12 scenes and 360 seconds. Honor explicit user overrides only
    within 10–14 scenes and 300–600 seconds. Build one spoken research argument:
    question, gap, contribution, method, strongest evidence, analysis,
    limitations, implications, and closing. Every scene needs English
    narration, contiguous timing, evidence IDs, and any approved visual IDs.
+   Give each scene an exact `title_claim_id`, `narration_claim_id`, non-empty
+   `visible_claim_ids`, and an allowed `visual_role`. From this point on, use
+   the canonical bytes at `RUN/plan.json`; validate and deliver reject any
+   independently reserialized or edited plan.
 4. Run `begin-attempt RUN`. Author a local-only editable HyperFrames project in
    a work folder for that attempt, not in its reserved `artifact/` directory.
    Follow the exact DOM and security contract in
@@ -50,27 +57,41 @@ Run `python "$SKILL_ROOT/scripts/video_harness.py" --help` and
    text, real paper figures, deterministic seekable timelines, one composition
    root, literal `class="clip"` scenes, literal narration audio, and a working
    subtitle toggle. Do not add remote resources or runtime network behavior.
-5. Run `validate PROJECT plan.json --run RUN`. This is structural validation;
+5. Write a non-empty claims JSON list. Every planned title and narration must
+   equal the text of its named claim exactly; visible numbers must occur in one
+   of that scene's `visible_claim_ids`. Every claim cites real evidence IDs.
+   Run `validate PROJECT RUN/plan.json --run RUN --claims claims.json`. This is
+   structural validation;
    it intentionally does not require narration audio yet and never creates a
-   placeholder. Fix every reported source, timing, local-asset, or HTML error.
-6. Write a claims JSON list whose visible claims cite actual evidence IDs. Run
-   `deliver PROJECT plan.json --run RUN --attempt ID --claims claims.json`.
+   placeholder. It reuses the shared eligible-role/reuse-limit visual planner
+   and rejects ambiguous HTML, unsafe CSS paths, navigation, and runtime network
+   behavior. Fix every reported source, timing, local-asset, or HTML error.
+6. Run
+   `deliver PROJECT RUN/plan.json --run RUN --attempt ID --claims claims.json`.
    The harness enforces this order: structural validation; per-scene
    HyperFrames/Kokoro TTS and timed WAV mix; transcript/SRT/VTT and metadata;
-   full real HyperFrames lint; strict real HyperFrames render; subtitle mux;
-   exact ffprobe; representative frames and contact sheet. ffmpeg may mix audio,
-   mux subtitles, and extract frames; it must never replace HyperFrames as the
-   final renderer. A stale or invalid MP4 is deleted and cannot pass.
+   strict offline Chromium interaction of the subtitle toggle; full real
+   HyperFrames lint; strict real HyperFrames render; subtitle mux; exact
+   ffprobe; representative frames and contact sheet. ffmpeg may mix audio, mux
+   subtitles, and extract frames; it must never replace HyperFrames as the final
+   renderer. A stale or invalid MP4 is deleted and cannot pass. Publishing uses
+   an exact generated allowlist: hidden files, `.env`, debug files, and
+   unreferenced assets fail instead of leaking into the artifact.
 7. Run `review-context RUN ID`. Give the exact MP4, narration WAV, contact sheet,
-   and all six individual frames to a fresh vision- and audio-capable host or subagent that
-   did not author the project. The reviewer must inspect every frame, listen to
-   the narration, and return the exact
+   and all six individual frames to a fresh vision- and audio-capable host or
+   subagent that did not author the project. The returned context exposes
+   hash-bound readable source text, evidence JSONL, and the source map; provide
+   them to the reviewer so it can verify semantics rather than guess from
+   frames. The reviewer must inspect every frame, listen to the narration, and
+   return the exact
    hash-bound schema in [review-rubric.md](references/review-rubric.md). Record
    it with `record-review`; never infer visual quality from HTML or self-certify.
 8. If an authoring gate fails, start the next bounded attempt and repair the
    localized findings. If setup, TTS execution, ffmpeg, ffprobe, or another
    deterministic runtime stage fails, repair the runtime and resume the same
-   attempt; do not spend an authoring attempt on it. On a passing review, run
+   attempt; do not spend an authoring attempt on it. A lint or render failure
+   reruns the exact runtime/browser doctor before it is classified, so browser
+   infrastructure failures remain in the same attempt. On a passing review, run
    `finalize RUN ID` and deliver the complete `final/` directory together with
    its run-level QA record.
 

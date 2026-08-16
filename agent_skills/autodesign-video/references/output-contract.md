@@ -25,7 +25,11 @@ The canonical plan is one JSON object:
       "duration_s": 24,
       "narration": "Complete English narration for this scene.",
       "source_ids": ["ev-001"],
-      "visual_ids": []
+      "visual_ids": [],
+      "visual_role": "overview",
+      "title_claim_id": "claim-scene-01-title",
+      "narration_claim_id": "claim-scene-01-narration",
+      "visible_claim_ids": ["claim-scene-01-title"]
     }
   ]
 }
@@ -35,7 +39,12 @@ Scenes are unique and contiguous from zero. Their durations sum exactly to the
 video duration. Default to 12 scenes and 360 seconds. Only an explicit user
 request may select 10–14 scenes or 300–600 seconds. The canvas and frame rate
 are always 1920×1080 at 30 fps. Narration is English and grounded; it is not
-slide copy read aloud.
+slide copy read aloud. The separately supplied claims list is mandatory and
+non-empty. Every scene title and narration equals its named claim text exactly,
+the two claims cite exactly that scene's source IDs, and every visible numeric
+fact appears in a named `visible_claim_ids` claim. The saved `RUN/plan.json` is
+canonical: validation and delivery use those exact bytes, not a reserialized
+copy.
 
 ## Editable HyperFrames project
 
@@ -47,10 +56,14 @@ animated project registers one deterministic seekable `window.__timelines`
 entry. Never use `requestAnimationFrame` or wall-clock state.
 
 Every planned scene is a direct `<section id="scene_XX" class="clip">` with
-exact `data-start`, `data-duration`, and `data-source-ids`. `data-hf-clip` is
+exact `data-start`, `data-duration`, `data-source-ids`, `data-narration`,
+`data-title-claim-id`, `data-narration-claim-id`, and `data-claim-ids`.
+The visible heading carries the exact `data-claim-id`. `data-hf-clip` is
 optional metadata and never replaces the literal `clip` class. Source images
 are regular local files with `data-source-id` matching the authorized visual
-catalog and its SHA-256. Preserve native text, SVG text, tables, and equations.
+catalog and its SHA-256. Scene allocations retain each visual's eligibility,
+allowed content roles, and reuse limit, and pass the shared visual-plan
+validator. Preserve native text, SVG text, tables, and equations.
 
 Include exactly one narration element before delivery:
 
@@ -61,15 +74,22 @@ Include exactly one narration element before delivery:
 ```
 
 Include an accessible `data-subtitle-toggle` control with `aria-pressed` and a
-local subtitle overlay. Captions are selectable in the MP4 and toggleable in
-the editable project. They must not be burned in or forced. Default the HTML
-overlay off so the video remains intentionally composed without captions.
+local subtitle overlay. The overlay has
+`data-subtitle-source="narration/subtitles.en.vtt"`, and its local
+`data-subtitle-cue` elements exactly match the generated VTT cues. Captions are
+selectable in the MP4 and toggleable in the editable project. They must not be
+burned in or forced. Default the HTML overlay off so the video remains
+intentionally composed without captions.
 
-Reject remote URLs, protocol-relative URLs, data/blob/javascript URLs, remote
-fonts, scripts, styles, media, iframes, executable downloads, `fetch`, XHR,
-WebSocket, EventSource, `sendBeacon`, dynamic imports, and any project path
-that is absolute, traverses `..`, escapes the project, is a symlink, or is a
-hard link. Rendering runs without provider credentials or network access.
+Reject duplicate attributes, meta refresh, remote URLs, protocol-relative
+URLs, data/blob/javascript URLs, remote fonts, scripts, styles, media, iframes,
+executable downloads, dynamic `new Image`, `fetch`, XHR, WebSocket, EventSource,
+`sendBeacon`, dynamic imports, and CSS URLs that are absolute, encoded escapes,
+or traverse `..`. Every project path stays inside the project and is neither a
+symlink nor hard link. Rendering runs without provider credentials. A real
+Chromium preflight blocks non-project requests and clicks the subtitle control
+twice, proving `aria-pressed` and overlay visibility transition off → on → off
+against cues from the locally generated VTT.
 
 ## Non-negotiable delivery order
 
@@ -82,24 +102,29 @@ hard link. Rendering runs without provider credentials or network access.
    full-duration 24 kHz mono PCM narration WAV.
 3. Write the English transcript, SRT, VTT, per-scene timing, voice ID, speed,
    engine, and optional-caption metadata.
-4. Run the real complete `hyperframes lint` only after the referenced narration
+4. Launch the exact installed HyperFrames browser in strict offline mode. Reject
+   network attempts or page errors; click the subtitle toggle twice and bind
+   every overlay cue to the generated VTT hash.
+5. Run the real complete `hyperframes lint` only after the referenced narration
    WAV exists and is hash-bound.
-5. Run exactly `hyperframes render --fps 30 --resolution landscape --strict
+6. Run exactly `hyperframes render --fps 30 --resolution landscape --strict
    --no-best-effort --output <fresh-path> .`. Only that fresh, nonempty result
    may become the delivery video.
-6. Mux the SRT as non-forced English `mov_text` without re-rendering video or
+7. Mux the SRT as non-forced English `mov_text` without re-rendering video or
    audio. ffprobe then requires H.264/yuv420p video, AAC audio, 1920×1080,
    exactly 30 fps, planned duration, and the selectable English subtitle track.
-7. Extract six spread-out representative frames and one 3×2 contact sheet.
+8. Extract six spread-out representative frames and one 3×2 contact sheet.
    Bind every hash into deterministic QA and a fresh host-VLM review.
 
 Nonzero TTS/probe execution, missing tools, corrupt caches, and timeouts are
 runtime failures: repair setup and resume the same attempt. Invalid authored
 HTML, full-lint findings, render-content failures, overlong narration, and
-media-contract failures are authoring repairs. Never resend a deterministic
-setup failure to the authoring model. Never accept an older MP4 after a failed
-render. Runtime diagnostics persist in the active attempt until a successful
-delivery clears them; they are never published as final artifacts.
+media-contract failures are authoring repairs. Every lint/render failure first
+reruns the browser/runtime doctor; a corrupt browser or runtime routes to
+same-attempt runtime recovery. Never resend a deterministic setup failure to
+the authoring model. Never accept an older MP4 after a failed render. Runtime
+diagnostics persist in the active attempt until a successful delivery clears
+them; they are never published as final artifacts.
 
 ## Required delivery closure
 
@@ -116,4 +141,7 @@ The selected attempt retains and hash-binds:
   source map, and final exact-set `delivery-manifest.json` in the run state.
 
 Finalization is forbidden unless every delivered byte, preview, source map,
-review context, and reviewer verdict still matches its recorded hash.
+review context, and reviewer verdict still matches its recorded hash. Before
+publishing, the project must equal the plan-derived allowlist exactly. Hidden
+files, `.env`, logs, render scratch files, and unreferenced assets are rejected,
+not copied.

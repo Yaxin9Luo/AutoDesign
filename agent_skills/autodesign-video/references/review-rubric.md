@@ -2,10 +2,14 @@
 
 Review the MP4, narration WAV, contact sheet, and all six individual
 representative frames from the exact deterministic-passed attempt. Listen to
-the narration and inspect every frame. The reviewer must be a fresh
+the narration and inspect every frame. Also read every hash-bound path returned
+under `review_materials`: the normalized source text, evidence JSONL, and
+attempt source map. Use those materials to check what each title, visible
+number, narrated claim, and source visual actually says. The reviewer must be a fresh
 vision- and audio-capable host context or fresh subagent that did not author the video.
 HTML, source code, filenames, and the author's own description are not visual
-or audio evidence.
+or audio evidence, but the bound source/evidence files are required semantic
+evidence.
 
 Score every dimension from 1 through 5:
 

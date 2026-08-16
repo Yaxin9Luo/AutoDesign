@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import html
 import json
 import math
 import os
@@ -14,6 +15,7 @@ import signal
 import subprocess
 import sys
 import time
+import urllib.parse
 import uuid
 from html.parser import HTMLParser
 from pathlib import Path
@@ -55,6 +57,17 @@ _NETWORK_SCRIPT = re.compile(
     re.IGNORECASE,
 )
 _WORD = re.compile(r"[A-Za-z]+(?:['-][A-Za-z]+)?")
+_VISIBLE_NUMBER = re.compile(r"(?<![A-Za-z0-9_])[-+]?(?:\d+(?:\.\d+)?|\.\d+)%?(?![A-Za-z0-9_])")
+_CSS_URL = re.compile(r"url\(\s*(['\"]?)(.*?)\1\s*\)", re.IGNORECASE | re.DOTALL)
+_VISUAL_ROLE_MAP = {
+    "opening": "overview",
+    "problem": "context",
+    "analysis": "comparison",
+    "results": "result",
+    "limitations": "supporting",
+    "implications": "supporting",
+    "closing": "overview",
+}
 
 REVIEW_RUBRIC: dict[str, Any] = {
     "format_version": FORMAT_VERSION,
@@ -88,10 +101,18 @@ class VideoContractError(RuntimeError):
 class StageError(RuntimeError):
     """A delivery stage failed with an explicit repair-routing class."""
 
-    def __init__(self, stage: str, message: str, *, failure_class: str) -> None:
+    def __init__(
+        self,
+        stage: str,
+        message: str,
+        *,
+        failure_class: str,
+        runtime_diagnostics: Mapping[str, Any] | None = None,
+    ) -> None:
         super().__init__(message)
         self.stage = stage
         self.failure_class = failure_class
+        self.runtime_diagnostics = dict(runtime_diagnostics or {})
 
 
 def sha256_file(path: Path | str) -> str:
@@ -103,6 +124,29 @@ def sha256_file(path: Path | str) -> str:
         while chunk := handle.read(1024 * 1024):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _canonical_hash(value: object) -> str:
+    data = (json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+    return hashlib.sha256(data).hexdigest()
+
+
+def load_canonical_delivery_plan(
+    run_dir: Path | str,
+    supplied_plan_path: Path | str,
+) -> tuple[dict[str, Any], str]:
+    run = Path(run_dir).absolute()
+    canonical_path = core.safe_path(run, "plan.json", must_exist=True)
+    supplied = Path(supplied_plan_path).absolute()
+    if supplied.is_symlink() or not supplied.is_file() or supplied.stat().st_nlink != 1:
+        raise VideoContractError("supplied delivery plan must be a regular non-linked file")
+    canonical_digest = sha256_file(canonical_path)
+    if sha256_file(supplied) != canonical_digest:
+        raise VideoContractError("delivery plan must be byte-identical to the canonical run plan")
+    canonical = normalize_plan(_read_json(canonical_path))
+    if normalize_plan(_read_json(supplied)) != canonical:
+        raise VideoContractError("delivery plan differs from the canonical run plan")
+    return canonical, canonical_digest
 
 
 def _number(value: object, *, field: str) -> float:
@@ -204,6 +248,25 @@ def normalize_plan(value: Mapping[str, Any], *, smoke: bool = False) -> dict[str
             not isinstance(item, str) or not item for item in visual_ids_value
         ):
             raise VideoContractError(f"{scene_id}.visual_ids must be a list of ids")
+        title_claim_id = str(scene_value.get("title_claim_id", "")).strip()
+        narration_claim_id = str(scene_value.get("narration_claim_id", "")).strip()
+        visible_claim_ids = scene_value.get("visible_claim_ids", [])
+        for claim_field, claim_id in (
+            ("title_claim_id", title_claim_id),
+            ("narration_claim_id", narration_claim_id),
+        ):
+            if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_.:-]{1,127}", claim_id):
+                raise VideoContractError(f"{scene_id}.{claim_field} is required and invalid")
+        if (
+            not isinstance(visible_claim_ids, list)
+            or not visible_claim_ids
+            or any(not isinstance(item, str) or not item.strip() for item in visible_claim_ids)
+        ):
+            raise VideoContractError(f"{scene_id}.visible_claim_ids requires claim ids")
+        normalized_visible_claim_ids = list(dict.fromkeys(item.strip() for item in visible_claim_ids))
+        if title_claim_id not in normalized_visible_claim_ids:
+            raise VideoContractError(f"{scene_id}.visible_claim_ids must include title_claim_id")
+        visual_role = str(scene_value.get("visual_role", _VISUAL_ROLE_MAP.get(role, role))).strip()
         normalized_scenes.append(
             {
                 "scene_id": scene_id,
@@ -214,6 +277,10 @@ def normalize_plan(value: Mapping[str, Any], *, smoke: bool = False) -> dict[str
                 "narration": narration,
                 "source_ids": list(dict.fromkeys(source_ids_value)),
                 "visual_ids": list(dict.fromkeys(visual_ids_value)),
+                "visual_role": visual_role,
+                "title_claim_id": title_claim_id,
+                "narration_claim_id": narration_claim_id,
+                "visible_claim_ids": normalized_visible_claim_ids,
             }
         )
         cursor += scene_duration
@@ -247,9 +314,19 @@ class _ProjectParser(HTMLParser):
         self.forbidden_tags: list[str] = []
         self.srcsets: list[str] = []
         self.scripts: list[str] = []
+        self.duplicate_attributes: list[dict[str, str]] = []
+        self.meta_refreshes: list[dict[str, str]] = []
+        self.scene_text: dict[str, list[str]] = {}
+        self.claim_text: dict[str, list[str]] = {}
         self._script_depth = 0
+        self._scene_stack: list[str] = []
+        self._claim_stack: list[tuple[str, str]] = []
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        names = [name.lower() for name, _value in attrs]
+        duplicates = sorted({name for name in names if names.count(name) > 1})
+        if duplicates:
+            self.duplicate_attributes.append({"tag": tag.lower(), "attributes": " ".join(duplicates)})
         values = {name.lower(): value or "" for name, value in attrs}
         if values.get("id"):
             self.elements_by_id[values["id"]] = values
@@ -257,14 +334,26 @@ class _ProjectParser(HTMLParser):
             self.roots.append(values)
         if tag.lower() == "section":
             self.scenes.append(values)
+            scene_id = values.get("id", "")
+            self._scene_stack.append(scene_id)
+            self.scene_text.setdefault(scene_id, [])
         if tag.lower() == "audio":
             self.audio.append(values)
         if tag.lower() == "img":
-            self.images.append(values)
+            image = dict(values)
+            if self._scene_stack:
+                image["_scene_id"] = self._scene_stack[-1]
+            self.images.append(image)
         if "data-subtitle-toggle" in values:
             self.subtitle_toggles.append(values)
         if tag.lower() in {"base", "embed", "form", "iframe", "object"}:
             self.forbidden_tags.append(tag.lower())
+        if tag.lower() == "meta" and values.get("http-equiv", "").strip().lower() == "refresh":
+            self.meta_refreshes.append(values)
+        claim_id = values.get("data-claim-id", "").strip()
+        if claim_id:
+            self._claim_stack.append((tag.lower(), claim_id))
+            self.claim_text.setdefault(claim_id, [])
         if values.get("srcset"):
             self.srcsets.append(values["srcset"])
         for name in _LOCAL_REFERENCE_ATTRS:
@@ -278,10 +367,19 @@ class _ProjectParser(HTMLParser):
     def handle_endtag(self, tag: str) -> None:
         if tag.lower() == "script" and self._script_depth:
             self._script_depth -= 1
+        if tag.lower() == "section" and self._scene_stack:
+            self._scene_stack.pop()
+        if self._claim_stack and self._claim_stack[-1][0] == tag.lower():
+            self._claim_stack.pop()
 
     def handle_data(self, data: str) -> None:
         if self._script_depth:
             self.scripts.append(data)
+            return
+        if self._scene_stack:
+            self.scene_text.setdefault(self._scene_stack[-1], []).append(data)
+        if self._claim_stack:
+            self.claim_text.setdefault(self._claim_stack[-1][1], []).append(data)
 
 
 def _issue(code: str, message: str, **context: object) -> dict[str, object]:
@@ -289,7 +387,17 @@ def _issue(code: str, message: str, **context: object) -> dict[str, object]:
 
 
 def _safe_project_file(project: Path, reference: str) -> Path:
-    relative = Path(reference.split("#", 1)[0].split("?", 1)[0])
+    raw = html.unescape(reference).split("#", 1)[0].split("?", 1)[0].strip()
+    decoded = urllib.parse.unquote(raw)
+    if (
+        not decoded
+        or decoded.startswith(("/", "~"))
+        or "\\" in decoded
+        or "\x00" in decoded
+        or re.match(r"^[A-Za-z]:", decoded)
+    ):
+        raise VideoContractError(f"unsafe local asset path: {reference}")
+    relative = Path(decoded)
     if relative.is_absolute() or not relative.parts or ".." in relative.parts:
         raise VideoContractError(f"unsafe local asset path: {reference}")
     candidate = project / relative
@@ -311,12 +419,54 @@ def _classes(attrs: Mapping[str, str]) -> set[str]:
     return {item for item in attrs.get("class", "").split() if item}
 
 
+def _claim_catalog(
+    claims: Sequence[Mapping[str, Any]] | None,
+    *,
+    evidence_ids: set[str] | None,
+) -> tuple[dict[str, dict[str, Any]], list[dict[str, object]]]:
+    issues: list[dict[str, object]] = []
+    if not claims:
+        return {}, [_issue("claims_empty", "video titles, narration, and visible facts require non-empty evidence claims")]
+    catalog: dict[str, dict[str, Any]] = {}
+    for index, value in enumerate(claims, start=1):
+        if not isinstance(value, Mapping):
+            issues.append(_issue("claim_invalid", "claim must be an object", claim_index=index))
+            continue
+        claim_id = str(value.get("id", "")).strip()
+        text = " ".join(str(value.get("text", "")).split())
+        source_ids = value.get("source_ids")
+        if (
+            not claim_id
+            or not text
+            or not isinstance(source_ids, list)
+            or not source_ids
+            or any(not isinstance(item, str) or not item for item in source_ids)
+        ):
+            issues.append(_issue("claim_invalid", "claim requires id, exact text, and source_ids", claim_id=claim_id))
+            continue
+        if claim_id in catalog:
+            issues.append(_issue("claim_duplicate", "claim ids must be unique", claim_id=claim_id))
+            continue
+        normalized = dict(value)
+        normalized.update({"id": claim_id, "text": text, "source_ids": list(dict.fromkeys(source_ids))})
+        catalog[claim_id] = normalized
+        if evidence_ids is not None and not set(normalized["source_ids"]).issubset(evidence_ids):
+            issues.append(_issue("claim_unknown_evidence", "claim cites unknown evidence", claim_id=claim_id))
+    return catalog, issues
+
+
+def _normalized_visible_text(value: str) -> str:
+    return " ".join(html.unescape(value).split())
+
+
 def validate_project(
     project_dir: Path | str,
     plan_value: Mapping[str, Any],
     *,
+    run_dir: Path | str | None = None,
     evidence_ids: set[str] | None = None,
-    visual_catalog: Mapping[str, Mapping[str, str]] | None = None,
+    visual_catalog: Mapping[str, Mapping[str, Any]] | None = None,
+    claims: Sequence[Mapping[str, Any]] | None = None,
     smoke: bool = False,
 ) -> dict[str, Any]:
     """Run structural validation only; narration media may not exist yet."""
@@ -354,6 +504,33 @@ def validate_project(
         parser.close()
     except Exception as error:
         issues.append(_issue("html_parse", f"HTML parsing failed: {error}"))
+    if parser.duplicate_attributes:
+        issues.append(
+            _issue(
+                "duplicate_attribute",
+                "duplicate HTML attributes are forbidden because browser parsing is ambiguous",
+                elements=parser.duplicate_attributes,
+            )
+        )
+    if parser.meta_refreshes:
+        issues.append(_issue("meta_refresh", "meta refresh navigation is forbidden"))
+
+    claim_catalog, claim_issues = _claim_catalog(claims, evidence_ids=evidence_ids)
+    issues.extend(claim_issues)
+    if run_dir is not None and claim_catalog:
+        try:
+            grounding = core.validate_grounding(list(claim_catalog.values()), core.load_evidence(run_dir))
+            for error in grounding.get("errors", []):
+                issues.append(
+                    _issue(
+                        "claim_grounding",
+                        "claim does not pass shared evidence grounding",
+                        grounding_code=str(error.get("code", "invalid")),
+                        claim_id=str(error.get("claim_id", "")),
+                    )
+                )
+        except core.PortableError as error:
+            issues.append(_issue("claim_grounding", str(error)))
 
     if len(parser.roots) != 1:
         issues.append(
@@ -407,6 +584,48 @@ def validate_project(
             issues.append(_issue("scene_source_binding", "scene source ids differ from plan", scene_id=scene_id))
         if evidence_ids is not None and not html_sources.issubset(evidence_ids):
             issues.append(_issue("unknown_evidence", "scene cites unknown evidence", scene_id=scene_id))
+        title_claim_id = attrs.get("data-title-claim-id", "")
+        narration_claim_id = attrs.get("data-narration-claim-id", "")
+        visible_claim_ids = [item for item in attrs.get("data-claim-ids", "").split() if item]
+        if title_claim_id != expected["title_claim_id"]:
+            issues.append(_issue("title_claim_binding", "scene title claim id differs from plan", scene_id=scene_id))
+        if narration_claim_id != expected["narration_claim_id"]:
+            issues.append(_issue("narration_claim_binding", "scene narration claim id differs from plan", scene_id=scene_id))
+        if visible_claim_ids != expected["visible_claim_ids"]:
+            issues.append(_issue("visible_claim_binding", "scene visible claim ids differ from plan", scene_id=scene_id))
+        title_claim = claim_catalog.get(expected["title_claim_id"])
+        narration_claim = claim_catalog.get(expected["narration_claim_id"])
+        if title_claim is None or title_claim.get("text") != expected["title"]:
+            issues.append(_issue("title_claim_mismatch", "planned title must exactly equal its evidence claim", scene_id=scene_id))
+        if narration_claim is None or narration_claim.get("text") != expected["narration"]:
+            issues.append(_issue("narration_claim_mismatch", "planned narration must exactly equal its evidence claim", scene_id=scene_id))
+        if " ".join(attrs.get("data-narration", "").split()) != expected["narration"]:
+            issues.append(_issue("narration_html_mismatch", "HTML narration must exactly equal the planned narration", scene_id=scene_id))
+        if title_claim is not None and set(title_claim.get("source_ids", [])) != expected_sources:
+            issues.append(_issue("title_claim_source_binding", "title claim sources differ from scene sources", scene_id=scene_id))
+        if narration_claim is not None and set(narration_claim.get("source_ids", [])) != expected_sources:
+            issues.append(_issue("narration_claim_source_binding", "narration claim sources differ from scene sources", scene_id=scene_id))
+        rendered_title = _normalized_visible_text("".join(parser.claim_text.get(expected["title_claim_id"], [])))
+        if rendered_title != expected["title"]:
+            issues.append(_issue("title_html_mismatch", "visible scene title must exactly equal the bound claim", scene_id=scene_id))
+        supported_numbers: set[str] = set()
+        for claim_id in expected["visible_claim_ids"]:
+            claim = claim_catalog.get(claim_id)
+            if claim is not None:
+                supported_numbers.update(_VISIBLE_NUMBER.findall(str(claim.get("text", ""))))
+        visible_numbers = set(
+            _VISIBLE_NUMBER.findall(_normalized_visible_text("".join(parser.scene_text.get(scene_id, []))))
+        )
+        unsupported_numbers = sorted(visible_numbers - supported_numbers)
+        if unsupported_numbers:
+            issues.append(
+                _issue(
+                    "unbound_visible_number",
+                    "visible numeric facts must appear in an explicitly bound evidence claim",
+                    scene_id=scene_id,
+                    numbers=unsupported_numbers,
+                )
+            )
     if set(expected_scenes) != {attrs.get("id", "") for attrs in parser.scenes}:
         issues.append(_issue("scene_identity", "HTML does not contain every planned scene exactly once"))
 
@@ -453,6 +672,8 @@ def validate_project(
         issues.append(_issue("non_seekable_or_network_script", "frame-clock or network script is forbidden"))
     if re.search(r"<script\b[^>]+\bsrc\s*=", text, re.IGNORECASE):
         issues.append(_issue("non_seekable_or_network_script", "external script sources are forbidden"))
+    if re.search(r"\bnew\s+Image\s*\(", scripts, re.IGNORECASE):
+        issues.append(_issue("dynamic_image", "dynamic Image construction is forbidden; stage source-bound visuals in HTML"))
     if parser.forbidden_tags:
         issues.append(
             _issue(
@@ -463,8 +684,20 @@ def validate_project(
         )
     if parser.srcsets:
         issues.append(_issue("unsafe_local_asset", "srcset is forbidden; stage one explicit local source image"))
-    if re.search(r"@import|url\(\s*['\"]?\s*(?:https?:|//|data:|blob:)", text, re.IGNORECASE):
+    if re.search(r"@import", text, re.IGNORECASE):
         issues.append(_issue("remote_asset", "remote or inline CSS assets are forbidden"))
+    for _quote, css_reference in _CSS_URL.findall(text):
+        reference = html.unescape(css_reference).strip()
+        if reference.startswith("#"):
+            continue
+        lowered = urllib.parse.unquote(reference).lower()
+        if lowered.startswith(_REMOTE_PREFIXES) or lowered.startswith(("data:", "blob:")):
+            issues.append(_issue("remote_asset", "remote or inline CSS assets are forbidden", reference=reference))
+            continue
+        try:
+            _safe_project_file(project, reference)
+        except VideoContractError as error:
+            issues.append(_issue("unsafe_css_asset", str(error), reference=reference))
 
     narration_reference = "assets/narration.wav"
     for tag, attr, reference in parser.references:
@@ -511,6 +744,24 @@ def validate_project(
                 issues.append(_issue("source_visual_hash_mismatch", "local image does not match the bound source visual", visual_id=visual_id))
         except VideoContractError as error:
             issues.append(_issue("unsafe_local_asset", str(error), visual_id=visual_id))
+    if run_dir is not None:
+        allocations = [
+            {"visual_id": visual_id, "role": scene["visual_role"]}
+            for scene in plan["scenes"]
+            for visual_id in scene["visual_ids"]
+        ]
+        try:
+            visual_plan = core.validate_visual_plan(run_dir, allocations)
+            for error in visual_plan.get("errors", []):
+                issues.append(
+                    _issue(
+                        str(error.get("code", "visual_plan")),
+                        "source visual allocation is invalid",
+                        **{key: value for key, value in dict(error).items() if key != "code"},
+                    )
+                )
+        except core.PortableError as error:
+            issues.append(_issue("visual_plan_invalid", str(error)))
     return {
         "passed": not issues,
         "issues": issues,
@@ -788,6 +1039,150 @@ def _write_subtitles(project: Path, plan: Mapping[str, Any], segments: Sequence[
     return {"transcript": transcript, "srt": srt, "vtt": vtt, "timing": timing, "metadata": metadata}
 
 
+def _vtt_cues(path: Path) -> list[str]:
+    lines = path.read_text(encoding="utf-8").splitlines()
+    cues: list[str] = []
+    index = 1 if lines and lines[0].strip() == "WEBVTT" else 0
+    while index < len(lines):
+        while index < len(lines) and not lines[index].strip():
+            index += 1
+        if index >= len(lines):
+            break
+        if "-->" not in lines[index]:
+            index += 1
+        if index >= len(lines) or "-->" not in lines[index]:
+            raise StageError("browser_preflight", "generated VTT has an invalid cue", failure_class="runtime")
+        index += 1
+        text_lines: list[str] = []
+        while index < len(lines) and lines[index].strip():
+            text_lines.append(lines[index].strip())
+            index += 1
+        cue = " ".join(text_lines).strip()
+        if not cue:
+            raise StageError("browser_preflight", "generated VTT contains an empty cue", failure_class="runtime")
+        cues.append(cue)
+    return cues
+
+
+def _browser_preflight(
+    project: Path,
+    vtt: Path,
+    runtime: Mapping[str, str],
+    env: Mapping[str, str],
+) -> dict[str, Any]:
+    script = r"""
+const path = require('path');
+const {pathToFileURL, fileURLToPath} = require('url');
+const puppeteer = require(path.join(process.argv[1], 'node_modules', 'puppeteer-core'));
+const browserPath = process.argv[2];
+const projectRoot = path.resolve(process.argv[3]);
+const indexPath = path.join(projectRoot, 'index.html');
+const inside = value => value === projectRoot || value.startsWith(projectRoot + path.sep);
+(async () => {
+  const browser = await puppeteer.launch({
+    executablePath: browserPath,
+    headless: true,
+    args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
+  });
+  const blocked = [];
+  const pageErrors = [];
+  try {
+    const page = await browser.newPage();
+    await page.setViewport({width: 1920, height: 1080, deviceScaleFactor: 1});
+    await page.setRequestInterception(true);
+    page.on('request', request => {
+      try {
+        const url = request.url();
+        if (!url.startsWith('file:')) {
+          blocked.push(url); request.abort(); return;
+        }
+        const local = path.resolve(fileURLToPath(url));
+        if (!inside(local)) {
+          blocked.push(url); request.abort(); return;
+        }
+        request.continue();
+      } catch (error) {
+        blocked.push(request.url()); request.abort();
+      }
+    });
+    page.on('pageerror', error => pageErrors.push(String(error && error.message || error)));
+    await page.goto(pathToFileURL(indexPath).href, {waitUntil: 'load', timeout: 30000});
+    const state = async () => page.$eval('[data-subtitle-toggle]', button => {
+      const overlay = document.getElementById(button.getAttribute('aria-controls'));
+      if (!overlay) throw new Error('subtitle overlay is missing');
+      return {aria_pressed: button.getAttribute('aria-pressed'), overlay_hidden: overlay.hidden};
+    });
+    const initial = await state();
+    const subtitle = await page.$eval('[data-subtitle-toggle]', button => {
+      const overlay = document.getElementById(button.getAttribute('aria-controls'));
+      return {
+        source: overlay.getAttribute('data-subtitle-source'),
+        texts: Array.from(overlay.querySelectorAll('[data-subtitle-cue]')).map(item => item.textContent.replace(/\s+/g, ' ').trim()),
+      };
+    });
+    await page.click('[data-subtitle-toggle]');
+    const afterFirst = await state();
+    await page.click('[data-subtitle-toggle]');
+    const afterSecond = await state();
+    process.stdout.write(JSON.stringify({
+      passed: blocked.length === 0 && pageErrors.length === 0,
+      initial,
+      after_first_click: afterFirst,
+      after_second_click: afterSecond,
+      blocked_requests: blocked,
+      page_errors: pageErrors,
+      subtitle_source: subtitle.source,
+      overlay_texts: subtitle.texts,
+    }));
+  } finally {
+    await browser.close();
+  }
+})().catch(error => { console.error(error && error.stack || String(error)); process.exit(2); });
+"""
+    result = _run(
+        [
+            str(runtime["node"]), "-e", script, str(runtime["node_root"]),
+            str(runtime["browser"]), str(project), str(vtt),
+        ],
+        cwd=project,
+        env=env,
+        timeout=60,
+        stage="browser_preflight",
+        failure_class="runtime",
+    )
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise StageError("browser_preflight", "offline browser preflight returned invalid JSON", failure_class="runtime") from error
+    if not isinstance(payload, dict):
+        raise StageError("browser_preflight", "offline browser preflight returned a non-object", failure_class="runtime")
+    expected_states = {
+        "initial": {"aria_pressed": "false", "overlay_hidden": True},
+        "after_first_click": {"aria_pressed": "true", "overlay_hidden": False},
+        "after_second_click": {"aria_pressed": "false", "overlay_hidden": True},
+    }
+    for key, expected in expected_states.items():
+        if payload.get(key) != expected:
+            raise StageError("browser_preflight", f"subtitle toggle state failed at {key}", failure_class="authoring")
+    if payload.get("blocked_requests") or payload.get("page_errors"):
+        raise StageError("browser_preflight", "offline browser observed a network request or page error", failure_class="authoring")
+    cues = _vtt_cues(vtt)
+    overlay_texts = payload.get("overlay_texts")
+    if overlay_texts != cues:
+        raise StageError("browser_preflight", "subtitle overlay cues differ from generated local VTT", failure_class="authoring")
+    if payload.get("subtitle_source") != "narration/subtitles.en.vtt":
+        raise StageError("browser_preflight", "subtitle overlay does not bind the generated local VTT", failure_class="authoring")
+    payload.update(
+        {
+            "passed": True,
+            "cue_count": len(cues),
+            "overlay_matches_all_cues": overlay_texts == cues,
+            "subtitle_source_sha256": sha256_file(vtt),
+        }
+    )
+    return payload
+
+
 def _fraction(value: object) -> float:
     text = str(value or "")
     try:
@@ -873,8 +1268,28 @@ def _failure_report(
         "error": str(error),
         "stages": stages,
     }
+    if error.runtime_diagnostics:
+        report["runtime_diagnostics"] = error.runtime_diagnostics
     _write_json(project / "delivery-report.json", report)
     return report
+
+
+def _runtime_rechecked_error(error: StageError, runtime: Mapping[str, str]) -> StageError:
+    cache_dir = runtime.get("cache_dir")
+    try:
+        diagnostics = setup_video.doctor_video_runtime(
+            cache_root=Path(str(cache_dir)).absolute().parent if cache_dir else None
+        )
+    except (OSError, setup_video.VideoRuntimeError) as doctor_error:
+        diagnostics = {"ready": False, "status": "corrupt", "issues": [str(doctor_error)]}
+    if diagnostics.get("ready") is True:
+        return error
+    return StageError(
+        error.stage,
+        f"{error}; exact runtime/browser doctor failed",
+        failure_class="runtime",
+        runtime_diagnostics={key: value for key, value in diagnostics.items() if key != "runtime"},
+    )
 
 
 def _capture_frames(
@@ -929,8 +1344,11 @@ def deliver_project(
     plan_value: Mapping[str, Any],
     runtime: Mapping[str, str],
     *,
+    run_dir: Path | str | None = None,
     evidence_ids: set[str] | None = None,
-    visual_catalog: Mapping[str, Mapping[str, str]] | None = None,
+    visual_catalog: Mapping[str, Mapping[str, Any]] | None = None,
+    claims: Sequence[Mapping[str, Any]] | None = None,
+    canonical_plan_sha256: str | None = None,
     smoke: bool = False,
 ) -> dict[str, Any]:
     """Produce a final MP4 only through the audited HyperFrames delivery order."""
@@ -940,7 +1358,7 @@ def deliver_project(
     try:
         if runtime.get("status") != "ready" or runtime.get("hyperframes_version") != setup_video.HYPERFRAMES_VERSION:
             raise StageError("runtime", "exact HyperFrames 0.7.86 runtime is not ready", failure_class="runtime")
-        for name in ("hyperframes", "ffmpeg", "ffprobe", "python", "home_dir"):
+        for name in ("hyperframes", "ffmpeg", "ffprobe", "python", "home_dir", "node", "node_root", "browser"):
             if not runtime.get(name):
                 raise StageError("runtime", f"runtime is missing {name}", failure_class="runtime")
         env = _runtime_env(runtime)
@@ -953,7 +1371,13 @@ def deliver_project(
         plan = normalize_plan(plan_value, smoke=smoke)
 
         structural = validate_project(
-            project, plan, evidence_ids=evidence_ids, visual_catalog=visual_catalog, smoke=smoke
+            project,
+            plan,
+            run_dir=run_dir,
+            evidence_ids=evidence_ids,
+            visual_catalog=visual_catalog,
+            claims=claims,
+            smoke=smoke,
         )
         stages.append({"id": "structural", **structural})
         if not structural["passed"]:
@@ -984,10 +1408,16 @@ def deliver_project(
             }
         )
 
-        lint = _run(
-            [str(runtime["hyperframes"]), "lint"], cwd=project, env=env,
-            timeout=120, stage="full_lint", failure_class="authoring",
-        )
+        browser = _browser_preflight(project, subtitle_paths["vtt"], runtime, env)
+        stages.append({"id": "browser_preflight", **browser})
+
+        try:
+            lint = _run(
+                [str(runtime["hyperframes"]), "lint"], cwd=project, env=env,
+                timeout=120, stage="full_lint", failure_class="authoring",
+            )
+        except StageError as error:
+            raise _runtime_rechecked_error(error, runtime) from error
         if not narration.is_file() or sha256_file(narration) != narration_hash:
             raise StageError("full_lint", "narration changed during full lint", failure_class="runtime")
         stages.append(
@@ -1003,24 +1433,32 @@ def deliver_project(
         renders.mkdir(parents=True, exist_ok=True)
         raw_mp4 = renders / f"hyperframes-{time.time_ns()}-{uuid.uuid4().hex}.mp4"
         started = time.time_ns()
-        render = _run(
-            [
-                str(runtime["hyperframes"]), "render", "--fps", "30", "--resolution", "landscape",
-                "--strict", "--no-best-effort", "--output", str(raw_mp4.relative_to(project)), ".",
-            ],
-            cwd=project,
-            env=env,
-            timeout=1800,
-            stage="render",
-            failure_class="authoring",
-        )
+        try:
+            render = _run(
+                [
+                    str(runtime["hyperframes"]), "render", "--fps", "30", "--resolution", "landscape",
+                    "--strict", "--no-best-effort", "--output", str(raw_mp4.relative_to(project)), ".",
+                ],
+                cwd=project,
+                env=env,
+                timeout=1800,
+                stage="render",
+                failure_class="authoring",
+            )
+        except StageError as error:
+            raise _runtime_rechecked_error(error, runtime) from error
         if (
             not raw_mp4.is_file()
             or raw_mp4.stat().st_size <= 0
             or raw_mp4.stat().st_mtime_ns + FRESH_MTIME_TOLERANCE_NS < started
         ):
             raw_mp4.unlink(missing_ok=True)
-            raise StageError("render", "HyperFrames did not produce a fresh non-empty MP4", failure_class="authoring")
+            error = StageError(
+                "render",
+                "HyperFrames did not produce a fresh non-empty MP4",
+                failure_class="authoring",
+            )
+            raise _runtime_rechecked_error(error, runtime)
         raw_hash = sha256_file(raw_mp4)
         muxed = renders / f"captioned-{uuid.uuid4().hex}.mp4"
         _run(
@@ -1088,9 +1526,7 @@ def deliver_project(
 
         source_map = {
             "format_version": FORMAT_VERSION,
-            "plan_sha256": hashlib.sha256(
-                (json.dumps(plan, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
-            ).hexdigest(),
+            "plan_sha256": canonical_plan_sha256 or _canonical_hash(plan),
             "scenes": [
                 {
                     "scene_id": scene["scene_id"],
@@ -1115,7 +1551,10 @@ def deliver_project(
             "media_probe_sha256": sha256_file(project / "media_probe.json"),
             "source_map_sha256": sha256_file(project / "video-source-map.json"),
             "semantic_review_required": True,
+            "canonical_plan_sha256": canonical_plan_sha256,
+            "claims_sha256": _canonical_hash(list(claims or [])),
         }
+        report["publish_allowlist"] = _expected_publish_paths(project, plan)
         _write_json(project / "delivery-report.json", report)
         report["delivery_report_sha256"] = sha256_file(project / "delivery-report.json")
         return report
@@ -1130,26 +1569,84 @@ def deliver_project(
         return _failure_report(project, stages, StageError("runtime", str(error), failure_class="runtime"))
 
 
-def _copy_tree_regular(source: Path, destination: Path) -> list[str]:
-    if source.is_symlink() or not source.is_dir():
-        raise VideoContractError("delivered project must be a regular directory")
-    if destination.exists() and any(destination.iterdir()):
-        raise VideoContractError("attempt artifact directory must be empty")
+def _expected_publish_paths(project: Path, plan: Mapping[str, Any]) -> list[str]:
+    index = project / "index.html"
+    parser = _ProjectParser()
+    parser.feed(index.read_text(encoding="utf-8"))
+    parser.close()
+    expected = {
+        "index.html",
+        "hyperframes.json",
+        "conference-video.mp4",
+        "contact-sheet.png",
+        "media_probe.json",
+        "delivery-report.json",
+        "video-source-map.json",
+        "narration/transcript.en.txt",
+        "narration/subtitles.en.srt",
+        "narration/subtitles.en.vtt",
+        "narration/timing.json",
+        "narration/voice-and-subtitles.json",
+    }
+    for _tag, _attribute, reference in parser.references:
+        if reference.startswith("#"):
+            continue
+        lowered = reference.lower()
+        if lowered.startswith(_REMOTE_PREFIXES) or lowered.startswith(("data:", "blob:", "javascript:")):
+            continue
+        path = _safe_project_file(project, reference)
+        expected.add(path.relative_to(project).as_posix())
+    for _quote, reference in _CSS_URL.findall(index.read_text(encoding="utf-8")):
+        if reference.strip().startswith("#"):
+            continue
+        path = _safe_project_file(project, reference.strip())
+        expected.add(path.relative_to(project).as_posix())
+    for index_number, scene in enumerate(plan["scenes"], start=1):
+        prefix = f"narration/scenes/{index_number:02d}-{scene['scene_id']}"
+        expected.update({f"{prefix}.txt", f"{prefix}.wav"})
+    expected.update(f"frames/frame-{index_number:02d}.png" for index_number in range(1, 7))
+    return sorted(expected)
+
+
+def _actual_project_files(source: Path) -> list[str]:
     paths: list[str] = []
     for current, directories, files in os.walk(source, followlinks=False):
         current_path = Path(current)
         for name in directories:
-            if (current_path / name).is_symlink():
-                raise VideoContractError("delivered project contains a symlinked directory")
-        for name in sorted(files):
+            directory = current_path / name
+            if directory.is_symlink():
+                raise VideoContractError("publish allowlist rejects a symlinked directory")
+        for name in files:
             path = current_path / name
             if path.is_symlink() or path.stat().st_nlink != 1:
-                raise VideoContractError("delivered project contains a symlink or hard link")
+                raise VideoContractError("publish allowlist rejects a symlink or hard link")
             relative = path.relative_to(source)
-            target = destination / relative
-            core.atomic_write_bytes(target, path.read_bytes())
-            paths.append(f"artifact/{relative.as_posix()}")
+            if any(part.startswith(".") for part in relative.parts):
+                raise VideoContractError(f"publish allowlist rejects hidden file: {relative.as_posix()}")
+            paths.append(relative.as_posix())
     return sorted(paths)
+
+
+def _copy_tree_allowlist(source: Path, destination: Path, allowlist: Sequence[str]) -> list[str]:
+    if source.is_symlink() or not source.is_dir():
+        raise VideoContractError("delivered project must be a regular directory")
+    if destination.exists() and any(destination.iterdir()):
+        raise VideoContractError("attempt artifact directory must be empty")
+    expected = sorted(dict.fromkeys(str(path) for path in allowlist))
+    actual = _actual_project_files(source)
+    if actual != expected:
+        missing = sorted(set(expected) - set(actual))
+        unknown = sorted(set(actual) - set(expected))
+        raise VideoContractError(
+            f"publish allowlist mismatch; missing={missing}; unknown={unknown}"
+        )
+    paths: list[str] = []
+    for relative_text in expected:
+        path = _safe_project_file(source, relative_text)
+        target = destination / relative_text
+        core.atomic_write_bytes(target, path.read_bytes())
+        paths.append(f"artifact/{relative_text}")
+    return paths
 
 
 def record_attempt_delivery(
@@ -1165,11 +1662,34 @@ def record_attempt_delivery(
     if report.get("passed") is not True or report.get("renderer") != "hyperframes@0.7.86":
         raise VideoContractError("only a passing HyperFrames 0.7.86 delivery can be recorded")
     run = Path(run_dir).absolute()
+    canonical_plan_path = core.safe_path(run, "plan.json", must_exist=True)
+    canonical_plan_sha256 = sha256_file(canonical_plan_path)
+    if report.get("canonical_plan_sha256") != canonical_plan_sha256:
+        raise VideoContractError("delivery report is not bound to the canonical run plan")
+    if report.get("claims_sha256") != _canonical_hash(list(claims)):
+        raise VideoContractError("delivery report claim binding differs from recorded claims")
     attempt = core.safe_path(run / "attempts", attempt_id, must_exist=True)
-    core.safe_path(attempt, "qa/runtime-failure.json").unlink(missing_ok=True)
+    runtime_failure_marker = core.safe_path(attempt, "qa/runtime-failure.json")
     artifact = core.safe_path(attempt, "artifact", must_exist=True)
-    paths = _copy_tree_regular(Path(project_dir).absolute(), artifact)
+    project = Path(project_dir).absolute()
+    persisted_report = _read_json(project / "delivery-report.json")
+    expected_report = {key: value for key, value in report.items() if key != "delivery_report_sha256"}
+    if persisted_report != expected_report:
+        raise VideoContractError("persisted delivery report differs from the passing in-memory report")
+    if report.get("delivery_report_sha256") != sha256_file(project / "delivery-report.json"):
+        raise VideoContractError("delivery report hash binding is stale")
+    plan = normalize_plan(_read_json(canonical_plan_path))
+    expected = _expected_publish_paths(project, plan)
+    if report.get("publish_allowlist") != expected:
+        raise VideoContractError("delivery report publish allowlist differs from the canonical project contract")
+    actual = _actual_project_files(project)
+    if actual != expected:
+        raise VideoContractError(
+            f"publish allowlist mismatch; missing={sorted(set(expected) - set(actual))}; "
+            f"unknown={sorted(set(actual) - set(expected))}"
+        )
     core.write_source_map(run, attempt_id, claims)
+    paths = _copy_tree_allowlist(project, artifact, expected)
     preview_dir = core.safe_path(attempt, "qa/previews", must_exist=True)
     previews: dict[str, str] = {}
     contact = artifact / "contact-sheet.png"
@@ -1189,7 +1709,7 @@ def record_attempt_delivery(
         for stage in report.get("stages", [])
         if isinstance(stage, Mapping)
     ]
-    return core.record_deterministic_result(
+    result = core.record_deterministic_result(
         run,
         attempt_id,
         passed=True,
@@ -1197,6 +1717,8 @@ def record_attempt_delivery(
         artifact_paths=paths,
         preview_paths=previews,
     )
+    runtime_failure_marker.unlink(missing_ok=True)
+    return result
 
 
 def record_delivery_failure(
@@ -1224,15 +1746,16 @@ def record_delivery_failure(
             reason=f"{report.get('failed_stage')}: {report.get('error')}",
         )
         return {"next_action": "repair_authoring_in_next_attempt"}
-    payload = core.redact_secrets(
-        {
-            "format_version": FORMAT_VERSION,
-            "attempt_id": attempt_id,
-            "failure_class": "runtime",
-            "failed_stage": str(report.get("failed_stage", "runtime")),
-            "error": str(report.get("error", "runtime delivery failure")),
-        }
-    )
+    marker_payload: dict[str, Any] = {
+        "format_version": FORMAT_VERSION,
+        "attempt_id": attempt_id,
+        "failure_class": "runtime",
+        "failed_stage": str(report.get("failed_stage", "runtime")),
+        "error": str(report.get("error", "runtime delivery failure")),
+    }
+    if isinstance(report.get("runtime_diagnostics"), Mapping):
+        marker_payload["runtime_diagnostics"] = dict(report["runtime_diagnostics"])
+    payload = core.redact_secrets(marker_payload)
     core.atomic_write_json(marker, payload)
     return {
         "next_action": "repair_runtime_and_resume_same_attempt",
@@ -1298,6 +1821,9 @@ def synthetic_smoke_plan() -> dict[str, Any]:
                 "narration": ("What is the question?", "We test the method.", "The evidence is clear.")[index],
                 "source_ids": ["ev-smoke"],
                 "visual_ids": [],
+                "title_claim_id": f"claim-scene-{index + 1:02d}-title",
+                "narration_claim_id": f"claim-scene-{index + 1:02d}-narration",
+                "visible_claim_ids": [f"claim-scene-{index + 1:02d}-title"],
             }
         )
     return normalize_plan(
@@ -1318,6 +1844,18 @@ def synthetic_smoke_plan() -> dict[str, Any]:
     )
 
 
+def synthetic_smoke_claims(plan: Mapping[str, Any]) -> list[dict[str, Any]]:
+    claims: list[dict[str, Any]] = []
+    for scene in plan["scenes"]:
+        claims.extend(
+            [
+                {"id": scene["title_claim_id"], "text": scene["title"], "source_ids": scene["source_ids"]},
+                {"id": scene["narration_claim_id"], "text": scene["narration"], "source_ids": scene["source_ids"]},
+            ]
+        )
+    return claims
+
+
 def write_synthetic_smoke_project(project_dir: Path | str, plan: Mapping[str, Any]) -> Path:
     project = Path(project_dir).absolute()
     if project.exists() or project.is_symlink():
@@ -1330,18 +1868,24 @@ def write_synthetic_smoke_project(project_dir: Path | str, plan: Mapping[str, An
             f'<section id="{scene["scene_id"]}" class="clip" data-hf-clip="true" '
             f'data-start="{scene["start_s"]}" data-duration="{scene["duration_s"]}" '
             f'data-track-index="1" data-source-ids="ev-smoke" '
+            f'data-title-claim-id="{scene["title_claim_id"]}" '
+            f'data-narration-claim-id="{scene["narration_claim_id"]}" '
+            f'data-claim-ids="{scene["title_claim_id"]}" '
+            f'data-narration="{html.escape(scene["narration"], quote=True)}" '
             f'style="background:{colors[index]}"><p>AutoDesign video lifecycle smoke</p>'
-            f'<h1>{scene["title"]}</h1></section>'
+            f'<h1 data-claim-id="{scene["title_claim_id"]}">{html.escape(scene["title"])}</h1></section>'
         )
-    html = f'''<!doctype html><html lang="en"><head><meta charset="utf-8"><style>
+    html_text = f'''<!doctype html><html lang="en"><head><meta charset="utf-8"><style>
 html,body{{margin:0;width:1920px;height:1080px;overflow:hidden;background:#101820;color:#fff;font-family:Arial,sans-serif}}
 [data-composition-id]{{position:relative;width:1920px;height:1080px}}.clip{{position:absolute;inset:0;display:grid;place-content:center;padding:120px}}
 h1{{font-size:120px;margin:20px 0}}p{{font-size:34px}}.subtitle-overlay[hidden]{{display:none}}
+[data-subtitle-toggle]{{position:absolute;right:48px;bottom:40px;z-index:100;padding:16px 20px}}
+.subtitle-overlay{{position:absolute;left:20%;right:20%;bottom:100px;z-index:99;background:#000c;padding:20px}}
 </style></head><body><main data-composition-id="smoke" data-start="0" data-duration="{plan["duration_s"]}" data-width="1920" data-height="1080" data-no-timeline>
 {''.join(sections)}<audio id="narration" class="clip" src="assets/narration.wav" data-start="0" data-duration="{plan["duration_s"]}" data-track-index="2" data-media-start="0"></audio>
-<button type="button" data-subtitle-toggle aria-pressed="false" aria-controls="subtitles">CC</button><div id="subtitles" class="subtitle-overlay" hidden></div></main>
+<button type="button" data-subtitle-toggle aria-pressed="false" aria-controls="subtitles">CC</button><div id="subtitles" class="subtitle-overlay" data-subtitle-source="narration/subtitles.en.vtt" hidden>{''.join(f'<span data-subtitle-cue>{html.escape(scene["narration"])}</span>' for scene in plan["scenes"])}</div></main>
 <script>document.querySelector('[data-subtitle-toggle]').addEventListener('click',event=>{{const button=event.currentTarget;const target=document.getElementById('subtitles');const shown=button.getAttribute('aria-pressed')==='true';button.setAttribute('aria-pressed',String(!shown));target.hidden=shown;}});</script></body></html>'''
-    _write_text(project / "index.html", html)
+    _write_text(project / "index.html", html_text)
     _write_json(project / "hyperframes.json", {"version": 1, "entry": "index.html"})
     return project
 
@@ -1353,19 +1897,34 @@ def _read_json(path: Path) -> dict[str, Any]:
     return value
 
 
-def _source_contract(run: Path) -> tuple[set[str], dict[str, dict[str, str]]]:
+def _source_contract(run: Path) -> tuple[set[str], dict[str, dict[str, Any]]]:
     evidence = {str(item["id"]) for item in core.load_evidence(run)}
     value = _read_json(run / "evidence" / "source_visuals.json")
-    catalog: dict[str, dict[str, str]] = {}
+    catalog: dict[str, dict[str, Any]] = {}
     for item in value.get("visuals", []):
         if not isinstance(item, Mapping) or not isinstance(item.get("id"), str):
             continue
         relative = str(item.get("path", ""))
-        catalog[item["id"]] = {
-            "path": str(run / "evidence" / relative),
-            "sha256": str(item.get("sha256", "")),
-        }
+        catalog[item["id"]] = dict(item)
+        catalog[item["id"]]["path"] = str(run / "evidence" / relative)
     return evidence, catalog
+
+
+def create_video_review_context(run_dir: Path | str, attempt_id: str) -> dict[str, Any]:
+    """Return hash-bound previews plus readable evidence material for the host VLM."""
+    run = Path(run_dir).absolute()
+    context = core.create_review_context(run, attempt_id, rubric=REVIEW_RUBRIC)
+    attempt = core.safe_path(run / "attempts", attempt_id, must_exist=True)
+    materials: dict[str, dict[str, str]] = {}
+    for key, path in (
+        ("evidence_jsonl", run / "evidence" / "evidence.jsonl"),
+        ("source_text", run / "evidence" / "source.txt"),
+        ("source_map", attempt / "provenance" / "source-map.json"),
+    ):
+        if path.is_symlink() or not path.is_file() or path.stat().st_nlink != 1:
+            raise VideoContractError(f"review material is missing or linked: {path}")
+        materials[key] = {"path": str(path), "sha256": sha256_file(path)}
+    return {**context, "review_materials": materials}
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -1395,6 +1954,7 @@ def _parser() -> argparse.ArgumentParser:
     validate.add_argument("project", type=Path)
     validate.add_argument("plan_json", type=Path)
     validate.add_argument("--run", type=Path, required=True)
+    validate.add_argument("--claims", type=Path, required=True)
     deliver = commands.add_parser("deliver")
     deliver.add_argument("project", type=Path)
     deliver.add_argument("plan_json", type=Path)
@@ -1439,9 +1999,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.command == "begin-attempt":
             result = {"attempt_id": begin_video_attempt(args.run)}
         elif args.command == "validate":
+            claims_value = json.loads(args.claims.read_text(encoding="utf-8"))
+            if not isinstance(claims_value, list):
+                raise VideoContractError("claims JSON must be a list")
             evidence_ids, catalog = _source_contract(args.run)
             result = validate_project(
-                args.project, _read_json(args.plan_json), evidence_ids=evidence_ids, visual_catalog=catalog
+                args.project,
+                _read_json(args.plan_json),
+                run_dir=args.run,
+                evidence_ids=evidence_ids,
+                visual_catalog=catalog,
+                claims=claims_value,
             )
         elif args.command == "deliver":
             claims_value = json.loads(args.claims.read_text(encoding="utf-8"))
@@ -1449,9 +2017,18 @@ def main(argv: Sequence[str] | None = None) -> int:
                 raise VideoContractError("claims JSON must be a list")
             runtime = setup_video.require_video_runtime(cache_root=args.cache_root).as_dict()
             evidence_ids, catalog = _source_contract(args.run)
+            canonical_plan, canonical_plan_sha256 = load_canonical_delivery_plan(
+                args.run, args.plan_json
+            )
             result = deliver_project(
-                args.project, _read_json(args.plan_json), runtime,
-                evidence_ids=evidence_ids, visual_catalog=catalog,
+                args.project,
+                canonical_plan,
+                runtime,
+                run_dir=args.run,
+                evidence_ids=evidence_ids,
+                visual_catalog=catalog,
+                claims=claims_value,
+                canonical_plan_sha256=canonical_plan_sha256,
             )
             if result.get("passed") is True:
                 result["deterministic_result"] = record_attempt_delivery(
@@ -1460,7 +2037,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             else:
                 result.update(record_delivery_failure(args.run, args.attempt, result))
         elif args.command == "review-context":
-            result = core.create_review_context(args.run, args.attempt, rubric=REVIEW_RUBRIC)
+            result = create_video_review_context(args.run, args.attempt)
         elif args.command == "record-review":
             result = core.record_semantic_review(
                 args.run, args.attempt, _read_json(args.review_json)

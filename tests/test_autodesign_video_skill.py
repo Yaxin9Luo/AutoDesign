@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
+import html
 import json
 import os
 import shutil
@@ -59,6 +61,9 @@ def _plan(*, scene_count: int = 12, duration_s: int = 360) -> dict[str, object]:
                 "narration": narration,
                 "source_ids": ["ev-001"],
                 "visual_ids": ["vis-001"] if index == 3 else [],
+                "title_claim_id": f"claim-{scene_id}-title",
+                "narration_claim_id": f"claim-{scene_id}-narration",
+                "visible_claim_ids": [f"claim-{scene_id}-title"],
             }
         )
         cursor += scene_duration
@@ -77,6 +82,29 @@ def _plan(*, scene_count: int = 12, duration_s: int = 360) -> dict[str, object]:
     }
 
 
+def _claims(plan: dict[str, object]) -> list[dict[str, object]]:
+    scenes = plan["scenes"]
+    assert isinstance(scenes, list)
+    claims: list[dict[str, object]] = []
+    for scene in scenes:
+        assert isinstance(scene, dict)
+        claims.extend(
+            [
+                {
+                    "id": scene["title_claim_id"],
+                    "text": scene["title"],
+                    "source_ids": list(scene["source_ids"]),
+                },
+                {
+                    "id": scene["narration_claim_id"],
+                    "text": scene["narration"],
+                    "source_ids": list(scene["source_ids"]),
+                },
+            ]
+        )
+    return claims
+
+
 def _project_html(plan: dict[str, object], *, bad: str = "") -> str:
     scenes = plan["scenes"]
     assert isinstance(scenes, list)
@@ -93,11 +121,20 @@ def _project_html(plan: dict[str, object], *, bad: str = "") -> str:
             )
         clip_class = "" if bad == "data-hf-only" and scene["scene_id"] == "scene_01" else ' class="clip"'
         scene_start = "nan" if bad == "scene-malformed-timing" and scene_index == 0 else scene["start_s"]
+        extra_number = "<p>Accuracy 99.9%</p>" if bad == "unbound-number" and scene_index == 0 else ""
+        title_markup = html.escape(str(scene["title"]))
+        if bad == "nested-title" and scene_index == 0:
+            first, rest = title_markup.split(" ", 1)
+            title_markup = f"<span>{first}</span> {rest}"
         scene_html.append(
             f'<section id="{scene["scene_id"]}"{clip_class} data-hf-clip="true" '
             f'data-start="{scene_start}" data-duration="{scene["duration_s"]}" '
-            f'data-track-index="1" data-narration="{scene["narration"]}" '
-            f'data-source-ids="ev-001"><h2>{scene["title"]}</h2>{source_media}</section>'
+            f'data-track-index="1" data-narration="{html.escape(str(scene["narration"]), quote=True)}" '
+            f'data-title-claim-id="{scene["title_claim_id"]}" '
+            f'data-narration-claim-id="{scene["narration_claim_id"]}" '
+            f'data-claim-ids="{" ".join(scene["visible_claim_ids"])}" '
+            f'data-source-ids="ev-001"><h2 data-claim-id="{scene["title_claim_id"]}">'
+            f'{title_markup}</h2>{extra_number}{source_media}</section>'
         )
     extra_root = (
         '<div data-composition-id="duplicate" data-start="0" data-duration="360" '
@@ -114,6 +151,12 @@ def _project_html(plan: dict[str, object], *, bad: str = "") -> str:
         if bad == "network-script"
         else ""
     )
+    if bad == "new-image":
+        unsafe_script = "const i = new Image(); i.src = 'https://example.com/tracker.png'"
+    meta_refresh = '<meta http-equiv="refresh" content="0;url=https://example.com">' if bad == "meta-refresh" else ""
+    duplicate_attr = ' src="https://example.com/second.png"' if bad == "duplicate-attr" else ""
+    css_escape = "<div style=\"background:url('../escape.png')\"></div>" if bad == "css-escape" else ""
+    css_absolute = "<div style=\"background:url('/etc/passwd')\"></div>" if bad == "css-absolute" else ""
     subtitle_button = "" if bad == "no-subtitle-toggle" else (
         f'<button type="button" data-subtitle-toggle aria-pressed="{str(bad == "subtitles-default-on").lower()}" '
         'aria-controls="subtitles">CC</button>'
@@ -126,7 +169,7 @@ def _project_html(plan: dict[str, object], *, bad: str = "") -> str:
         'data-track-index="2" data-media-start="0"></audio>'
     )
     return f"""<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><style>
+<html lang="en"><head><meta charset="utf-8">{meta_refresh}<style>
 html,body{{margin:0;width:1920px;height:1080px;overflow:hidden}}
 [data-composition-id]{{position:relative;width:1920px;height:1080px;background:#101820;color:white}}
 .clip{{position:absolute;inset:0}} .subtitle-overlay[hidden]{{display:none}}
@@ -134,8 +177,12 @@ html,body{{margin:0;width:1920px;height:1080px;overflow:hidden}}
 <main data-composition-id="conference-video" data-start="{root_start}"
       data-duration="{plan['duration_s']}" data-width="1920" data-height="1080"
       data-no-timeline>{''.join(scene_html)}{audio}
-  {subtitle_button}<div id="subtitles" class="subtitle-overlay" aria-live="polite"{subtitle_hidden}></div>
-  {remote}{data_url}{remote_css}{iframe}
+  {subtitle_button}<div id="subtitles" class="subtitle-overlay" aria-live="polite"
+    data-subtitle-source="narration/subtitles.en.vtt"{subtitle_hidden}>
+    {''.join(f'<span>{html.escape(str(scene["narration"]))}</span>' for scene in scenes)}
+  </div>
+  {remote}{data_url}{remote_css}{iframe}{css_escape}{css_absolute}
+  {f'<img src="assets/figure.png"{duplicate_attr} data-source-id="vis-001" alt="duplicate">' if duplicate_attr else ''}
 </main>{extra_root}
 <script>{unsafe_script}
 document.querySelector('[data-subtitle-toggle]')?.addEventListener('click',event=>{{
@@ -236,12 +283,38 @@ def _fake_runtime(root: Path, *, fail_stage: str = "", stale_render: bool = Fals
         }}))
         """,
     )
+    browser = _make_executable(bin_dir / "chrome-headless-shell", "raise SystemExit(0)")
+    node = _make_executable(
+        bin_dir / "node",
+        """
+        import hashlib, json, pathlib, sys
+        vtt = next((pathlib.Path(value) for value in sys.argv if value.endswith('.vtt')), None)
+        blocks = vtt.read_text(encoding='utf-8').strip().split('\\n\\n')[1:] if vtt else []
+        cues = [' '.join(block.splitlines()[2:]).strip() for block in blocks]
+        print(json.dumps({
+          'passed': True,
+          'initial': {'aria_pressed': 'false', 'overlay_hidden': True},
+          'after_first_click': {'aria_pressed': 'true', 'overlay_hidden': False},
+          'after_second_click': {'aria_pressed': 'false', 'overlay_hidden': True},
+          'blocked_requests': [],
+          'page_errors': [],
+          'cue_count': len(cues),
+          'overlay_matches_all_cues': True,
+          'subtitle_source': 'narration/subtitles.en.vtt',
+          'overlay_texts': cues,
+          'subtitle_source_sha256': hashlib.sha256(vtt.read_bytes()).hexdigest() if vtt else '',
+        }))
+        """,
+    )
     return {
         "status": "ready",
         "cache_dir": str(root / "runtime-cache"),
         "home_dir": str(root / "runtime-home"),
         "hyperframes": str(hyperframes),
         "python": sys.executable,
+        "node": str(node),
+        "browser": str(browser),
+        "node_root": str(bin_dir),
         "ffmpeg": str(ffmpeg),
         "ffprobe": str(ffprobe),
         "command_log": str(log),
@@ -258,7 +331,9 @@ def _write_runtime_fixture(setup: object, spec: object) -> tuple[str, str]:
     model = home / ".cache" / "hyperframes" / "tts" / "models" / "kokoro-v1.0.onnx"
     voices = home / ".cache" / "hyperframes" / "tts" / "voices" / "voices-v1.0.bin"
     smoke = cache / "smoke" / "tts.wav"
-    for path in (hyperframes, python, model, voices, smoke):
+    browser = home / ".cache" / "hyperframes" / "chrome" / "chrome-headless-shell"
+    package_file = cache / "tts-venv" / "lib" / f"python{spec.python_major_minor}" / "site-packages" / "fixture" / "module.py"
+    for path in (hyperframes, python, model, voices, smoke, browser, package_file):
         path.parent.mkdir(parents=True, exist_ok=True)
     _make_executable(hyperframes, "print('0.7.86')")
     _make_executable(
@@ -272,6 +347,8 @@ def _write_runtime_fixture(setup: object, spec: object) -> tuple[str, str]:
     model.write_bytes(b"fixture-model")
     voices.write_bytes(b"fixture-voices")
     smoke.write_bytes(b"fixture-wav")
+    _make_executable(browser, "raise SystemExit(0)")
+    package_file.write_text("VALUE = 1\n", encoding="utf-8")
     model_hash = setup._sha256(model)
     voices_hash = setup._sha256(voices)
     state = {
@@ -290,6 +367,7 @@ def _write_runtime_fixture(setup: object, spec: object) -> tuple[str, str]:
         "home_relative": home.relative_to(cache).as_posix(),
         "package_sha256": spec.package_sha256,
         "package_lock_sha256": spec.package_lock_sha256,
+        "python_lock_sha256": spec.python_lock_sha256,
         "kokoro_onnx_version": setup.KOKORO_ONNX_VERSION,
         "soundfile_version": setup.SOUNDFILE_VERSION,
         "kokoro_model_relative": model.relative_to(cache).as_posix(),
@@ -298,9 +376,12 @@ def _write_runtime_fixture(setup: object, spec: object) -> tuple[str, str]:
         "kokoro_voices_sha256": voices_hash,
         "tts_smoke_relative": smoke.relative_to(cache).as_posix(),
         "tts_smoke_sha256": setup._sha256(smoke),
+        "browser_relative": browser.relative_to(cache).as_posix(),
+        "browser_sha256": setup._sha256(browser),
         "browser_ensured": True,
     }
     setup._atomic_write_json(cache / "runtime-state.json", state)
+    setup._make_python_packages_read_only(cache / "tts-venv")
     return model_hash, voices_hash
 
 
@@ -400,6 +481,7 @@ class AutoDesignVideoSkillTests(unittest.TestCase):
             project,
             plan,
             evidence_ids={"ev-001"},
+            claims=_claims(plan),
             visual_catalog={
                 "vis-001": {
                     "path": str(project / "assets" / "figure.png"),
@@ -411,6 +493,104 @@ class AutoDesignVideoSkillTests(unittest.TestCase):
         self.assertEqual(report["scene_count"], 12)
         self.assertEqual(report["timeline_duration_s"], 360)
         self.assertTrue(report["subtitle_toggle"])
+
+        nested_title_project = _write_project(self.root / "nested-title", plan, bad="nested-title")
+        nested_title = harness.validate_project(
+            nested_title_project,
+            plan,
+            evidence_ids={"ev-001"},
+            claims=_claims(plan),
+        )
+        self.assertTrue(nested_title["passed"], nested_title)
+
+    def test_scene_titles_narration_and_visible_numbers_require_exact_nonempty_claims(self) -> None:
+        harness = self._require(self.harness, HARNESS_PATH)
+        plan = _plan()
+        claims = _claims(plan)
+        project = _write_project(self.root / "valid-claims", plan)
+        valid = harness.validate_project(
+            project,
+            plan,
+            evidence_ids={"ev-001"},
+            claims=claims,
+        )
+        self.assertTrue(valid["passed"], valid)
+
+        empty = harness.validate_project(
+            project,
+            plan,
+            evidence_ids={"ev-001"},
+            claims=[],
+        )
+        self.assertFalse(empty["passed"])
+        self.assertIn("claims_empty", {item["code"] for item in empty["issues"]})
+
+        for field, replacement, code in (
+            ("title", "A paraphrased title", "title_claim_mismatch"),
+            ("narration", "A paraphrased narration.", "narration_claim_mismatch"),
+        ):
+            with self.subTest(field=field):
+                changed = json.loads(json.dumps(claims))
+                target_id = plan["scenes"][0][f"{field}_claim_id"]
+                next(item for item in changed if item["id"] == target_id)["text"] = replacement
+                report = harness.validate_project(
+                    project,
+                    plan,
+                    evidence_ids={"ev-001"},
+                    claims=changed,
+                )
+                self.assertFalse(report["passed"])
+                self.assertIn(code, {item["code"] for item in report["issues"]})
+
+        numbered = _write_project(self.root / "unbound-number", plan, bad="unbound-number")
+        report = harness.validate_project(
+            numbered,
+            plan,
+            evidence_ids={"ev-001"},
+            claims=claims,
+        )
+        self.assertFalse(report["passed"])
+        self.assertIn("unbound_visible_number", {item["code"] for item in report["issues"]})
+
+    def test_source_catalog_preserves_visual_policy_and_shared_plan_validator_enforces_reuse(self) -> None:
+        harness = self._require(self.harness, HARNESS_PATH)
+        core = harness.core
+        source = self.root / "source.md"
+        source.write_text("# Method\nA grounded method and result.\n", encoding="utf-8")
+        visual = self.root / "method.png"
+        visual.write_bytes(b"source-figure")
+        run = self.root / "visual-run"
+        core.initialize_run(run, SKILL_ROOT, release_version="0.1.0")
+        core.prepare_source(run, source, extra_assets=[visual])
+        evidence_ids, catalog = harness._source_contract(run)
+        self.assertIn("ev-001", evidence_ids)
+        self.assertEqual(catalog["vis-001"]["eligibility"], "eligible")
+        self.assertIn("method", catalog["vis-001"]["allowed_content_roles"])
+        self.assertEqual(catalog["vis-001"]["max_reuse"], 1)
+
+        plan = _plan()
+        plan["scenes"][3]["visual_ids"] = ["vis-001"]
+        plan["scenes"][4]["visual_ids"] = ["vis-001"]
+        project = _write_project(self.root / "visual-project", plan)
+        staged = project / "assets" / "figure.png"
+        source_visual = Path(catalog["vis-001"]["path"])
+        staged.write_bytes(source_visual.read_bytes())
+        with mock.patch.object(
+            core,
+            "validate_visual_plan",
+            wraps=core.validate_visual_plan,
+        ) as shared_validator:
+            report = harness.validate_project(
+                project,
+                plan,
+                run_dir=run,
+                evidence_ids=evidence_ids,
+                visual_catalog=catalog,
+                claims=_claims(plan),
+            )
+        shared_validator.assert_called_once()
+        self.assertFalse(report["passed"])
+        self.assertIn("visual_reuse_limit", {item["code"] for item in report["issues"]})
 
     def test_structural_validation_rejects_unsafe_or_noncanonical_projects(self) -> None:
         harness = self._require(self.harness, HARNESS_PATH)
@@ -427,12 +607,41 @@ class AutoDesignVideoSkillTests(unittest.TestCase):
             ("subtitles-default-on", "subtitle_default_state"),
             ("malformed-timing", "composition_contract"),
             ("scene-malformed-timing", "scene_timing"),
+            ("duplicate-attr", "duplicate_attribute"),
+            ("meta-refresh", "meta_refresh"),
+            ("new-image", "dynamic_image"),
+            ("css-escape", "unsafe_css_asset"),
+            ("css-absolute", "unsafe_css_asset"),
         ):
             with self.subTest(bad=bad):
                 project = _write_project(self.root / bad, _plan(), bad=bad)
                 report = harness.validate_project(project, _plan(), evidence_ids={"ev-001"})
                 self.assertFalse(report["passed"])
                 self.assertIn(code, {item["code"] for item in report["issues"]})
+
+    def test_delivery_runs_strict_offline_browser_toggle_and_binds_generated_vtt(self) -> None:
+        harness = self._require(self.harness, HARNESS_PATH)
+        plan = _plan()
+        project = _write_project(self.root, plan)
+        report = harness.deliver_project(
+            project,
+            plan,
+            _fake_runtime(self.root),
+            claims=_claims(plan),
+            smoke=True,
+        )
+        self.assertTrue(report["passed"], report)
+        browser = next(stage for stage in report["stages"] if stage["id"] == "browser_preflight")
+        self.assertTrue(browser["passed"], browser)
+        self.assertEqual(browser["initial"], {"aria_pressed": "false", "overlay_hidden": True})
+        self.assertEqual(browser["after_first_click"], {"aria_pressed": "true", "overlay_hidden": False})
+        self.assertEqual(browser["after_second_click"], {"aria_pressed": "false", "overlay_hidden": True})
+        self.assertEqual(browser["blocked_requests"], [])
+        self.assertTrue(browser["overlay_matches_all_cues"])
+        self.assertEqual(
+            browser["subtitle_source_sha256"],
+            harness.sha256_file(project / "narration" / "subtitles.en.vtt"),
+        )
 
     def test_source_visual_binding_rejects_missing_hash_symlink_and_hardlink(self) -> None:
         harness = self._require(self.harness, HARNESS_PATH)
@@ -466,7 +675,7 @@ class AutoDesignVideoSkillTests(unittest.TestCase):
         plan = _plan()
         project = _write_project(self.root, plan)
         runtime = _fake_runtime(self.root)
-        report = harness.deliver_project(project, plan, runtime, smoke=True)
+        report = harness.deliver_project(project, plan, runtime, claims=_claims(plan), smoke=True)
         self.assertTrue(report["passed"], report)
         events = [json.loads(line) for line in Path(runtime["command_log"]).read_text().splitlines()]
         tools_and_stages = [
@@ -502,7 +711,7 @@ class AutoDesignVideoSkillTests(unittest.TestCase):
         plan = _plan()
         project = _write_project(self.root, plan)
         runtime = _fake_runtime(self.root)
-        report = harness.deliver_project(project, plan, runtime, smoke=True)
+        report = harness.deliver_project(project, plan, runtime, claims=_claims(plan), smoke=True)
         self.assertTrue(report["passed"], report)
         lint = next(stage for stage in report["stages"] if stage["id"] == "full_lint")
         self.assertEqual(lint["narration_sha256"], harness.sha256_file(project / "assets" / "narration.wav"))
@@ -515,7 +724,9 @@ class AutoDesignVideoSkillTests(unittest.TestCase):
                 root = self.root / stage
                 plan = _plan()
                 project = _write_project(root, plan)
-                report = harness.deliver_project(project, plan, _fake_runtime(root, fail_stage=stage), smoke=True)
+                report = harness.deliver_project(
+                    project, plan, _fake_runtime(root, fail_stage=stage), claims=_claims(plan), smoke=True
+                )
                 self.assertFalse(report["passed"])
                 self.assertEqual(report["failure_class"], "runtime")
                 self.assertFalse(report["authoring_retryable"])
@@ -536,14 +747,24 @@ class AutoDesignVideoSkillTests(unittest.TestCase):
             project,
             plan,
             _fake_runtime(self.root / "runtime-failure", fail_stage="tts"),
+            claims=_claims(plan),
             smoke=True,
         )
+        report["runtime_diagnostics"] = {
+            "ready": False,
+            "status": "corrupt",
+            "issues": ["browser launch probe failed"],
+        }
         routed = harness.record_delivery_failure(run, attempt_id, report)
         self.assertEqual(routed["next_action"], "repair_runtime_and_resume_same_attempt")
         resumed = harness.resume_video_run(run)
         self.assertEqual(resumed["active_attempt"], attempt_id)
         self.assertEqual(resumed["next_action"], "repair_runtime_and_resume_same_attempt")
         self.assertIn("narration", resumed["runtime_failure"]["failed_stage"])
+        self.assertEqual(
+            resumed["runtime_failure"]["runtime_diagnostics"]["issues"],
+            ["browser launch probe failed"],
+        )
         self.assertEqual(json.loads((run / "run.json").read_text())["state"], "authoring")
         authoring = {
             "passed": False,
@@ -564,7 +785,14 @@ class AutoDesignVideoSkillTests(unittest.TestCase):
                 plan = _plan()
                 project = _write_project(root, plan)
                 runtime = _fake_runtime(root, fail_stage=stage)
-                report = harness.deliver_project(project, plan, runtime, smoke=True)
+                with mock.patch.object(
+                    harness.setup_video,
+                    "doctor_video_runtime",
+                    return_value={"ready": True, "status": "ready", "issues": []},
+                ):
+                    report = harness.deliver_project(
+                        project, plan, runtime, claims=_claims(plan), smoke=True
+                    )
                 self.assertFalse(report["passed"])
                 self.assertEqual(report["failed_stage"], "full_lint" if stage == "lint" else "render")
                 self.assertEqual(report["failure_class"], "authoring")
@@ -573,13 +801,108 @@ class AutoDesignVideoSkillTests(unittest.TestCase):
                     self.assertNotIn("-c:v", commands)
                 self.assertFalse(any(project.glob("renders/delivery*.mp4")))
 
+    def test_lint_or_render_rechecks_browser_doctor_and_routes_infrastructure_same_attempt(self) -> None:
+        harness = self._require(self.harness, HARNESS_PATH)
+        for failed_stage in ("lint", "render"):
+            with self.subTest(failed_stage=failed_stage):
+                root = self.root / f"infra-{failed_stage}"
+                plan = _plan()
+                project = _write_project(root, plan)
+                with mock.patch.object(
+                    harness.setup_video,
+                    "doctor_video_runtime",
+                    return_value={
+                        "ready": False,
+                        "status": "corrupt",
+                        "issues": ["fresh Chrome launch probe failed"],
+                    },
+                ) as doctor:
+                    report = harness.deliver_project(
+                        project,
+                        plan,
+                        _fake_runtime(root, fail_stage=failed_stage),
+                        claims=_claims(plan),
+                        smoke=True,
+                    )
+                doctor.assert_called()
+                self.assertFalse(report["passed"])
+                self.assertEqual(report["failure_class"], "runtime")
+                self.assertFalse(report["authoring_retryable"])
+                self.assertIn("Chrome", report["runtime_diagnostics"]["issues"][0])
+
+    def test_delivery_requires_byte_identical_canonical_run_plan(self) -> None:
+        harness = self._require(self.harness, HARNESS_PATH)
+        core = harness.core
+        source = self.root / "source.md"
+        source.write_text("# Video source\nA grounded contribution and result.\n", encoding="utf-8")
+        run = self.root / "bound-plan-run"
+        core.initialize_run(run, SKILL_ROOT, release_version="0.1.0")
+        core.prepare_source(run, source)
+        plan = _plan()
+        core.save_plan(run, harness.normalize_plan(plan))
+        supplied = self.root / "supplied-plan.json"
+        supplied.write_text((run / "plan.json").read_text(encoding="utf-8"), encoding="utf-8")
+        bound, digest = harness.load_canonical_delivery_plan(run, supplied)
+        self.assertEqual(bound, harness.normalize_plan(plan))
+        self.assertEqual(digest, harness.sha256_file(run / "plan.json"))
+
+        supplied.write_text(json.dumps(bound), encoding="utf-8")
+        with self.assertRaisesRegex(harness.VideoContractError, "canonical run plan"):
+            harness.load_canonical_delivery_plan(run, supplied)
+
+    def test_publish_allowlist_rejects_hidden_unknown_and_unreferenced_files(self) -> None:
+        harness = self._require(self.harness, HARNESS_PATH)
+        core = harness.core
+        source = self.root / "source.md"
+        source.write_text("# Grounded video\nThe paper reports a grounded method and evidence.\n", encoding="utf-8")
+        run = self.root / "publish-run"
+        core.initialize_run(run, SKILL_ROOT, release_version="0.1.0")
+        core.prepare_source(run, source)
+        plan = _plan()
+        core.save_plan(run, harness.normalize_plan(plan))
+        attempt_id = core.begin_attempt(run)
+        project = _write_project(self.root / "publish-project", plan)
+        report = harness.deliver_project(
+            project,
+            plan,
+            _fake_runtime(self.root / "publish-runtime"),
+            claims=_claims(plan),
+            canonical_plan_sha256=harness.sha256_file(run / "plan.json"),
+            smoke=True,
+        )
+        self.assertTrue(report["passed"], report)
+        for name in (".env", "debug.log", "assets/unreferenced.png"):
+            with self.subTest(name=name):
+                path = project / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("must not publish\n", encoding="utf-8")
+                with self.assertRaisesRegex(harness.VideoContractError, "allowlist"):
+                    harness.record_attempt_delivery(
+                        run,
+                        attempt_id,
+                        project,
+                        report,
+                        claims=_claims(plan),
+                    )
+                path.unlink()
+        self.assertEqual(list((run / "attempts" / attempt_id / "artifact").iterdir()), [])
+
     def test_stale_render_output_cannot_satisfy_delivery(self) -> None:
         harness = self._require(self.harness, HARNESS_PATH)
         plan = _plan()
         project = _write_project(self.root, plan)
-        report = harness.deliver_project(
-            project, plan, _fake_runtime(self.root, stale_render=True), smoke=True
-        )
+        with mock.patch.object(
+            harness.setup_video,
+            "doctor_video_runtime",
+            return_value={"ready": True, "status": "ready", "issues": []},
+        ):
+            report = harness.deliver_project(
+                project,
+                plan,
+                _fake_runtime(self.root, stale_render=True),
+                claims=_claims(plan),
+                smoke=True,
+            )
         self.assertFalse(report["passed"])
         self.assertEqual(report["failed_stage"], "render")
         self.assertIn("fresh", report["error"].lower())
@@ -640,6 +963,78 @@ class AutoDesignVideoSkillTests(unittest.TestCase):
         self.assertLessEqual(len(spec.cache_key), 40)
         self.assertEqual(setup._venv_python_relative().parts[0], "p")
 
+    def test_python_runtime_lock_is_generated_hash_complete_platform_bound_and_tamper_evident(self) -> None:
+        setup = self._require(self.setup, SETUP_PATH)
+        requirements_input = SKILL_ROOT / "assets" / "video-runtime" / "requirements-kokoro.in"
+        lock = SKILL_ROOT / "assets" / "video-runtime" / "requirements-kokoro.lock"
+        self.assertEqual(
+            requirements_input.read_text(encoding="utf-8"),
+            "kokoro-onnx==0.5.0\nsoundfile==0.14.0\n",
+        )
+        text = lock.read_text(encoding="utf-8")
+        self.assertIn("autogenerated by uv", text)
+        self.assertIn("--universal", text.splitlines()[1])
+        self.assertIn("uv pip compile requirements-kokoro.in", text.splitlines()[1])
+        self.assertIn("kokoro-onnx==0.5.0", text)
+        self.assertIn("soundfile==0.14.0", text)
+        self.assertNotIn("--index-url", text)
+        self.assertEqual(hashlib.sha256(lock.read_bytes()).hexdigest(), setup.PYTHON_LOCK_SHA256)
+        self.assertRegex(text, r"(?m)^onnxruntime==[^\n]+")
+        requirement_blocks: list[str] = []
+        current: list[str] = []
+        for line in text.splitlines():
+            if line and not line.startswith((" ", "#")):
+                if current:
+                    requirement_blocks.append("\n".join(current))
+                current = [line]
+            elif current:
+                current.append(line)
+        if current:
+            requirement_blocks.append("\n".join(current))
+        self.assertTrue(requirement_blocks)
+        self.assertTrue(all("--hash=sha256:" in block for block in requirement_blocks))
+
+        original = setup.runtime_spec(cache_root=self.root / "cache")
+        self.assertEqual(original.python_lock_sha256, setup.PYTHON_LOCK_SHA256)
+        self.assertIn(setup.PYTHON_LOCK_SHA256[:12], original.cache_key)
+        tampered = self.root / "requirements-kokoro.lock"
+        tampered.write_bytes(lock.read_bytes() + b"# tampered\n")
+        with mock.patch.object(setup, "PYTHON_LOCK_PATH", tampered):
+            with self.assertRaisesRegex(setup.VideoRuntimeError, "Python lock checksum"):
+                setup.runtime_spec(cache_root=self.root / "tampered-cache")
+
+        with (
+            mock.patch.object(setup.platform, "system", return_value="FreeBSD"),
+            mock.patch.object(setup.platform, "machine", return_value="sparc64"),
+        ):
+            with self.assertRaisesRegex(setup.VideoRuntimeError, "unsupported video runtime platform"):
+                setup.runtime_spec(cache_root=self.root / "unsupported")
+
+    def test_doctor_launches_exact_browser_and_rejects_writable_python_packages(self) -> None:
+        setup = self._require(self.setup, SETUP_PATH)
+        spec = setup.runtime_spec(cache_root=self.root / "cache")
+        model_hash, voices_hash = _write_runtime_fixture(setup, spec)
+        setup._make_python_packages_read_only(spec.cache_dir / "tts-venv")
+        with (
+            mock.patch.object(setup, "KOKORO_MODEL_SHA256", model_hash),
+            mock.patch.object(setup, "KOKORO_VOICES_SHA256", voices_hash),
+            mock.patch.object(setup, "_probe_hyperframes_browser", return_value={"passed": True}) as probe,
+        ):
+            ready = setup.doctor_video_runtime(cache_root=spec.cache_root)
+        self.assertTrue(ready["ready"], ready)
+        probe.assert_called_once()
+
+        package_file = next((spec.cache_dir / "tts-venv").rglob("*.py"))
+        package_file.chmod(package_file.stat().st_mode | stat.S_IWUSR)
+        with (
+            mock.patch.object(setup, "KOKORO_MODEL_SHA256", model_hash),
+            mock.patch.object(setup, "KOKORO_VOICES_SHA256", voices_hash),
+            mock.patch.object(setup, "_probe_hyperframes_browser", return_value={"passed": True}),
+        ):
+            corrupt = setup.doctor_video_runtime(cache_root=spec.cache_root)
+        self.assertFalse(corrupt["ready"])
+        self.assertIn("writable", json.dumps(corrupt).lower())
+
     def test_doctor_distinguishes_missing_partial_corrupt_and_ready_cache(self) -> None:
         setup = self._require(self.setup, SETUP_PATH)
         cache_root = self.root / "cache"
@@ -657,6 +1052,7 @@ class AutoDesignVideoSkillTests(unittest.TestCase):
         with (
             mock.patch.object(setup, "KOKORO_MODEL_SHA256", model_hash),
             mock.patch.object(setup, "KOKORO_VOICES_SHA256", voices_hash),
+            mock.patch.object(setup, "_probe_hyperframes_browser", return_value={"passed": True}),
         ):
             ready = setup.doctor_video_runtime(cache_root=cache_root)
         self.assertEqual(ready["status"], "ready")
@@ -729,6 +1125,7 @@ class AutoDesignVideoSkillTests(unittest.TestCase):
         with (
             mock.patch.object(setup, "KOKORO_MODEL_SHA256", model_hash),
             mock.patch.object(setup, "KOKORO_VOICES_SHA256", voices_hash),
+            mock.patch.object(setup, "_probe_hyperframes_browser", return_value={"passed": True}),
         ):
             runtime = setup.require_video_runtime(cache_root=spec.cache_root)
         env = setup.runtime_environment(
@@ -767,18 +1164,28 @@ class AutoDesignVideoSkillTests(unittest.TestCase):
         harness = self._require(self.harness, HARNESS_PATH)
         core = harness.core
         source = self.root / "source.md"
-        source.write_text("# Grounded video\nThe paper reports a grounded method and evidence.\n", encoding="utf-8")
+        plan = _plan()
+        source.write_text(
+            "# Grounded video\n\n" + "\n\n".join(str(claim["text"]) for claim in _claims(plan)) + "\n",
+            encoding="utf-8",
+        )
         run = self.root / "run"
         core.initialize_run(run, SKILL_ROOT, release_version="0.1.0")
         core.prepare_source(run, source)
-        plan = _plan()
         core.save_plan(run, plan)
         attempt_id = core.begin_attempt(run)
         attempt = run / "attempts" / attempt_id
         project = _write_project(attempt / "artifact-root", plan)
-        report = harness.deliver_project(project, plan, _fake_runtime(self.root / "runtime"), smoke=True)
+        report = harness.deliver_project(
+            project,
+            plan,
+            _fake_runtime(self.root / "runtime"),
+            claims=_claims(plan),
+            canonical_plan_sha256=harness.sha256_file(run / "plan.json"),
+            smoke=True,
+        )
         self.assertTrue(report["passed"], report)
-        claims = [{"id": "claim-01", "text": "The paper reports a grounded method.", "source_ids": ["ev-001"]}]
+        claims = _claims(plan)
         runtime_marker = attempt / "qa" / "runtime-failure.json"
         core.atomic_write_json(
             runtime_marker,
@@ -790,9 +1197,31 @@ class AutoDesignVideoSkillTests(unittest.TestCase):
                 "error": "temporary runtime failure",
             },
         )
+        with self.assertRaisesRegex(harness.VideoContractError, "persisted delivery report"):
+            harness.record_attempt_delivery(
+                run,
+                attempt_id,
+                project,
+                {**report, "publish_allowlist": []},
+                claims=claims,
+            )
+        self.assertTrue(runtime_marker.exists())
         harness.record_attempt_delivery(run, attempt_id, project, report, claims=claims)
         self.assertFalse(runtime_marker.exists())
-        context = core.create_review_context(run, attempt_id, rubric=harness.REVIEW_RUBRIC)
+        context = harness.create_video_review_context(run, attempt_id)
+        materials = context["review_materials"]
+        self.assertEqual(
+            materials["evidence_jsonl"]["sha256"],
+            harness.sha256_file(Path(materials["evidence_jsonl"]["path"])),
+        )
+        self.assertEqual(
+            materials["source_text"]["sha256"],
+            harness.sha256_file(Path(materials["source_text"]["path"])),
+        )
+        self.assertEqual(
+            materials["source_map"]["sha256"],
+            context["source_map_sha256"],
+        )
         review = {
             "format_version": 1,
             "attempt_id": attempt_id,
