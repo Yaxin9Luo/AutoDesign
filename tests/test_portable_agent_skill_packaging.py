@@ -121,6 +121,7 @@ class PortableAgentSkillPackagingTests(unittest.TestCase):
             result = _build(release)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             archive = release / f"{APPROVED_SKILLS[0]}-{VERSION}.zip"
+            checksum = release / f"{archive.name}.sha256"
             destination = temp / "skills"
 
             first = subprocess.run(
@@ -130,6 +131,8 @@ class PortableAgentSkillPackagingTests(unittest.TestCase):
                     "install",
                     "--archive",
                     str(archive),
+                    "--checksum",
+                    str(checksum),
                     "--destination",
                     str(destination),
                 ],
@@ -150,6 +153,8 @@ class PortableAgentSkillPackagingTests(unittest.TestCase):
                     "install",
                     "--archive",
                     str(archive),
+                    "--checksum",
+                    str(checksum),
                     "--destination",
                     str(destination),
                 ],
@@ -181,6 +186,7 @@ class PortableAgentSkillPackagingTests(unittest.TestCase):
                     "install",
                     "--archive",
                     str(traversal),
+                    "--allow-unverified",
                     "--destination",
                     str(destination),
                 ],
@@ -207,6 +213,7 @@ class PortableAgentSkillPackagingTests(unittest.TestCase):
                     "install",
                     "--archive",
                     str(linked),
+                    "--allow-unverified",
                     "--destination",
                     str(destination),
                 ],
@@ -235,6 +242,7 @@ class PortableAgentSkillPackagingTests(unittest.TestCase):
                     "install",
                     "--archive",
                     str(archive),
+                    "--allow-unverified",
                     "--destination",
                     str(temp / "skills"),
                 ],
@@ -258,6 +266,79 @@ class PortableAgentSkillPackagingTests(unittest.TestCase):
             result = _build(temp / "release", source)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("symlink", result.stdout + result.stderr)
+
+    def test_install_fails_closed_without_release_checksum(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            temp = Path(temporary)
+            release = temp / "release"
+            result = _build(release)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            archive = release / f"{APPROVED_SKILLS[0]}-{VERSION}.zip"
+
+            install = subprocess.run(
+                [
+                    sys.executable,
+                    str(PACKAGER),
+                    "install",
+                    "--archive",
+                    str(archive),
+                    "--destination",
+                    str(temp / "skills"),
+                ],
+                cwd=REPO_ROOT,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(install.returncode, 0)
+            self.assertIn("checksum is required", install.stdout + install.stderr)
+            self.assertFalse((temp / "skills" / APPROVED_SKILLS[0]).exists())
+
+    def test_install_rejects_tampered_archive_against_stale_checksum(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            temp = Path(temporary)
+            release = temp / "release"
+            result = _build(release)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            archive = release / f"{APPROVED_SKILLS[0]}-{VERSION}.zip"
+            checksum = release / f"{archive.name}.sha256"
+
+            with zipfile.ZipFile(archive) as source:
+                entries = [(info, source.read(info)) for info in source.infolist()]
+            tampered = False
+            with zipfile.ZipFile(archive, "w") as target:
+                for info, content in entries:
+                    if info.filename.endswith("/SKILL.md"):
+                        updated = content.replace(
+                            b"Create a conference poster",
+                            b"Create a polished conference poster",
+                            1,
+                        )
+                        tampered = tampered or updated != content
+                        content = updated
+                    target.writestr(info, content)
+            self.assertTrue(tampered)
+
+            install = subprocess.run(
+                [
+                    sys.executable,
+                    str(PACKAGER),
+                    "install",
+                    "--archive",
+                    str(archive),
+                    "--checksum",
+                    str(checksum),
+                    "--destination",
+                    str(temp / "skills"),
+                ],
+                cwd=REPO_ROOT,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(install.returncode, 0)
+            self.assertIn("checksum mismatch", install.stdout + install.stderr)
+            self.assertFalse((temp / "skills" / APPROVED_SKILLS[0]).exists())
 
 
 if __name__ == "__main__":

@@ -37,7 +37,10 @@ deterministic `manifest.json`.
 ```bash
 python3 scripts/package_agent_skills.py install \
   --archive dist/agent-skills-v0.1.0/autodesign-poster-0.1.0.zip \
+  --checksum dist/agent-skills-v0.1.0/autodesign-poster-0.1.0.zip.sha256 \
   --destination "${CODEX_HOME:-$HOME/.codex}/skills"
 ```
 
-Installation is atomic and refuses to replace an existing Skill directory.
+Installation verifies the release checksum, is atomic, and refuses to replace
+an existing Skill directory. Installing a raw development archive requires the
+explicit `--allow-unverified` opt-in.

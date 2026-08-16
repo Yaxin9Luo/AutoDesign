@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -39,6 +40,25 @@ def _sha256(path: Path) -> str:
         for chunk in iter(lambda: source.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _verify_checksum(archive_path: Path, checksum_path: Path) -> None:
+    checksum_path = checksum_path.resolve()
+    if not checksum_path.is_file():
+        raise PackageError(f"checksum sidecar does not exist: {checksum_path}")
+    sidecar = checksum_path.read_text(encoding="utf-8").strip()
+    match = re.fullmatch(
+        r"(?P<digest>[0-9a-fA-F]{64})  (?P<filename>[^/\\\s]+)", sidecar
+    )
+    if match is None:
+        raise PackageError(f"invalid checksum sidecar: {checksum_path}")
+    if match.group("filename") != archive_path.name:
+        raise PackageError(
+            f"checksum sidecar names {match.group('filename')}, expected {archive_path.name}"
+        )
+    actual = _sha256(archive_path)
+    if not hmac.compare_digest(match.group("digest").lower(), actual):
+        raise PackageError(f"archive checksum mismatch: {archive_path}")
 
 
 def _package_files(package_root: Path) -> list[Path]:
@@ -184,10 +204,24 @@ def _validate_archive(archive: zipfile.ZipFile) -> tuple[str, list[zipfile.ZipIn
     return skill_name, infos
 
 
-def install_archive(archive_path: Path, destination: Path) -> Path:
+def install_archive(
+    archive_path: Path,
+    destination: Path,
+    *,
+    checksum_path: Path | None = None,
+    allow_unverified: bool = False,
+) -> Path:
     archive_path = archive_path.resolve()
     if not archive_path.is_file():
         raise PackageError(f"archive does not exist: {archive_path}")
+    if checksum_path is not None and allow_unverified:
+        raise PackageError("choose checksum verification or --allow-unverified, not both")
+    if not allow_unverified:
+        if checksum_path is None:
+            raise PackageError(
+                "release checksum is required; pass --checksum or explicitly use --allow-unverified"
+            )
+        _verify_checksum(archive_path, checksum_path)
     destination = destination.resolve()
     destination.mkdir(parents=True, exist_ok=True)
 
@@ -242,6 +276,13 @@ def _parser() -> argparse.ArgumentParser:
     install = subcommands.add_parser("install", help="safely install one Skill archive")
     install.add_argument("--archive", type=Path, required=True)
     install.add_argument("--destination", type=Path, required=True)
+    verification = install.add_mutually_exclusive_group()
+    verification.add_argument("--checksum", type=Path)
+    verification.add_argument(
+        "--allow-unverified",
+        action="store_true",
+        help="explicitly install a raw archive without release integrity verification",
+    )
     return parser
 
 
@@ -252,7 +293,12 @@ def main(argv: list[str] | None = None) -> int:
             output = build_release(args.source_root, args.output_dir, args.version)
             print(f"Built Agent Skill release: {output}")
         else:
-            output = install_archive(args.archive, args.destination)
+            output = install_archive(
+                args.archive,
+                args.destination,
+                checksum_path=args.checksum,
+                allow_unverified=args.allow_unverified,
+            )
             print(f"Installed Agent Skill: {output}")
     except (OSError, PackageError, zipfile.BadZipFile) as error:
         print(f"ERROR: {error}", file=sys.stderr)

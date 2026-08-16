@@ -167,6 +167,30 @@ class PortableAgentSkillPackageTests(unittest.TestCase):
             self.assertNotEqual(completed.returncode, 0)
             self.assertIn("symlink", completed.stdout + completed.stderr)
 
+    def test_validator_scans_secret_markers_in_binary_named_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "agent_skills"
+            shutil.copytree(SKILLS_ROOT, root)
+            target = root / APPROVED_SKILLS[0] / "deploy.key"
+            target.write_bytes(
+                b"opaque-prefix\x00-----BEGIN OPENSSH PRIVATE KEY-----\nnot-a-real-key\n"
+            )
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(REPO_ROOT / "scripts" / "validate_agent_skills.py"),
+                    "--root",
+                    str(root),
+                ],
+                cwd=REPO_ROOT,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("secret-like content", completed.stdout + completed.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

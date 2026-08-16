@@ -70,11 +70,16 @@ _FORBIDDEN_PRODUCT_REFERENCE = (
     "127.0.0.1:8000",
     "/api/health",
 )
-_SECRET_CONTENT = (
-    re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
-    re.compile(r"(?im)^\s*(?:OPENAI|ANTHROPIC|FRIDAY)_[A-Z0-9_]*(?:KEY|TOKEN)\s*=\s*\S+"),
-    re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b"),
+_SECRET_BYTES = (
+    re.compile(rb"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
+    re.compile(
+        rb"^\s*(?:OPENAI|ANTHROPIC|FRIDAY)_[A-Z0-9_]*(?:KEY|TOKEN)\s*=\s*\S+",
+        flags=re.IGNORECASE | re.MULTILINE,
+    ),
+    re.compile(rb"\bsk-[A-Za-z0-9_-]{20,}\b"),
 )
+_SECRET_SCAN_CHUNK_BYTES = 64 * 1024
+_SECRET_SCAN_OVERLAP_BYTES = 4096
 
 
 def _parse_frontmatter(path: Path) -> tuple[dict[str, str], list[str]]:
@@ -137,6 +142,17 @@ def _iter_entries_without_following_symlinks(root: Path):
             yield current_path / name
 
 
+def _contains_secret_bytes(path: Path) -> bool:
+    overlap = b""
+    with path.open("rb") as source:
+        while chunk := source.read(_SECRET_SCAN_CHUNK_BYTES):
+            window = overlap + chunk
+            if any(pattern.search(window) for pattern in _SECRET_BYTES):
+                return True
+            overlap = window[-_SECRET_SCAN_OVERLAP_BYTES:]
+    return False
+
+
 def validate_skill_package(skill_root: Path, skill_name: str) -> list[str]:
     errors: list[str] = []
     if skill_name not in APPROVED_SKILLS:
@@ -184,7 +200,11 @@ def validate_skill_package(skill_root: Path, skill_name: str) -> list[str]:
             part in _CACHE_OR_OUTPUT_PARTS for part in relative.parts
         ):
             errors.append(f"{relative}: cache or generated output is not allowed")
-        if not entry.is_file() or entry.suffix.lower() not in _TEXT_SUFFIXES:
+        if not entry.is_file():
+            continue
+        if _contains_secret_bytes(entry):
+            errors.append(f"{relative}: secret-like content is not allowed")
+        if entry.suffix.lower() not in _TEXT_SUFFIXES:
             continue
         text = entry.read_text(encoding="utf-8", errors="ignore")
         if _FORBIDDEN_IMPORT.search(text) or any(
@@ -193,8 +213,6 @@ def validate_skill_package(skill_root: Path, skill_name: str) -> list[str]:
             errors.append(f"{relative}: forbidden product dependency")
         if "../skills/" in text or "../autodesign/" in text or "../design_anything/" in text:
             errors.append(f"{relative}: forbidden package-external path")
-        if any(pattern.search(text) for pattern in _SECRET_CONTENT):
-            errors.append(f"{relative}: secret-like content is not allowed")
     return errors
 
 
