@@ -1964,6 +1964,9 @@ elif name == "pdfimages":
                 shared.mkdir(parents=True)
                 (shared / "portable_core.py").write_bytes(b"canonical-core")
                 (shared / "source-grounding.md").write_bytes(b"canonical-grounding")
+                (shared / "browser_worker.py").write_bytes(b"canonical-browser-worker")
+                (shared / "setup_browser.py").write_bytes(b"canonical-browser-setup")
+                (shared / "requirements-browser.lock").write_bytes(b"canonical-browser-lock")
                 outside = self.root / f"outside-{case}"
                 outside.mkdir()
                 (outside / "sentinel").write_bytes(b"unchanged")
