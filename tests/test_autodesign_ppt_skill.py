@@ -498,18 +498,21 @@ class AutoDesignPptSkillTests(unittest.TestCase):
         absent_evidence = {
             "ablation": (
                 "We do not conduct an ablation study.",
+                "Without an ablation study, component effects remain unknown.",
                 "Ablation studies are left to future work.",
                 "No component removal is performed; accuracy drops from 82% to 79%.",
                 "我们没有进行消融实验。",
             ),
             "robustness": (
                 "We do not evaluate robustness.",
+                "The paper lacks robustness evaluation.",
                 "Robustness evaluation is left for future work.",
                 "No shifted dataset is evaluated; accuracy is 78.5% versus 79.0%.",
                 "我们未评估鲁棒性。",
             ),
             "qualitative": (
                 "No qualitative analysis is provided.",
+                "Without qualitative analysis, no cases can be interpreted.",
                 "Qualitative evidence will be considered in future work.",
                 "No representative case is shown.",
                 "论文未提供定性分析。",
@@ -530,6 +533,65 @@ class AutoDesignPptSkillTests(unittest.TestCase):
                         "Do not treat stated absence as evidence",
                         [{"id": "ev-001", "text": text}],
                     )
+
+    def test_conditional_roles_accept_a_complete_positive_clause_beside_absence(self) -> None:
+        harness = self._require(self.harness, HARNESS_PATH)
+        mixed_evidence = {
+            "ablation": (
+                "The ablation study removes the router and accuracy drops by 2 points. "
+                "Additional ablations are left to future work."
+            ),
+            "robustness": (
+                "Under distribution shift, accuracy remains stable. "
+                "Additional robustness evaluation is left to future work."
+            ),
+            "qualitative": (
+                "A representative case study shows the failure behavior. "
+                "Additional qualitative analysis is future work."
+            ),
+        }
+        for role, text in mixed_evidence.items():
+            with self.subTest(role=role):
+                self.assertEqual(
+                    harness._semantic_evidence_ref(
+                        role,
+                        role.title(),
+                        "Use the independent positive clause",
+                        [{"id": "ev-001", "text": text}],
+                    ),
+                    "ev-001",
+                )
+
+    def test_conditional_roles_do_not_join_signals_across_clauses(self) -> None:
+        harness = self._require(self.harness, HARNESS_PATH)
+        split_evidence = {
+            "ablation": (
+                "We remove a routing module from preprocessing. "
+                "Accuracy improves for an unrelated full-model baseline."
+            ),
+            "robustness": (
+                "We evaluate a shifted dataset. "
+                "Accuracy remains stable on the original benchmark."
+            ),
+            "qualitative": (
+                "We include a representative case study. "
+                "The model shows improved quantitative accuracy."
+            ),
+        }
+        for role, text in split_evidence.items():
+            with (
+                self.subTest(role=role),
+                self.assertRaisesRegex(
+                    harness.PptHarnessError,
+                    f"role {role}; provide --story-plan",
+                ),
+            ):
+                harness._semantic_evidence_ref(
+                    role,
+                    role.title(),
+                    "Do not join evidence across clauses",
+                    [{"id": "ev-001", "text": text}],
+                )
 
     def test_conditional_roles_accept_numeric_observed_comparisons(self) -> None:
         harness = self._require(self.harness, HARNESS_PATH)
@@ -563,6 +625,33 @@ class AutoDesignPptSkillTests(unittest.TestCase):
         )
         evidence_texts["ev-013"] = (
             "W/o routing module: 79.4%; full model: 82.1%."
+        )
+        roles[11] = "robustness"
+        roles[12] = "ablation"
+        plan = harness.build_deck_plan(
+            "Create a conference deck.",
+            list(evidence_texts),
+            evidence_texts=evidence_texts,
+        )
+        self.assertEqual(
+            [str(slide["role"]) for slide in plan["slides"]],
+            roles,
+        )
+
+    def test_default_planner_uses_independent_positive_clauses(self) -> None:
+        harness = self._require(self.harness, HARNESS_PATH)
+        evidence_texts, roles, _role_refs = self._conditioned_story_fixture()
+        evidence_texts["ev-012"] = (
+            "Under distribution shift, accuracy remains stable. "
+            "Additional robustness evaluation is left to future work."
+        )
+        evidence_texts["ev-013"] = (
+            "The ablation study removes the router and accuracy drops by 2 points. "
+            "Additional ablations are left to future work."
+        )
+        evidence_texts["ev-014"] = (
+            "A representative case study shows the failure behavior. "
+            "Additional qualitative analysis is future work."
         )
         roles[11] = "robustness"
         roles[12] = "ablation"
@@ -663,9 +752,9 @@ class AutoDesignPptSkillTests(unittest.TestCase):
     def test_host_story_plan_rejects_negated_conditional_roles(self) -> None:
         harness = self._require(self.harness, HARNESS_PATH)
         cases = (
-            (11, "robustness", "We do not evaluate robustness."),
-            (12, "ablation", "We do not conduct an ablation study."),
-            (13, "qualitative", "No qualitative analysis is provided."),
+            (11, "robustness", "The paper lacks robustness evaluation."),
+            (12, "ablation", "Without an ablation study, effects remain unknown."),
+            (13, "qualitative", "Without qualitative analysis, cases are unavailable."),
         )
         for slot, role, text in cases:
             evidence_texts, roles, role_refs = self._conditioned_story_fixture()
@@ -732,6 +821,99 @@ class AutoDesignPptSkillTests(unittest.TestCase):
                 },
             )
             self.assertEqual(str(plan["slides"][slot]["role"]), role)
+
+    def test_host_story_plan_uses_independent_positive_clauses(self) -> None:
+        harness = self._require(self.harness, HARNESS_PATH)
+        cases = (
+            (
+                11,
+                "robustness",
+                "Under distribution shift, accuracy remains stable. "
+                "Additional robustness evaluation is left to future work.",
+            ),
+            (
+                12,
+                "ablation",
+                "The ablation study removes the router and accuracy drops by 2 points. "
+                "Additional ablations are left to future work.",
+            ),
+            (
+                13,
+                "qualitative",
+                "A representative case study shows the failure behavior. "
+                "Additional qualitative analysis is future work.",
+            ),
+        )
+        for slot, role, text in cases:
+            evidence_texts, roles, role_refs = self._conditioned_story_fixture()
+            evidence_texts["ev-019"] = text
+            roles[slot] = role
+            role_refs[role] = "ev-019"
+            plan = harness.build_deck_plan(
+                "Create a conference deck.",
+                list(evidence_texts),
+                evidence_texts=evidence_texts,
+                story_plan={
+                    "format_version": 1,
+                    "slides": [
+                        {
+                            "slide_id": f"slide-{index:02d}",
+                            "role": planned_role,
+                            "evidence_refs": [role_refs[planned_role]],
+                        }
+                        for index, planned_role in enumerate(roles, start=1)
+                    ],
+                },
+            )
+            self.assertEqual(str(plan["slides"][slot]["role"]), role)
+
+    def test_host_story_plan_does_not_join_signals_across_clauses(self) -> None:
+        harness = self._require(self.harness, HARNESS_PATH)
+        cases = (
+            (
+                11,
+                "robustness",
+                "We evaluate a shifted dataset. Accuracy remains stable on the original benchmark.",
+            ),
+            (
+                12,
+                "ablation",
+                "We remove a routing module. Accuracy improves for an unrelated baseline.",
+            ),
+            (
+                13,
+                "qualitative",
+                "We include a representative case study. Quantitative accuracy improves.",
+            ),
+        )
+        for slot, role, text in cases:
+            evidence_texts, roles, role_refs = self._conditioned_story_fixture()
+            evidence_texts["ev-019"] = text
+            roles[slot] = role
+            role_refs[role] = "ev-019"
+            with (
+                self.subTest(role=role),
+                self.assertRaisesRegex(
+                    harness.PptHarnessError,
+                    f"role {role}.*evidence|evidence.*role {role}",
+                ),
+            ):
+                harness.build_deck_plan(
+                    "Create a conference deck.",
+                    list(evidence_texts),
+                    evidence_texts=evidence_texts,
+                    story_plan={
+                        "format_version": 1,
+                        "slides": [
+                            {
+                                "slide_id": f"slide-{index:02d}",
+                                "role": planned_role,
+                                "evidence_refs": [role_refs[planned_role]],
+                            }
+                            for index, planned_role in enumerate(roles, start=1)
+                        ],
+                    },
+                )
 
     def test_host_story_plan_rejects_wrong_slot_and_duplicate_substitutions(self) -> None:
         harness = self._require(self.harness, HARNESS_PATH)

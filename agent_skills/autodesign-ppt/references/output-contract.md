@@ -67,7 +67,11 @@ A component operation or changed condition followed by a two-value comparison
 (`from`/`to`, `versus`, `vs.`, or `w/o`/`full`) is a measured result. Statements
 that negate an evaluation, say evidence was not provided, or defer it to future
 work are rejected before positive signal matching; declared absence cannot
-ground an experimental slide.
+ground an experimental slide. Evidence is evaluated clause by clause. One
+complete, non-negated positive clause may ground the role even when another
+clause describes additional future work. Signals from separate clauses are not
+joined; the sole exception is an adjacent, explicitly labeled `w/o`/`full`
+numeric pair.
 If no host story plan is passed, the deterministic fallback
 scores role-distinctive evidence concepts for each slide and applies the same
 conditional substitutions. A match must clear the minimum and beat the

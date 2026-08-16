@@ -701,7 +701,12 @@ def _conditional_role_declares_absence(role: str, normalized: str) -> bool:
         rf"\b(?:do|does|did|will|would|can|could|is|are|was|were|has|have|had)\s+"
         rf"(?:not|never)\b[^.!?]{{0,80}}{role_pattern}",
         rf"\bno\b[^.!?]{{0,50}}{role_pattern}",
+        rf"\bwithout\b[^.!?]{{0,50}}{role_pattern}",
+        rf"\b(?:lack|lacks|lacked|lacking)\b[^.!?]{{0,50}}{role_pattern}",
         rf"{role_pattern}[^.!?]{{0,80}}\b(?:not|never|absent|missing|omitted|unavailable)\b",
+        rf"{role_pattern}[^.!?]{{0,50}}\b(?:lack|lacks|lacked|lacking)\b",
+        rf"{role_pattern}[^.!?]{{0,30}}\b(?:is|are|was|were)\s+"
+        rf"(?:for\s+)?future work\b",
         rf"{role_pattern}[^.!?]{{0,70}}\b"
         rf"(?:left|deferred|reserved|postponed|planned|considered)\b"
         rf"[^.!?]{{0,40}}\b(?:future work|future studies?|future evaluation)\b",
@@ -740,6 +745,27 @@ def _has_numeric_observed_comparison(normalized: str) -> bool:
     )
 
 
+def _semantic_evidence_clauses(normalized: str) -> list[str]:
+    clauses = re.split(
+        r"[;；。！？]|(?<!\d)(?<!vs)[.!?](?!\d)",
+        normalized,
+    )
+    return [clause.strip() for clause in clauses if clause.strip()]
+
+
+def _labeled_numeric_comparison_pairs(clauses: Sequence[str]) -> list[str]:
+    pairs: list[str] = []
+    for first, second in zip(clauses, clauses[1:]):
+        joined = f"{first}; {second}"
+        has_labels = bool(
+            ("w/o" in first and re.search(r"\bfull\b", second))
+            or (re.search(r"\bfull\b", first) and "w/o" in second)
+        )
+        if has_labels and _has_numeric_observed_comparison(joined):
+            pairs.append(joined)
+    return pairs
+
+
 def _conditional_role_signal_supported(
     role: str,
     normalized: str,
@@ -774,17 +800,27 @@ def _role_evidence_score(role: str, text: str) -> int:
         unicodedata.normalize("NFKC", text).casefold().split()
     )
     rules = _CONDITIONAL_ROLE_SIGNAL_RULES.get(semantic_role)
-    if rules is not None and not _conditional_role_signal_supported(
-        semantic_role,
-        normalized,
-        rules,
-    ):
-        return 0
-    score = sum(
-        any(_semantic_term_present(normalized, term) for term in alternatives)
-        for alternatives in concepts
-    )
-    return max(score, 1) if rules is not None else score
+    if rules is None:
+        return sum(
+            any(_semantic_term_present(normalized, term) for term in alternatives)
+            for alternatives in concepts
+        )
+    clauses = _semantic_evidence_clauses(normalized)
+    fragments = [*clauses, *_labeled_numeric_comparison_pairs(clauses)]
+    scores = []
+    for fragment in fragments:
+        if not _conditional_role_signal_supported(
+            semantic_role,
+            fragment,
+            rules,
+        ):
+            continue
+        score = sum(
+            any(_semantic_term_present(fragment, term) for term in alternatives)
+            for alternatives in concepts
+        )
+        scores.append(max(score, 1))
+    return max(scores, default=0)
 
 
 def _semantic_evidence_candidate(
