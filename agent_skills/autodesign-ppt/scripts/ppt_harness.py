@@ -596,6 +596,9 @@ _STRUCTURAL_COUNT_TERMS = (
     "专家数",
     "分支数",
 )
+_STRUCTURAL_CARDINALITY_TERMS = frozenset(_STRUCTURAL_COUNT_TERMS) - {
+    "configuration",
+}
 _LOCAL_OUTCOME_BINDING_MAX_GAP = 48
 
 
@@ -864,17 +867,20 @@ def _numeric_value_spans(normalized_text: str) -> list[tuple[int, int]]:
 
 def _number_precedes_structure(gap: str) -> bool:
     return bool(
-        re.fullmatch(
-            r"\s*(?:[-\u2010-\u2015]\s*)?(?:[a-z]+\s+){0,2}",
-            gap,
-        )
+        re.fullmatch(r"\s*(?:[-\u2010-\u2015]\s*)?", gap)
         or re.fullmatch(r"\s*(?:个)?\s*", gap)
     )
 
 
-def _structure_precedes_number(gap: str) -> bool:
+def _structure_precedes_number(gap: str, *, cardinality_term: bool) -> bool:
+    if not cardinality_term:
+        return False
     return re.fullmatch(
-        r"\s*(?:(?:count|number|of)\s*)?(?:[:=：]\s*)?",
+        (
+            r"\s*(?:(?:count|number|of)\s*)?"
+            r"(?:(?:is|are|was|were|equals?|equal\s+to|has|had)\s*)?"
+            r"(?:[:=：]\s*)?"
+        ),
         gap,
     ) is not None
 
@@ -882,7 +888,7 @@ def _structure_precedes_number(gap: str) -> bool:
 def _structurally_bound_number_spans(normalized_text: str) -> set[tuple[int, int]]:
     numbers = _numeric_value_spans(normalized_text)
     structures = [
-        span
+        (span, term in _STRUCTURAL_CARDINALITY_TERMS)
         for term in _STRUCTURAL_COUNT_TERMS
         for span in _term_spans(
             normalized_text,
@@ -892,14 +898,15 @@ def _structurally_bound_number_spans(normalized_text: str) -> set[tuple[int, int
     ]
     bound: set[tuple[int, int]] = set()
     for number in numbers:
-        for structure in structures:
+        for structure, cardinality_term in structures:
             if number[1] <= structure[0] and _number_precedes_structure(
                 normalized_text[number[1] : structure[0]]
             ):
                 bound.add(number)
                 break
             if structure[1] <= number[0] and _structure_precedes_number(
-                normalized_text[structure[1] : number[0]]
+                normalized_text[structure[1] : number[0]],
+                cardinality_term=cardinality_term,
             ):
                 bound.add(number)
                 break

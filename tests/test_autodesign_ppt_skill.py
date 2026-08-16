@@ -609,6 +609,10 @@ class AutoDesignPptSkillTests(unittest.TestCase):
                     "W/o routing module accuracy for the 2-stage configuration is 79.4%; "
                     "full model accuracy for the 4-stage configuration is 82.1%."
                 ),
+                (
+                    "W/o routing module accuracy is 79.4% across two stages; "
+                    "full model accuracy is 82.1% across four stages."
+                ),
                 "无监督方法的消融结果显示，准确率从82.1%下降到79.4%。",
                 "缺乏路由模块时，准确率从82.1%下降到79.4%。",
             ),
@@ -659,6 +663,22 @@ class AutoDesignPptSkillTests(unittest.TestCase):
                 "W/o routing module has depth 2 and reports accuracy; "
                 "full model has depth 4 and reports accuracy."
             ),
+            (
+                "W/o routing module depth is 2 and reports accuracy; "
+                "full model depth is 4 and reports accuracy."
+            ),
+            (
+                "W/o routing module head count was 2 and reports accuracy; "
+                "full model head count was 4 and reports accuracy."
+            ),
+            (
+                "W/o routing module block count equals 2 and reports accuracy; "
+                "full model block count equals 4 and reports accuracy."
+            ),
+            (
+                "W/o routing module has 2 heads and reports accuracy; "
+                "full model has 4 heads and reports accuracy."
+            ),
         )
         for text in false_comparisons:
             with (
@@ -703,21 +723,30 @@ class AutoDesignPptSkillTests(unittest.TestCase):
         evidence_texts["ev-012"] = (
             "On the shifted dataset, accuracy is 78.5% versus 79.0% in-domain."
         )
-        evidence_texts["ev-013"] = (
-            "W/o routing module accuracy for the 2-stage configuration is 79.4%; "
-            "full model accuracy for the 4-stage configuration is 82.1%."
-        )
         roles[11] = "robustness"
         roles[12] = "ablation"
-        plan = harness.build_deck_plan(
-            "Create a conference deck.",
-            list(evidence_texts),
-            evidence_texts=evidence_texts,
+        comparisons = (
+            (
+                "W/o routing module accuracy for the 2-stage configuration is 79.4%; "
+                "full model accuracy for the 4-stage configuration is 82.1%."
+            ),
+            (
+                "W/o routing module accuracy is 79.4% across two stages; "
+                "full model accuracy is 82.1% across four stages."
+            ),
         )
-        self.assertEqual(
-            [str(slide["role"]) for slide in plan["slides"]],
-            roles,
-        )
+        for text in comparisons:
+            evidence_texts["ev-013"] = text
+            with self.subTest(text=text):
+                plan = harness.build_deck_plan(
+                    "Create a conference deck.",
+                    list(evidence_texts),
+                    evidence_texts=evidence_texts,
+                )
+                self.assertEqual(
+                    [str(slide["role"]) for slide in plan["slides"]],
+                    roles,
+                )
 
     def test_default_planner_rejects_structural_counts_as_ablation_outcomes(self) -> None:
         harness = self._require(self.harness, HARNESS_PATH)
@@ -741,6 +770,22 @@ class AutoDesignPptSkillTests(unittest.TestCase):
             (
                 "W/o routing module has depth 2 and reports accuracy; "
                 "full model has depth 4 and reports accuracy."
+            ),
+            (
+                "W/o routing module depth is 2 and reports accuracy; "
+                "full model depth is 4 and reports accuracy."
+            ),
+            (
+                "W/o routing module head count was 2 and reports accuracy; "
+                "full model head count was 4 and reports accuracy."
+            ),
+            (
+                "W/o routing module block count equals 2 and reports accuracy; "
+                "full model block count equals 4 and reports accuracy."
+            ),
+            (
+                "W/o routing module has 2 heads and reports accuracy; "
+                "full model has 4 heads and reports accuracy."
             ),
         )
         for text in false_comparisons:
@@ -943,6 +988,14 @@ class AutoDesignPptSkillTests(unittest.TestCase):
                     "full model accuracy for the 4-stage configuration is 82.1%."
                 ),
             ),
+            (
+                12,
+                "ablation",
+                (
+                    "W/o routing module accuracy is 79.4% across two stages; "
+                    "full model accuracy is 82.1% across four stages."
+                ),
+            ),
         )
         for slot, role, text in cases:
             evidence_texts, roles, role_refs = self._conditioned_story_fixture()
@@ -989,6 +1042,22 @@ class AutoDesignPptSkillTests(unittest.TestCase):
             (
                 "W/o routing module has depth 2 and reports accuracy; "
                 "full model has depth 4 and reports accuracy."
+            ),
+            (
+                "W/o routing module depth is 2 and reports accuracy; "
+                "full model depth is 4 and reports accuracy."
+            ),
+            (
+                "W/o routing module head count was 2 and reports accuracy; "
+                "full model head count was 4 and reports accuracy."
+            ),
+            (
+                "W/o routing module block count equals 2 and reports accuracy; "
+                "full model block count equals 4 and reports accuracy."
+            ),
+            (
+                "W/o routing module has 2 heads and reports accuracy; "
+                "full model has 4 heads and reports accuracy."
             ),
         )
         for text in false_comparisons:
