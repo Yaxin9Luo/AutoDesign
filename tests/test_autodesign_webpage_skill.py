@@ -192,12 +192,12 @@ def _valid_html(asset_path: str = "assets/vis-001.svg") -> str:
   <section id="abstract" data-section-role="abstract"><h2>Abstract</h2><p data-claim-id="claim-abstract">Atlas keeps scientific claims connected to stable evidence anchors.</p><p>{filler}</p></section>
   <section id="method" data-section-role="method"><h2>Method</h2><p data-claim-id="claim-method">The method plans the research story, composes source-bound sections, and validates the rendered page.</p>
     <button id="inspect-method-control" type="button" data-interaction-id="inspect-method" aria-controls="method-figure" aria-pressed="false">Inspect the source method figure</button>
-    <figure id="method-figure" data-claim-id="claim-method" data-source-id="vis-001"><img src="{asset_path}" data-source-id="vis-001" alt="Three-stage Atlas method pipeline"><figcaption>Source method overview linked to claim-method.</figcaption></figure>
+    <figure id="method-figure" data-source-id="vis-001"><img src="{asset_path}" data-source-id="vis-001" alt="Three-stage Atlas method pipeline"><figcaption>Source method overview linked to claim-method.</figcaption></figure>
     <p>{filler}</p></section>
-  <section id="evidence" data-section-role="evidence"><h2>Evidence map</h2><p data-claim-id="claim-method">Plan, compose, and validate keep the method inspectable.</p><p>{filler}</p></section>
+  <section id="evidence" data-section-role="evidence"><h2>Evidence map</h2><p data-claim-id="claim-method">The method plans the research story, composes source-bound sections, and validates the rendered page.</p><p>{filler}</p></section>
   <section id="results" data-section-role="results"><h2>Results</h2><p data-claim-id="claim-results">Atlas improved evidence coverage from 62% to 91% on the synthetic evaluation.</p><table><caption>Source-backed evidence coverage</caption><thead><tr><th>System</th><th>Coverage</th></tr></thead><tbody><tr><td>Baseline</td><td>62%</td></tr><tr><td>Atlas</td><td>91%</td></tr></tbody></table><p>{filler}</p></section>
   <section id="limitations" data-section-role="limitations"><h2>Limitations</h2><p data-claim-id="claim-limitations">The synthetic evaluation is small and browser coverage is limited to Chromium.</p><p>{filler}</p></section>
-  <section id="resources" data-section-role="resources"><h2>Resources</h2><div class="resource-list"><a data-resource-link="Paper" data-claim-id="claim-resource" href="https://example.org/atlas-paper" rel="noopener">Paper</a></div>
+  <section id="resources" data-section-role="resources"><h2>Resources</h2><p data-claim-id="claim-resource">The paper resource is https://example.org/atlas-paper.</p><div class="resource-list"><a data-resource-link="Paper" href="https://example.org/atlas-paper" rel="noopener">Paper</a></div>
     <p data-missing-metadata="code_url">Code URL was not provided in the source.</p><p data-missing-metadata="data_url">Dataset URL was not provided in the source.</p><p data-missing-metadata="license">License was not provided in the source.</p></section>
   <section id="citation" data-section-role="citation"><h2>Citation</h2><p data-missing-metadata="citation">Citation metadata was not provided in the source.</p><p data-missing-metadata="affiliations">Affiliations were not provided in the source.</p><p data-missing-metadata="venue">Venue was not provided in the source.</p><p data-missing-metadata="date">Publication date was not provided in the source.</p></section>
 </main>
@@ -386,6 +386,96 @@ class WebpageSkillTest(unittest.TestCase):
         self.assertEqual(report["metrics"]["required_section_count"], 8)
         self.assertEqual(report["metrics"]["source_grounded_interaction_count"], 1)
         self.assertEqual(report["metrics"]["missing_metadata_count"], 7)
+
+    def test_static_contract_rejects_visible_claim_text_drift_with_a_valid_id(self) -> None:
+        attempt_id = self._author_valid_attempt()
+        path = self.run / "attempts" / attempt_id / "artifact" / "index.html"
+        path.write_text(
+            path.read_text(encoding="utf-8").replace(
+                "Atlas improved evidence coverage from 62% to 91% on the synthetic evaluation.",
+                "Atlas achieved perfect evidence coverage on every benchmark.",
+                1,
+            ),
+            encoding="utf-8",
+        )
+
+        report = self.harness.validate_webpage_html(self.run, attempt_id)
+
+        self.assertIn(
+            "claim_text_mismatch",
+            {finding["code"] for finding in report["findings"]},
+        )
+
+    def test_static_contract_rejects_delayed_script_navigation_before_browser(self) -> None:
+        attempt_id = self._author_valid_attempt()
+        path = self.run / "attempts" / attempt_id / "artifact" / "index.html"
+        path.write_text(
+            path.read_text(encoding="utf-8").replace(
+                "</script>",
+                "setTimeout(() => { window.location.href = 'https://egress.example/late'; }, 2000);</script>",
+                1,
+            ),
+            encoding="utf-8",
+        )
+
+        report = self.harness.validate_webpage_html(self.run, attempt_id)
+
+        self.assertIn(
+            "dynamic_navigation_script",
+            {finding["code"] for finding in report["findings"]},
+        )
+
+    def test_static_contract_rejects_markup_navigation_egress(self) -> None:
+        attempt_id = self._author_valid_attempt()
+        path = self.run / "attempts" / attempt_id / "artifact" / "index.html"
+        html = path.read_text(encoding="utf-8").replace(
+            "</head>",
+            '<meta http-equiv="refresh" content="2;url=https://egress.example/late"></head>',
+            1,
+        ).replace(
+            "</footer>",
+            '<form action="https://egress.example/submit"><button>Send</button></form></footer>',
+            1,
+        )
+        path.write_text(html, encoding="utf-8")
+
+        report = self.harness.validate_webpage_html(self.run, attempt_id)
+
+        self.assertIn(
+            "dynamic_navigation_markup",
+            {finding["code"] for finding in report["findings"]},
+        )
+
+    def test_static_contract_forbids_additional_html_sidecars(self) -> None:
+        attempt_id = self._author_valid_attempt()
+        artifact = self.run / "attempts" / attempt_id / "artifact"
+        (artifact / "supplement.html").write_text(
+            '<!doctype html><script src="https://egress.example/payload.js"></script>',
+            encoding="utf-8",
+        )
+        index = artifact / "index.html"
+        index.write_text(
+            index.read_text(encoding="utf-8").replace(
+                "</footer>", '<a href="supplement.html">Supplement</a></footer>', 1
+            ),
+            encoding="utf-8",
+        )
+
+        report = self.harness.validate_webpage_html(self.run, attempt_id)
+
+        self.assertIn(
+            "html_sidecar_forbidden",
+            {finding["code"] for finding in report["findings"]},
+        )
+
+    def test_skill_commands_use_the_attempt_id_returned_by_begin(self) -> None:
+        instructions = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+
+        self.assertNotIn("--attempt 01", instructions)
+        self.assertNotIn("attempts/01", instructions)
+        self.assertIn('ATTEMPT_ID="$(python3 "$HARNESS" begin', instructions)
+        self.assertIn('--attempt "$ATTEMPT_ID"', instructions)
+        self.assertIn('["active_attempt"]', instructions)
 
     def test_static_contract_requires_the_planned_section_ids(self) -> None:
         attempt_id = self._author_valid_attempt()
@@ -741,6 +831,26 @@ class WebpageSkillRealBrowserTest(unittest.TestCase):
             raise unittest.SkipTest("AUTODESIGN_SKILL_BROWSER_CACHE must be explicit")
         return Path(cache)
 
+    @staticmethod
+    def _author_browser_attempt(root: Path, harness, transform) -> tuple[Path, str, Path]:
+        source = root / "paper.md"
+        source.write_text(_source_text(), encoding="utf-8")
+        visual = root / "pipeline.svg"
+        visual.write_text(_svg(), encoding="utf-8")
+        run = root / "run"
+        harness.initialize_webpage_run(
+            run, source, extra_assets=[visual], install_browser=False
+        )
+        harness.save_webpage_plan(run, _plan())
+        attempt = harness.begin_webpage_attempt(run)
+        staged = harness.stage_visual(run, attempt, "vis-001")
+        artifact = run / "attempts" / attempt / "artifact"
+        (artifact / "index.html").write_text(
+            transform(_valid_html(staged)), encoding="utf-8"
+        )
+        harness.write_webpage_source_map(run, attempt, _claims())
+        return run, attempt, artifact
+
     def test_real_browser_checks_desktop_mobile_keyboard_no_js_and_reduced_motion(self) -> None:
         cache = self._browser_cache()
         harness = _load_harness()
@@ -782,6 +892,318 @@ class WebpageSkillRealBrowserTest(unittest.TestCase):
             self.assertTrue(interaction["checks"]["no_javascript_core_visible"])
             self.assertTrue(interaction["checks"]["reduced_motion_effective"])
             self.assertTrue(interaction["checks"]["internal_links_resolve"])
+            self.assertTrue(interaction["checks"]["observable_interaction_effects"])
+            self.assertTrue(interaction["checks"]["mobile_interaction_available"])
+            self.assertTrue(interaction["checks"]["desktop_identity_thesis_above_fold"])
+            self.assertTrue(interaction["checks"]["focus_indicators_visible"])
+
+    def test_browser_rejects_aria_only_interaction_without_visible_target_change(self) -> None:
+        cache = self._browser_cache()
+        harness = _load_harness()
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            run, attempt, artifact = self._author_browser_attempt(
+                root,
+                harness,
+                lambda html: html.replace(
+                    "document.getElementById('method-figure').classList.toggle('is-inspected',!selected);",
+                    "document.getElementById('method-figure').setAttribute('aria-label','Inspected');",
+                ),
+            )
+
+            report = harness.validate_webpage_attempt(
+                run, attempt, browser_cache=cache, allow_browser_install=False
+            )
+
+            self.assertFalse(report["passed"])
+            audit = json.loads(
+                (artifact / "interaction-audit.json").read_text(encoding="utf-8")
+            )
+            self.assertFalse(audit["checks"]["observable_interaction_effects"])
+            self.assertFalse(audit["interactions"][0]["target_changed"])
+
+    def test_browser_does_not_count_focus_only_target_styling_as_activation(self) -> None:
+        cache = self._browser_cache()
+        harness = _load_harness()
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+
+            def focus_only_change(html: str) -> str:
+                return html.replace(
+                    "figure.is-inspected { border-color:var(--accent); }",
+                    "#inspect-method-control:focus + #method-figure { border-color:var(--accent); }",
+                    1,
+                ).replace(
+                    "document.getElementById('method-figure').classList.toggle('is-inspected',!selected);",
+                    "document.getElementById('method-figure').setAttribute('aria-label','Inspected');",
+                    1,
+                )
+
+            run, attempt, artifact = self._author_browser_attempt(
+                root, harness, focus_only_change
+            )
+
+            report = harness.validate_webpage_attempt(
+                run, attempt, browser_cache=cache, allow_browser_install=False
+            )
+
+            self.assertFalse(report["passed"])
+            audit = json.loads(
+                (artifact / "interaction-audit.json").read_text(encoding="utf-8")
+            )
+            self.assertFalse(audit["checks"]["observable_interaction_effects"])
+            self.assertFalse(audit["interactions"][0]["target_changed"])
+
+    def test_browser_requires_a_usable_mobile_interaction_control(self) -> None:
+        cache = self._browser_cache()
+        harness = _load_harness()
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            run, attempt, artifact = self._author_browser_attempt(
+                root,
+                harness,
+                lambda html: html.replace(
+                    "@media (max-width:720px) {",
+                    "@media (max-width:720px) { #inspect-method-control { display:none!important; }",
+                    1,
+                ),
+            )
+
+            report = harness.validate_webpage_attempt(
+                run, attempt, browser_cache=cache, allow_browser_install=False
+            )
+
+            self.assertFalse(report["passed"])
+            audit = json.loads(
+                (artifact / "interaction-audit.json").read_text(encoding="utf-8")
+            )
+            self.assertFalse(audit["checks"]["mobile_interaction_available"])
+
+    def test_browser_requires_the_mobile_interaction_to_work(self) -> None:
+        cache = self._browser_cache()
+        harness = _load_harness()
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            run, attempt, artifact = self._author_browser_attempt(
+                root,
+                harness,
+                lambda html: html.replace(
+                    "@media (max-width:720px) {",
+                    "@media (max-width:720px) { figure.is-inspected { border-color:transparent!important; }",
+                    1,
+                ),
+            )
+
+            report = harness.validate_webpage_attempt(
+                run, attempt, browser_cache=cache, allow_browser_install=False
+            )
+
+            self.assertFalse(report["passed"])
+            audit = json.loads(
+                (artifact / "interaction-audit.json").read_text(encoding="utf-8")
+            )
+            self.assertFalse(audit["checks"]["mobile_interaction_available"])
+
+    def test_browser_requires_identity_and_thesis_in_first_desktop_viewport(self) -> None:
+        cache = self._browser_cache()
+        harness = _load_harness()
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            run, attempt, artifact = self._author_browser_attempt(
+                root,
+                harness,
+                lambda html: html.replace(
+                    "header { min-height:70vh;",
+                    "header { margin-top:1200px; min-height:70vh;",
+                    1,
+                ),
+            )
+
+            report = harness.validate_webpage_attempt(
+                run, attempt, browser_cache=cache, allow_browser_install=False
+            )
+
+            self.assertFalse(report["passed"])
+            audit = json.loads(
+                (artifact / "interaction-audit.json").read_text(encoding="utf-8")
+            )
+            self.assertFalse(audit["checks"]["desktop_identity_thesis_above_fold"])
+
+    def test_browser_rejects_a_sliver_of_identity_at_the_viewport_edge(self) -> None:
+        cache = self._browser_cache()
+        harness = _load_harness()
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            run, attempt, artifact = self._author_browser_attempt(
+                root,
+                harness,
+                lambda html: html.replace(
+                    "h1 {",
+                    "h1, [data-thesis-claim-id] { position:fixed; top:990px; margin:0; } h1 {",
+                    1,
+                ),
+            )
+
+            report = harness.validate_webpage_attempt(
+                run, attempt, browser_cache=cache, allow_browser_install=False
+            )
+
+            self.assertFalse(report["passed"])
+            audit = json.loads(
+                (artifact / "interaction-audit.json").read_text(encoding="utf-8")
+            )
+            self.assertFalse(audit["checks"]["desktop_identity_thesis_above_fold"])
+
+    def test_browser_requires_a_visibly_distinct_keyboard_focus_indicator(self) -> None:
+        cache = self._browser_cache()
+        harness = _load_harness()
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            run, attempt, artifact = self._author_browser_attempt(
+                root,
+                harness,
+                lambda html: html.replace(
+                    "outline:3px solid var(--accent); outline-offset:4px;",
+                    "outline:none;",
+                    1,
+                ),
+            )
+
+            report = harness.validate_webpage_attempt(
+                run, attempt, browser_cache=cache, allow_browser_install=False
+            )
+
+            self.assertFalse(report["passed"])
+            audit = json.loads(
+                (artifact / "interaction-audit.json").read_text(encoding="utf-8")
+            )
+            self.assertFalse(audit["checks"]["focus_indicators_visible"])
+
+    def test_browser_observes_a_two_second_delayed_egress_attempt(self) -> None:
+        cache = self._browser_cache()
+        harness = _load_harness()
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            artifact = root / "artifact"
+            artifact.mkdir()
+            html_path = artifact / "index.html"
+            html_path.write_text(
+                """<!doctype html><html lang="en"><body>
+                <button id="control" aria-controls="target" aria-pressed="false">Inspect</button>
+                <p id="target">Evidence</p>
+                <script>
+                const c=document.getElementById('control');
+                c.addEventListener('click',()=>{c.setAttribute('aria-pressed','true');document.getElementById('target').style.border='3px solid red';});
+                setTimeout(()=>{window.location.href='https://egress.example/late';},2000);
+                </script></body></html>""",
+                encoding="utf-8",
+            )
+            runtime = harness.setup_browser.ensure_browser_runtime(
+                cache_root=cache, allow_install=False
+            )
+
+            report = harness._run_interaction_audit(
+                html_path=html_path,
+                workspace_root=artifact,
+                output_dir=root / "qa",
+                interactions=[
+                    {
+                        "id": "inspect",
+                        "control_id": "control",
+                        "target_id": "target",
+                        "state_attribute": "aria-pressed",
+                    }
+                ],
+                content_contract={
+                    "title_claim_id": "title",
+                    "thesis_claim_id": "thesis",
+                    "sections": [],
+                    "visual_allocations": [],
+                    "missing_metadata": [],
+                },
+                runtime=runtime,
+                browser_cache=cache,
+                allow_install=False,
+            )
+
+            self.assertFalse(report["passed"])
+            self.assertFalse(report["checks"]["no_network_attempts"])
+            self.assertGreaterEqual(report["blocked_request_count"], 1)
+
+    def test_no_javascript_claim_check_uses_canonical_unicode_text(self) -> None:
+        cache = self._browser_cache()
+        harness = _load_harness()
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            artifact = root / "artifact"
+            (artifact / "assets").mkdir(parents=True)
+            (artifact / "assets" / "vis-001.svg").write_text(
+                _svg(), encoding="utf-8"
+            )
+            html_path = artifact / "index.html"
+            html_path.write_text(
+                _valid_html().replace(
+                    '<h1 data-claim-id="claim-title">Atlas: Evidence-Aware Research Communication</h1>',
+                    '<h1 data-claim-id="claim-title">Cafe\u0301: Evidence-Aware Research Communication</h1>',
+                    1,
+                ),
+                encoding="utf-8",
+            )
+            contract = _plan()
+            source_claims = _claims()
+            source_claims[0] = {
+                **source_claims[0],
+                "text": "Caf\u00e9: Evidence-Aware Research Communication",
+            }
+            contract["source_claims"] = source_claims
+            runtime = harness.setup_browser.ensure_browser_runtime(
+                cache_root=cache, allow_install=False
+            )
+
+            report = harness._run_interaction_audit(
+                html_path=html_path,
+                workspace_root=artifact,
+                output_dir=root / "qa",
+                interactions=contract["interactions"],
+                content_contract=contract,
+                runtime=runtime,
+                browser_cache=cache,
+                allow_install=False,
+            )
+
+            self.assertTrue(report["passed"], report)
+            self.assertTrue(report["checks"]["no_javascript_core_visible"])
+
+    def test_no_javascript_gate_rejects_hidden_source_text_with_css_replacement(self) -> None:
+        cache = self._browser_cache()
+        harness = _load_harness()
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+
+            def hide_bound_text(html: str) -> str:
+                return html.replace(
+                    "section, header {",
+                    ".source-hidden { display:none; } .invented::before { content:'Invented result'; } section, header {",
+                    1,
+                ).replace(
+                    '<p data-claim-id="claim-results">Atlas improved evidence coverage from 62% to 91% on the synthetic evaluation.</p>',
+                    '<p class="invented" data-claim-id="claim-results"><span class="source-hidden">Atlas improved evidence coverage from 62% to 91% on the synthetic evaluation.</span></p>',
+                    1,
+                )
+
+            run, attempt, artifact = self._author_browser_attempt(
+                root, harness, hide_bound_text
+            )
+
+            report = harness.validate_webpage_attempt(
+                run, attempt, browser_cache=cache, allow_browser_install=False
+            )
+
+            self.assertFalse(report["passed"])
+            interaction = json.loads(
+                (artifact / "interaction-audit.json").read_text(encoding="utf-8")
+            )
+            self.assertFalse(interaction["checks"]["no_javascript_core_visible"])
 
     def test_no_javascript_gate_rejects_css_hidden_claim_evidence(self) -> None:
         cache = self._browser_cache()

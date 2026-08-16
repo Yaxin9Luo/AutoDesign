@@ -89,12 +89,16 @@ finite number from 0.8 through 1. An explicit attached asset is already eligible
 ## HTML and asset closure
 
 The canonical artifact is `attempts/<id>/artifact/index.html` plus local files
-under the same `artifact/` directory.
+under the same `artifact/` directory. `index.html` is the only allowed HTML
+document: do not ship linked or unlinked `.html`/`.htm` sidecars.
 
 - Use HTML5 doctype, `html[lang]`, viewport metadata, one `main`, one visible
   `h1`, a labeled `nav`, and a skip link to `#main`.
 - Mark the eight narrative containers with `data-section-role`. Bind the H1 and
-  thesis to the plan. Mark every visible source claim with `data-claim-id`.
+  thesis to the plan and keep at least half of each visible within the initial
+  1440 x 1000 desktop viewport. Mark every visible source claim with one `data-claim-id`; after
+  whitespace normalization its visible text must exactly equal that source-map
+  claim's text.
 - Write each unavailable field in visible native text and tag it with
   `data-missing-metadata`. The marker set must exactly equal the plan.
 - Mark a staged evidence image with `data-source-id` on the `img`, `source`, or
@@ -103,13 +107,22 @@ under the same `artifact/` directory.
 - Implement every interaction with a native `button` or `a`,
   `data-interaction-id`, `aria-controls`, an accessible name, and the planned
   observable state attribute. Its target must contain a bound claim or visual.
+  Activation must also visibly change the target's text, geometry, or computed
+  presentation; changing only ARIA/data attributes is a no-op and fails. At
+  least one planned control must remain visible, enabled, unclipped, and at
+  least 24 x 24 CSS pixels at 390 px width, and its activation must still
+  produce the planned visible target change there.
 - Keep core research content and evidence visible when JavaScript is disabled.
   JavaScript may annotate, compare, filter, or focus evidence; it may not fetch
   data, hide the only copy of evidence, or gate reading.
 - Use only local CSS, JS, fonts, images, media, and downloads. Remote assets,
-  data URLs, `@import`, iframes, objects, embeds, base tags, network APIs, broken
-  fragments, positive tabindex, and unlisted external links are forbidden.
-- Provide visible `:focus-visible`, a mobile breakpoint, and effective
+  data URLs, `@import`, iframes, objects, embeds, base tags, forms, meta refresh,
+  network APIs, broken fragments, positive tabindex, and unlisted external
+  links are forbidden.
+- JavaScript navigation (`location`, `window.open`) is forbidden. Browser QA
+  tracks timers for 2.5 seconds and fails closed if delayed work does not settle
+  or attempts a blocked request; do not use persistent or long-delay timers.
+- Provide a browser-measurable visible `:focus-visible` treatment, a mobile breakpoint, and effective
   `prefers-reduced-motion: reduce` overrides for every active motion mode.
 - Use 3-8 restrained functional inline SVG icons. Name interactive icons; hide
   decorative ones from accessibility APIs.
@@ -156,4 +169,5 @@ attempts/<id>/
 The final directory contains the exact reviewed artifact closure,
 `provenance/source-map.json`, and `delivery-manifest.json`. Screenshot hashes
 bind the semantic review but previews remain in attempt QA. Never manually copy
-an attempt into `final/`.
+an attempt into `final/`. Use the actual `attempt_id` returned by each `begin`
+command; repair attempts are not necessarily `01`.

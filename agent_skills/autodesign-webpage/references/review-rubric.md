@@ -22,6 +22,11 @@ Fail before scoring when any of these is visible or evidenced:
   excessive pills, arbitrary glow, stock SaaS composition, or other AI-slop;
 - a broken primary navigation/control, absent keyboard affordance, or an
   interaction whose initial state is the only way to access evidence;
+- an interaction that changes only ARIA/data state without a visible target
+  change, no usable interaction control at 390 px, an invisible keyboard focus
+  treatment, or a title/thesis pushed below the initial desktop viewport;
+- any additional HTML sidecar, delayed/persistent browser task, or scripted
+  navigation/egress path;
 - incomplete screenshot set or any context/hash mismatch.
 
 ## Dimensions
@@ -91,7 +96,7 @@ Copy the following binding fields exactly from `review-context.json`:
 ```json
 {
   "format_version": 1,
-  "attempt_id": "01",
+  "attempt_id": "<actual attempt_id from begin>",
   "review_context_sha256": "...",
   "artifact_hashes": {},
   "preview_hashes": {"desktop": "...", "mobile": "..."},

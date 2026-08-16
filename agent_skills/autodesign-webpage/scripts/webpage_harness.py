@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import unicodedata
 from collections import Counter
 from html.parser import HTMLParser
 from pathlib import Path
@@ -120,6 +121,14 @@ _MOTION = re.compile(
 _NETWORK_JS = re.compile(
     r"\b(?:fetch|XMLHttpRequest|WebSocket|EventSource|WebTransport|RTCPeerConnection)\b"
     r"|\bsendBeacon\s*\(",
+    re.IGNORECASE,
+)
+_DYNAMIC_NAVIGATION_JS = re.compile(
+    r"\b(?:(?:window|document|top|parent|self)\s*\.\s*)?location"
+    r"(?:\s*\.\s*href)?\s*="
+    r"|\b(?:(?:window|document|top|parent|self)\s*\.\s*)?location"
+    r"\s*\.\s*(?:assign|replace|reload)\s*\("
+    r"|\bwindow\s*\.\s*open\s*\(",
     re.IGNORECASE,
 )
 _REVEAL_JS = re.compile(
@@ -718,6 +727,10 @@ def _control_name(control: _Node) -> str:
     )
 
 
+def _normalized_claim_text(value: str) -> str:
+    return " ".join(unicodedata.normalize("NFC", value).split())
+
+
 def _finding(code: str, message: str, **details: Any) -> dict[str, Any]:
     return {"code": code, "message": message, **details}
 
@@ -746,6 +759,19 @@ def validate_webpage_html(run_dir: Path | str, attempt_id: str) -> dict[str, Any
     parser.close()
     nodes = parser.nodes()
     by_id, duplicate_ids = _find_by_id(nodes)
+    html_sidecars = sorted(
+        path.relative_to(artifact).as_posix()
+        for path in artifact.rglob("*")
+        if path != html_path and path.suffix.lower() in {".htm", ".html"}
+    )
+    if html_sidecars:
+        findings.append(
+            _finding(
+                "html_sidecar_forbidden",
+                "index.html must be the artifact's only HTML document",
+                paths=html_sidecars,
+            )
+        )
     if not parser.doctype:
         findings.append(_finding("missing_doctype", "use the HTML5 doctype"))
     if parser.parse_errors:
@@ -802,6 +828,37 @@ def validate_webpage_html(run_dir: Path | str, attempt_id: str) -> dict[str, Any
     unused_claims = sorted(set(source_claims) - html_claims)
     if unused_claims:
         findings.append(_finding("unrendered_source_claim", "every mapped claim must appear in native HTML", ids=unused_claims))
+    for node in nodes:
+        claim_ids = sorted(_attr_tokens(node, "data-claim-id"))
+        if not claim_ids:
+            continue
+        actual = _normalized_claim_text(
+            node.text(omit_tags={"script", "style", "template", "noscript"})
+        )
+        if len(claim_ids) != 1:
+            findings.append(
+                _finding(
+                    "claim_text_mismatch",
+                    "each visible claim node must bind exactly one source-map claim",
+                    ids=claim_ids,
+                    line=node.line,
+                )
+            )
+            continue
+        claim_id = claim_ids[0]
+        source_claim = source_claims.get(claim_id)
+        if source_claim is None:
+            continue
+        expected = _normalized_claim_text(str(source_claim.get("text") or ""))
+        if not actual or actual != expected:
+            findings.append(
+                _finding(
+                    "claim_text_mismatch",
+                    "visible claim text must exactly match its source-map claim",
+                    claim_id=claim_id,
+                    line=node.line,
+                )
+            )
 
     role_nodes: dict[str, list[_Node]] = {}
     for node in nodes:
@@ -930,6 +987,13 @@ def validate_webpage_html(run_dir: Path | str, attempt_id: str) -> dict[str, Any
     script = "\n".join(scripts)
     if _NETWORK_JS.search(script):
         findings.append(_finding("network_script", "artifact JavaScript must not use network APIs"))
+    if _DYNAMIC_NAVIGATION_JS.search(script):
+        findings.append(
+            _finding(
+                "dynamic_navigation_script",
+                "artifact JavaScript must not navigate or open browsing contexts",
+            )
+        )
     if _REVEAL_JS.search(script) and _HIDDEN_REVEAL_CSS.search(css):
         findings.append(_finding("javascript_reveal_dependency", "core content starts hidden and depends on JavaScript reveal"))
 
@@ -972,6 +1036,23 @@ def validate_webpage_html(run_dir: Path | str, attempt_id: str) -> dict[str, Any
             findings.append(_finding("image_missing_alt", "every image requires meaningful alt text", line=node.line))
     for node in [item for item in nodes if item.tag in {"iframe", "object", "embed", "base"}]:
         findings.append(_finding("unsafe_embed", f"{node.tag} is forbidden in a portable page"))
+    navigation_markup = [
+        node.tag
+        for node in nodes
+        if node.tag == "form"
+        or (
+            node.tag == "meta"
+            and node.attrs.get("http-equiv", "").strip().lower() == "refresh"
+        )
+    ]
+    if navigation_markup:
+        findings.append(
+            _finding(
+                "dynamic_navigation_markup",
+                "forms and meta refresh are forbidden in a portable page",
+                tags=sorted(set(navigation_markup)),
+            )
+        )
     for node in nodes:
         tabindex = node.attrs.get("tabindex", "").strip()
         if tabindex and re.fullmatch(r"[+]?[1-9][0-9]*", tabindex):
@@ -1154,7 +1235,7 @@ def validate_webpage_html(run_dir: Path | str, attempt_id: str) -> dict[str, Any
 
 
 _INTERACTION_PROBE = r'''#!/usr/bin/env python3
-import argparse, json, os, re
+import argparse, json, os
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 from urllib.request import url2pathname
@@ -1176,6 +1257,32 @@ BLOCK = r"""
     if (name in globalThis) globalThis[name] = class { constructor(){ throw new DOMException(name + ' disabled in local QA', 'SecurityError'); } };
   }
   if (navigator.sendBeacon) navigator.sendBeacon = deny('sendBeacon');
+  const pending = new Set();
+  const nativeSetTimeout = globalThis.setTimeout.bind(globalThis);
+  const nativeClearTimeout = globalThis.clearTimeout.bind(globalThis);
+  const nativeSetInterval = globalThis.setInterval.bind(globalThis);
+  const nativeClearInterval = globalThis.clearInterval.bind(globalThis);
+  globalThis.setTimeout = (callback, delay, ...args) => {
+    let identifier;
+    const wrapped = (...values) => {
+      pending.delete(identifier);
+      if (typeof callback === 'function') return callback(...values);
+      return globalThis.eval(String(callback));
+    };
+    identifier = nativeSetTimeout(wrapped, delay, ...args);
+    pending.add(identifier);
+    return identifier;
+  };
+  globalThis.clearTimeout = (identifier) => { pending.delete(identifier); return nativeClearTimeout(identifier); };
+  globalThis.setInterval = (callback, delay, ...args) => {
+    const identifier = nativeSetInterval(callback, delay, ...args);
+    pending.add(identifier);
+    return identifier;
+  };
+  globalThis.clearInterval = (identifier) => { pending.delete(identifier); return nativeClearInterval(identifier); };
+  Object.defineProperty(globalThis, '__autodesignPendingTimers', {
+    value: () => pending.size, configurable: false, writable: false
+  });
 })();
 """
 
@@ -1195,14 +1302,15 @@ def main():
     blocked.append(u.scheme or 'unknown'); route.abort('blockedbyclient')
   def websocket_handler(route):
     blocked.append('websocket'); route.close()
-  def context(browser, *, javascript=True, reduced=False):
-    c=browser.new_context(java_script_enabled=javascript, offline=True, reduced_motion='reduce' if reduced else 'no-preference', viewport={'width':1440,'height':1000})
+  def context(browser, *, javascript=True, reduced=False, width=1440, height=1000):
+    c=browser.new_context(java_script_enabled=javascript, offline=True, reduced_motion='reduce' if reduced else 'no-preference', viewport={'width':width,'height':height})
     c.route('**/*',route_handler)
     try: c.route_web_socket('**/*',websocket_handler)
     except AttributeError: pass
     c.add_init_script(BLOCK); c.on('weberror',lambda error: page_errors.append(type(error).__name__)); c.on('requestfailed',lambda request: request_errors.append(urlsplit(request.url).scheme or 'unknown'))
     return c
   result={'format_version':1,'passed':False,'checks':{},'interactions':[]}
+  nojs_ok=False; motion_ok=False; internal_ok=False; mobile_ok=False; identity_ok=False; timers_ok=False
   try:
     with sync_playwright() as pw:
       browser=pw.chromium.launch(headless=True,args=FLAGS)
@@ -1213,30 +1321,81 @@ def main():
           href=internal.nth(i).get_attribute('href') or ''
           internal_ok = internal_ok and len(href)>1 and page.locator('#'+href[1:]).count()==1
         motion_ok=page.evaluate("""() => [...document.querySelectorAll('*')].every(el => { const s=getComputedStyle(el); const times=v=>v.split(',').every(x=>{x=x.trim();return x.endsWith('ms')?parseFloat(x)===0:parseFloat(x||'0')===0}); return (s.animationName==='none'||times(s.animationDuration)) && times(s.transitionDuration) && s.scrollBehavior!=='smooth'; })""")
+        identity_ok=bool(page.evaluate("""contract => {
+          const visible = el => { if (!el) return false; for (let n=el;n;n=n.parentElement) { const s=getComputedStyle(n); if (s.display==='none'||s.visibility==='hidden'||Number(s.opacity)<=0) return false; } const r=el.getBoundingClientRect(); return r.width>0 && r.height>0; };
+          const aboveFold = el => { if (!visible(el)) return false; const r=el.getBoundingClientRect(); const w=Math.max(0,Math.min(r.right,innerWidth)-Math.max(r.left,0)); const h=Math.max(0,Math.min(r.bottom,innerHeight)-Math.max(r.top,0)); return w>=Math.min(r.width,innerWidth)*0.5 && h>=Math.min(r.height,innerHeight)*0.5; };
+          const h1=[...document.querySelectorAll('h1')].find(el => (el.getAttribute('data-claim-id')||'').split(/\s+/).includes(contract.title_claim_id));
+          const thesis=document.querySelector('[data-thesis-claim-id="'+CSS.escape(contract.thesis_claim_id)+'"]');
+          const identity=document.querySelector('[data-section-role="identity"]');
+          return aboveFold(identity) && aboveFold(h1) && aboveFold(thesis);
+        }""",plan))
         for item in plan['interactions']:
           control=page.locator('#'+item['control_id']); target=page.locator('#'+item['target_id']); state=item['state_attribute']
           ok=control.count()==1 and target.count()==1 and control.is_visible() and target.is_visible()
-          before=control.get_attribute(state) if ok else None
           if ok:
-            control.focus(); control.press('Enter'); page.wait_for_timeout(80)
+            ok=bool(control.evaluate("""el => { for(let n=el;n;n=n.parentElement){const s=getComputedStyle(n);if(s.display==='none'||s.visibility==='hidden'||Number(s.opacity)<=0)return false;}return true; }""") and target.evaluate("""el => { for(let n=el;n;n=n.parentElement){const s=getComputedStyle(n);if(s.display==='none'||s.visibility==='hidden'||Number(s.opacity)<=0)return false;}return true; }"""))
+          before=control.get_attribute(state) if ok else None; target_before=None; focus_visible=False; scroll_before=None
+          if ok:
+            page.evaluate("() => document.activeElement && document.activeElement.blur()")
+            baseline=control.evaluate("""el => { const s=getComputedStyle(el); return {color:s.color,background:s.backgroundColor,border:s.border,boxShadow:s.boxShadow,textDecoration:s.textDecorationLine}; }""")
+            page.keyboard.press('Tab'); control.focus()
+            focused=control.evaluate("""el => { const s=getComputedStyle(el); return {matches:el.matches(':focus-visible'),outlineStyle:s.outlineStyle,outlineWidth:s.outlineWidth,outlineColor:s.outlineColor,color:s.color,background:s.backgroundColor,border:s.border,boxShadow:s.boxShadow,textDecoration:s.textDecorationLine}; }""")
+            outline=focused['outlineStyle']!='none' and float((focused['outlineWidth'] or '0px').replace('px','') or 0)>0 and focused['outlineColor'] not in {'transparent','rgba(0, 0, 0, 0)'}
+            delta=any(baseline.get(key)!=focused.get(key) for key in ('color','background','border','boxShadow','textDecoration'))
+            focus_visible=bool(focused['matches'] and (outline or focused['boxShadow']!='none' or delta))
+            target_before=target.evaluate("""el => { const s=getComputedStyle(el), r=el.getBoundingClientRect(); return {text:el.innerText,display:s.display,visibility:s.visibility,opacity:s.opacity,color:s.color,background:s.backgroundColor,border:s.border,boxShadow:s.boxShadow,outline:s.outline,transform:s.transform,filter:s.filter,x:r.x+scrollX,y:r.y+scrollY,width:r.width,height:r.height}; }""")
+            scroll_before=page.evaluate('() => ({x:scrollX,y:scrollY})')
+            control.press('Enter'); page.wait_for_timeout(100)
           after=control.get_attribute(state) if ok else None
-          ok=bool(ok and target.is_visible() and before!=after and control.evaluate('(el)=>document.activeElement===el'))
-          interactions.append({'id':item['id'],'passed':ok,'state_changed':before!=after})
+          target_after=target.evaluate("""el => { const s=getComputedStyle(el), r=el.getBoundingClientRect(); return {text:el.innerText,display:s.display,visibility:s.visibility,opacity:s.opacity,color:s.color,background:s.backgroundColor,border:s.border,boxShadow:s.boxShadow,outline:s.outline,transform:s.transform,filter:s.filter,x:r.x+scrollX,y:r.y+scrollY,width:r.width,height:r.height}; }""") if ok else None
+          scrolled=bool(ok and item.get('kind')=='navigate' and scroll_before!=page.evaluate('() => ({x:scrollX,y:scrollY})'))
+          target_changed=bool(ok and (target_before!=target_after or scrolled))
+          ok=bool(ok and target.is_visible() and before!=after and target_changed and focus_visible and control.evaluate('(el)=>document.activeElement===el'))
+          interactions.append({'id':item['id'],'passed':ok,'state_changed':before!=after,'target_changed':target_changed,'focus_indicator_visible':focus_visible})
+        try:
+          page.wait_for_function("() => typeof globalThis.__autodesignPendingTimers==='function' && globalThis.__autodesignPendingTimers()===0",timeout=2500)
+          page.wait_for_timeout(100); timers_ok=True
+        except Exception:
+          timers_ok=False
+        c.close()
+        c=context(browser,reduced=True,width=390,height=844); mobile=c.new_page(); mobile.goto(html.as_uri(),wait_until='load',timeout=30000); mobile.wait_for_timeout(50)
+        usable=0
+        for item in plan['interactions']:
+          control=mobile.locator('#'+item['control_id']); target=mobile.locator('#'+item['target_id']); state=item['state_attribute']
+          if control.count()==1 and target.count()==1 and control.is_visible() and control.is_enabled() and target.is_visible():
+            control.scroll_into_view_if_needed(); box=control.bounding_box(); style=control.evaluate("""el => { let visible=true; for(let n=el;n;n=n.parentElement){const s=getComputedStyle(n);if(s.display==='none'||s.visibility==='hidden'||Number(s.opacity)<=0)visible=false;} return {visible,pointer:getComputedStyle(el).pointerEvents}; }""")
+            target_visible=target.evaluate("""el => { for(let n=el;n;n=n.parentElement){const s=getComputedStyle(n);if(s.display==='none'||s.visibility==='hidden'||Number(s.opacity)<=0)return false;}return true; }""")
+            if box and style['visible'] and target_visible and box['width']>=24 and box['height']>=24 and box['x']>=0 and box['x']+box['width']<=390 and style['pointer']!='none':
+              before=control.get_attribute(state); control.focus()
+              target_before=target.evaluate("""el => { const s=getComputedStyle(el), r=el.getBoundingClientRect(); return {text:el.innerText,display:s.display,visibility:s.visibility,opacity:s.opacity,color:s.color,background:s.backgroundColor,border:s.border,boxShadow:s.boxShadow,outline:s.outline,transform:s.transform,filter:s.filter,x:r.x+scrollX,y:r.y+scrollY,width:r.width,height:r.height}; }""")
+              scroll_before=mobile.evaluate('() => ({x:scrollX,y:scrollY})'); control.press('Enter'); mobile.wait_for_timeout(100)
+              target_after=target.evaluate("""el => { const s=getComputedStyle(el), r=el.getBoundingClientRect(); return {text:el.innerText,display:s.display,visibility:s.visibility,opacity:s.opacity,color:s.color,background:s.backgroundColor,border:s.border,boxShadow:s.boxShadow,outline:s.outline,transform:s.transform,filter:s.filter,x:r.x+scrollX,y:r.y+scrollY,width:r.width,height:r.height}; }""")
+              scrolled=item.get('kind')=='navigate' and scroll_before!=mobile.evaluate('() => ({x:scrollX,y:scrollY})')
+              if before!=control.get_attribute(state) and (target_before!=target_after or scrolled) and target.is_visible(): usable+=1
+        mobile_ok=usable>=1
+        try:
+          mobile.wait_for_function("() => typeof globalThis.__autodesignPendingTimers==='function' && globalThis.__autodesignPendingTimers()===0",timeout=2500)
+          mobile.wait_for_timeout(100)
+        except Exception:
+          timers_ok=False
         c.close()
         c=context(browser,javascript=False,reduced=True); nojs=c.new_page(); nojs.goto(html.as_uri(),wait_until='load',timeout=30000)
         roles=['identity','abstract','method','evidence','results','limitations','resources','citation']
         nojs_ok=all(nojs.locator('[data-section-role="'+role+'"]').count()==1 and nojs.locator('[data-section-role="'+role+'"]').is_visible() for role in roles)
         nojs_ok=nojs_ok and nojs.locator('h1').count()==1 and nojs.locator('h1').is_visible()
+        claims={item['id']:item['text'] for item in plan.get('source_claims',[])}
         claim_ids=sorted({plan['title_claim_id'],plan['thesis_claim_id'],*(claim for section in plan['sections'] for claim in section['claim_ids'])})
         visual_ids=sorted({item['visual_id'] for item in plan['visual_allocations']})
         nojs_ok=nojs_ok and bool(nojs.evaluate("""expected => {
-          const visible = el => { const s=getComputedStyle(el), r=el.getBoundingClientRect(); return s.display!=='none' && s.visibility!=='hidden' && Number(s.opacity)>0 && r.width>0 && r.height>0; };
-          const tokenVisible = (attribute,id) => [...document.querySelectorAll('['+attribute+']')].some(el => (el.getAttribute(attribute)||'').split(/\\s+/).includes(id) && visible(el));
-          return expected.claims.every(id => tokenVisible('data-claim-id',id)) && expected.visuals.every(id => tokenVisible('data-source-id',id)) && expected.missing.every(id => tokenVisible('data-missing-metadata',id));
-        }""",{'claims':claim_ids,'visuals':visual_ids,'missing':plan['missing_metadata']}))
+          const visible = el => { if (!el) return false; for (let n=el;n;n=n.parentElement) { const s=getComputedStyle(n); if (s.display==='none'||s.visibility==='hidden'||Number(s.opacity)<=0) return false; } const r=el.getBoundingClientRect(); return r.width>0 && r.height>0; };
+          const tokenVisible = (attribute,id) => [...document.querySelectorAll('['+attribute+']')].some(el => (el.getAttribute(attribute)||'').split(/\s+/).includes(id) && visible(el));
+          const normalized = value => String(value||'').normalize('NFC').replace(/\s+/g,' ').trim();
+          const claimVisible = id => [...document.querySelectorAll('[data-claim-id]')].some(el => (el.getAttribute('data-claim-id')||'').split(/\s+/).includes(id) && visible(el) && (!expected.text[id] || normalized(el.innerText)===normalized(expected.text[id])));
+          return expected.claims.every(claimVisible) && expected.visuals.every(id => tokenVisible('data-source-id',id)) && expected.missing.every(id => tokenVisible('data-missing-metadata',id));
+        }""",{'claims':claim_ids,'text':claims,'visuals':visual_ids,'missing':plan['missing_metadata']}))
         c.close()
       finally: browser.close()
-    checks={'no_javascript_core_visible':bool(nojs_ok),'keyboard_interactions':bool(interactions) and all(x['passed'] for x in interactions),'reduced_motion_effective':bool(motion_ok),'internal_links_resolve':bool(internal_ok),'no_network_attempts':not blocked and not request_errors,'no_page_errors':not page_errors}
+    checks={'no_javascript_core_visible':bool(nojs_ok),'keyboard_interactions':bool(interactions) and all(x['passed'] for x in interactions),'observable_interaction_effects':bool(interactions) and all(x['target_changed'] for x in interactions),'mobile_interaction_available':bool(mobile_ok),'desktop_identity_thesis_above_fold':bool(identity_ok),'focus_indicators_visible':bool(interactions) and all(x['focus_indicator_visible'] for x in interactions),'reduced_motion_effective':bool(motion_ok),'internal_links_resolve':bool(internal_ok),'delayed_tasks_quiescent':bool(timers_ok),'no_network_attempts':not blocked and not request_errors,'no_page_errors':not page_errors}
     result={'format_version':1,'passed':all(checks.values()),'checks':checks,'interactions':interactions,'blocked_request_count':len(blocked),'request_error_count':len(request_errors),'page_error_count':len(page_errors)}
   except Exception as error:
     result={'format_version':1,'passed':False,'checks':{},'interactions':interactions,'runtime_error':type(error).__name__}
@@ -1278,6 +1437,9 @@ def _run_interaction_audit(
                 dict(item) for item in content_contract["visual_allocations"]
             ],
             "missing_metadata": list(content_contract["missing_metadata"]),
+            "source_claims": [
+                dict(item) for item in content_contract.get("source_claims", [])
+            ],
         },
     )
     env = setup_browser.isolated_environment(
@@ -1377,12 +1539,18 @@ def validate_webpage_attempt(
                 allow_install=allow_browser_install,
             )
             interaction_function = interaction_audit or _run_interaction_audit
+            interaction_contract = {
+                **_plan_file(run),
+                "source_claims": _json_file(
+                    attempt / "provenance" / "source-map.json"
+                ).get("claims", []),
+            }
             interaction_report = interaction_function(
                 html_path=html_path,
                 workspace_root=artifact,
                 output_dir=attempt / "qa",
                 interactions=_plan_file(run)["interactions"],
-                content_contract=_plan_file(run),
+                content_contract=interaction_contract,
                 runtime=active,
                 browser_cache=browser_cache,
                 allow_install=allow_browser_install,
