@@ -89,8 +89,12 @@ content, reduced motion, internal links, local asset closure, source hashes, and
 responsive geometry. Controls must be reachable by sequential keyboard focus;
 at 390 px, an actual `inspect` or `compare` interaction must remain usable.
 Paint-transparent, clipped, masked, transformed-away, or collapsed evidence is
-not visible. Persistent timers, animation frames, and Web Animations fail the
-quiescence gate. Only `index.html`, files it reaches locally, and harness-written
+not visible in either the no-JS or JavaScript-enabled state. The live DOM must
+still exactly match the planned sections, claims, visuals, metadata, and
+interaction bindings after scripts settle. Keyboard behavior and pending work
+are audited separately with default motion and reduced motion. Persistent
+timers, animation frames, and Web Animations fail either quiescence gate. Only
+`index.html`, files it reaches locally, and harness-written
 audit reports may exist in `artifact/`; do not add scratch or hardlinked files.
 Do not waive a failing check. Begin the next attempt and
 repair only reported regions; preserve every prior attempt. Every repair must

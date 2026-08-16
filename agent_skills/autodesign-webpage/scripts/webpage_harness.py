@@ -1546,41 +1546,85 @@ BLOCK = r"""
 })();
 """
 
-GROUNDING = r"""contract => {
+DOM_AUDIT = r"""contract => {
   const normalized=value=>String(value||'').normalize('NFC').replace(/\s+/g,' ').trim();
   const tokens=(el,name)=>(el.getAttribute(name)||'').split(/\s+/).filter(Boolean);
+  const sameSet=(actual,expected)=>actual.size===expected.size&&[...actual].every(value=>expected.has(value));
+  const intersect=(a,b)=>({left:Math.max(a.left,b.left),top:Math.max(a.top,b.top),right:Math.min(a.right,b.right),bottom:Math.min(a.bottom,b.bottom)});
+  const area=rect=>Math.max(0,rect.right-rect.left)*Math.max(0,rect.bottom-rect.top);
+  const documentRect=rect=>({left:rect.left+scrollX,top:rect.top+scrollY,right:rect.right+scrollX,bottom:rect.bottom+scrollY});
+  const color=value=>{const match=String(value||'').match(/rgba?\(([^)]+)\)/i);if(!match)return null;const parts=match[1].split(/[\s,\/]+/).filter(Boolean).map(Number);return {r:parts[0],g:parts[1],b:parts[2],a:parts.length>3?parts[3]:1};};
+  const luminance=value=>{const channel=input=>{const normalizedValue=input/255;return normalizedValue<=.04045?normalizedValue/12.92:Math.pow((normalizedValue+.055)/1.055,2.4);};return .2126*channel(value.r)+.7152*channel(value.g)+.0722*channel(value.b);};
+  const contrast=(first,second)=>{const a=luminance(first),b=luminance(second);return (Math.max(a,b)+.05)/(Math.min(a,b)+.05);};
+  const blend=(foreground,backdrop)=>({r:foreground.r*foreground.a+backdrop.r*(1-foreground.a),g:foreground.g*foreground.a+backdrop.g*(1-foreground.a),b:foreground.b*foreground.a+backdrop.b*(1-foreground.a),a:1});
+  const background=el=>{for(let node=el;node;node=node.parentElement){const value=color(getComputedStyle(node).backgroundColor);if(value&&value.a>=.99)return value;}return {r:255,g:255,b:255,a:1};};
+  const filteredOut=value=>[...String(value||'').matchAll(/opacity\(\s*([+-]?(?:\d*\.?\d+)(?:e[-+]?\d+)?)\s*(%)?\s*\)/gi)].some(match=>(Number(match[1])/(match[2]?100:1))<=.01);
+  const transformedOut=value=>{if(!value||value==='none')return false;let matrix;try{matrix=new DOMMatrixReadOnly(value);}catch{return true;}const limit=Math.max(innerWidth,innerHeight)*4,scaleX=Math.hypot(matrix.m11,matrix.m12,matrix.m13),scaleY=Math.hypot(matrix.m21,matrix.m22,matrix.m23);return scaleX<=.01||scaleY<=.01||Math.abs(matrix.m41)>limit||Math.abs(matrix.m42)>limit;};
+  const visibleRect=el=>{
+    if(!el)return null;let result=documentRect(el.getBoundingClientRect());if(area(result)<=.5)return null;
+    result=intersect(result,{left:0,top:0,right:document.documentElement.scrollWidth,bottom:document.documentElement.scrollHeight});if(area(result)<=.5)return null;
+    for(let node=el;node;node=node.parentElement){
+      const style=getComputedStyle(node),rect=documentRect(node.getBoundingClientRect());
+      if(style.display==='none'||['hidden','collapse'].includes(style.visibility)||Number(style.opacity)<=.01||style.contentVisibility==='hidden'||filteredOut(style.filter)||transformedOut(style.transform))return null;
+      const clip=String(style.clip||'auto').replace(/\s+/g,'').toLowerCase();
+      if(style.clipPath!=='none'||(clip!=='auto'&&clip!=='rect(auto,auto,auto,auto)')||(style.maskImage&&style.maskImage!=='none')||(style.webkitMaskImage&&style.webkitMaskImage!=='none'))return null;
+      if(node===el||['hidden','clip','scroll','auto'].includes(style.overflowX)||['hidden','clip','scroll','auto'].includes(style.overflowY))result=intersect(result,rect);
+      if(area(result)<=.5)return null;
+    }
+    return result;
+  };
+  const textNodePainted=node=>{
+    const parent=node.parentElement,box=visibleRect(parent);if(!box)return false;
+    const style=getComputedStyle(parent),fill=color(style.webkitTextFillColor),ink=fill||color(style.color),backdrop=background(parent);
+    if(!ink||ink.a<=.01||contrast(blend(ink,backdrop),backdrop)<1.2)return false;
+    const range=document.createRange();range.selectNodeContents(node);const painted=[...range.getClientRects()].some(rect=>area(intersect(documentRect(rect),box))>.5);range.detach();return painted;
+  };
+  const textPainted=el=>{const walker=document.createTreeWalker(el,NodeFilter.SHOW_TEXT);let node,seen=false;while((node=walker.nextNode())){if(!String(node.data||'').trim())continue;seen=true;if(!textNodePainted(node))return false;}return seen;};
+  const visible=(el,text=false)=>Boolean(visibleRect(el))&&(!text||textPainted(el));
   const expected=new Map((contract.source_claims||[]).map(item=>[String(item.id),normalized(item.text)]));
-  const visible=el=>{ if(!el)return false; for(let n=el;n;n=n.parentElement){const s=getComputedStyle(n);if(s.display==='none'||['hidden','collapse'].includes(s.visibility)||Number(s.opacity)<=.01)return false;}const r=el.getBoundingClientRect();return r.width>.5&&r.height>.5; };
+  const claimNodes=[...document.querySelectorAll('[data-claim-id]')];
+  const claimsExact=claimNodes.every(el=>{const ids=tokens(el,'data-claim-id');return visible(el,true)&&ids.length===1&&expected.has(ids[0])&&normalized(el.innerText)===expected.get(ids[0]);})&&[...expected].every(([id])=>claimNodes.some(el=>tokens(el,'data-claim-id').includes(id)));
+  const sections=contract.sections||[],roots=[...document.querySelectorAll('[data-section-role]')];
+  const sectionsExact=roots.length===sections.length&&sections.every((section,index)=>{
+    const root=roots[index];if(root.id!==section.id||root.getAttribute('data-section-role')!==section.role||!visible(root))return false;
+    const actual=new Set([root,...root.querySelectorAll('[data-claim-id]')].flatMap(el=>tokens(el,'data-claim-id')));
+    return sameSet(actual,new Set(section.claim_ids||[]));
+  });
+  const h1=[...document.querySelectorAll('h1')];
+  const titleExact=h1.length===1&&tokens(h1[0],'data-claim-id').length===1&&tokens(h1[0],'data-claim-id')[0]===contract.title_claim_id&&expected.has(contract.title_claim_id)&&visible(h1[0],true);
+  const thesis=[...document.querySelectorAll('[data-thesis-claim-id]')].filter(el=>el.getAttribute('data-thesis-claim-id')===contract.thesis_claim_id);
+  const thesisExact=thesis.length===1&&tokens(thesis[0],'data-claim-id').length===1&&tokens(thesis[0],'data-claim-id')[0]===contract.thesis_claim_id&&expected.has(contract.thesis_claim_id)&&visible(thesis[0],true);
+  const bodyNodes=[document.body,...document.body.querySelectorAll('*')];
+  const inlineHandlersSafe=bodyNodes.every(el=>[...el.attributes].every(attribute=>!/^on/i.test(attribute.name)));
+  const pseudoSafe=bodyNodes.every(el=>['::before','::after'].every(pseudo=>{const content=getComputedStyle(el,pseudo).content;return !content||['none','normal','\"\"',"''"].includes(content);}));
   const formula=/(?:\\\(|\\\[|\$[^$\n]+\$|\\(?:frac|sum|prod|sqrt|int)\b|[∑∏√∫≈≠≤≥±]|\b[A-Za-z][A-Za-z0-9_]*\s*(?:=|<=|>=|<|>)\s*[^,.;:]+|\^[{]?[-+]?\d)/i;
   const assertion=/(?:https?:\/\/[^\s<>\"']+|(?<![\w])[-+]?\d[\d,]*(?:\.\d+)?(?:\s*[%‰])?)/i;
-  const claimNodes=[...document.querySelectorAll('[data-claim-id]')];
-  if(!claimNodes.every(el=>{const ids=tokens(el,'data-claim-id');return visible(el)&&ids.length===1&&expected.has(ids[0])&&normalized(el.innerText)===expected.get(ids[0]);}))return false;
-  if(![...expected].every(([id])=>claimNodes.some(el=>tokens(el,'data-claim-id').includes(id))))return false;
-  if(!(contract.sections||[]).every(section=>{
-    const roots=[...document.querySelectorAll('[data-section-role]')].filter(el=>el.getAttribute('data-section-role')===section.role);
-    if(roots.length!==1||roots[0].id!==section.id)return false;
-    const actual=[roots[0],...roots[0].querySelectorAll('[data-claim-id]')].flatMap(el=>tokens(el,'data-claim-id')).sort();
-    return JSON.stringify(actual)===JSON.stringify([...section.claim_ids].sort());
-  }))return false;
-  const h1=[...document.querySelectorAll('h1')];
-  if(h1.length!==1||JSON.stringify(tokens(h1[0],'data-claim-id'))!==JSON.stringify([contract.title_claim_id]))return false;
-  const thesis=[...document.querySelectorAll('[data-thesis-claim-id]')].filter(el=>el.getAttribute('data-thesis-claim-id')===contract.thesis_claim_id);
-  if(thesis.length!==1||JSON.stringify(tokens(thesis[0],'data-claim-id'))!==JSON.stringify([contract.thesis_claim_id]))return false;
-  const unboundText=el=>{
-    const walker=document.createTreeWalker(el,NodeFilter.SHOW_TEXT); let node, text='';
-    while((node=walker.nextNode())){
-      if(visible(node.parentElement)&&!node.parentElement.closest('[data-claim-id]'))text+=node.data;
-    }
-    return normalized(text);
-  };
-  if([...document.body.querySelectorAll('*')].some(el=>{
-    if(!visible(el)||el.closest('[data-claim-id]'))return false;
-    const text=unboundText(el); return Boolean(text&&(assertion.test(text)||formula.test(text)));
-  }))return false;
-  return [...document.body.querySelectorAll('*')].every(el=>['::before','::after'].every(pseudo=>{
-    const content=getComputedStyle(el,pseudo).content;
-    return !content||['none','normal','\"\"',"''"].includes(content);
-  }));
+  const unboundWalker=document.createTreeWalker(document.body,NodeFilter.SHOW_TEXT);let unboundNode,unboundText='';
+  while((unboundNode=unboundWalker.nextNode())){const parent=unboundNode.parentElement;if(!String(unboundNode.data||'').trim()||parent.closest('[data-claim-id],script,style,template,noscript')||!textNodePainted(unboundNode))continue;unboundText+=' '+unboundNode.data;}
+  const unboundValue=normalized(unboundText),unboundAssertionsSafe=!(unboundValue&&(assertion.test(unboundValue)||formula.test(unboundValue)));
+  const plannedVisualCounts=new Map();
+  for(const allocation of contract.visual_allocations||[]){const id=String(allocation.visual_id);plannedVisualCounts.set(id,(plannedVisualCounts.get(id)||0)+1);}
+  const actualVisualCounts=new Map(),knownVisuals=new Set(plannedVisualCounts.keys()),countedDisplays=new Set();
+  for(const media of document.querySelectorAll('img,source')){
+    const owner=media.closest('[data-source-id]');if(!owner){actualVisualCounts.set('__invalid__',(actualVisualCounts.get('__invalid__')||0)+1);continue;}const id=owner.getAttribute('data-source-id'),picture=media.closest('picture'),display=picture?(picture.querySelector('img')||picture):media;
+    if(!knownVisuals.has(id)||!visible(display))actualVisualCounts.set('__invalid__',(actualVisualCounts.get('__invalid__')||0)+1);
+    else if(!countedDisplays.has(display)){countedDisplays.add(display);actualVisualCounts.set(id,(actualVisualCounts.get(id)||0)+1);}
+  }
+  const visualsExact=actualVisualCounts.size===plannedVisualCounts.size&&[...plannedVisualCounts].every(([id,count])=>actualVisualCounts.get(id)===count);
+  const missingActual=new Set(bodyNodes.flatMap(el=>tokens(el,'data-missing-metadata'))),missingExpected=new Set(contract.missing_metadata||[]);
+  const missingExact=sameSet(missingActual,missingExpected)&&[...missingExpected].every(id=>bodyNodes.some(el=>tokens(el,'data-missing-metadata').includes(id)&&visible(el,true)));
+  const controls=[...document.querySelectorAll('[data-interaction-id]')],plannedInteractions=contract.interactions||[];
+  const interactionsExact=controls.length===plannedInteractions.length&&plannedInteractions.every(interaction=>{
+    const control=document.getElementById(interaction.control_id),target=document.getElementById(interaction.target_id);if(!control||!target||!['BUTTON','A'].includes(control.tagName)||control.getAttribute('data-interaction-id')!==interaction.id||!tokens(control,'aria-controls').includes(interaction.target_id)||!control.hasAttribute(interaction.state_attribute))return false;
+    const targetNodes=[target,...target.querySelectorAll('*')],targetClaims=new Set(targetNodes.flatMap(el=>tokens(el,'data-claim-id'))),targetVisuals=new Set(targetNodes.flatMap(el=>tokens(el,'data-source-id')));
+    return (interaction.claim_ids||[]).some(id=>expected.has(id)&&targetClaims.has(id))||(interaction.visual_ids||[]).some(id=>knownVisuals.has(id)&&targetVisuals.has(id));
+  });
+  const identity=document.querySelector('[data-section-role="identity"]');
+  const aboveFold=el=>{if(!visible(el))return false;const rect=el.getBoundingClientRect(),width=Math.max(0,Math.min(rect.right,innerWidth)-Math.max(rect.left,0)),height=Math.max(0,Math.min(rect.bottom,innerHeight)-Math.max(rect.top,0));return width>=Math.min(rect.width,innerWidth)*.5&&height>=Math.min(rect.height,innerHeight)*.5;};
+  const identityAboveFold=aboveFold(identity)&&aboveFold(h1[0])&&aboveFold(thesis[0]);
+  const sourceGrounding=claimsExact&&unboundAssertionsSafe&&pseudoSafe;
+  const contractIntact=sectionsExact&&titleExact&&thesisExact&&inlineHandlersSafe&&visualsExact&&missingExact&&interactionsExact;
+  return {passed:sourceGrounding&&contractIntact,sourceGrounding,contractIntact,identityAboveFold,checks:{claimsExact,sectionsExact,titleExact,thesisExact,inlineHandlersSafe,pseudoSafe,unboundAssertionsSafe,visualsExact,missingExact,interactionsExact}};
 }"""
 
 def inside(path, root):
@@ -1607,61 +1651,69 @@ def main():
     c.add_init_script(BLOCK); c.on('weberror',lambda error: page_errors.append(type(error).__name__)); c.on('requestfailed',lambda request: request_errors.append(urlsplit(request.url).scheme or 'unknown'))
     return c
   result={'format_version':1,'passed':False,'checks':{},'interactions':[]}
-  nojs_ok=False; motion_ok=False; internal_ok=False; mobile_ok=False; identity_ok=False; timers_ok=False; runtime_grounding_ok=False
+  mode_reports={}
+  nojs_ok=False; motion_ok=False; internal_ok=False; mobile_ok=False; identity_ok=False; timers_ok=False; runtime_grounding_ok=False; runtime_contract_ok=False
+  def audit_desktop(browser, *, reduced):
+    c=context(browser,reduced=reduced); page=c.new_page()
+    try:
+      page.goto(html.as_uri(),wait_until='load',timeout=30000); page.wait_for_timeout(100)
+      initial_dom=page.evaluate(DOM_AUDIT,plan)
+      internal=page.locator('a[href^="#"]'); links_ok=True
+      for i in range(internal.count()):
+        href=internal.nth(i).get_attribute('href') or ''
+        links_ok = links_ok and len(href)>1 and page.locator('#'+href[1:]).count()==1
+      reduced_ok=True
+      if reduced:
+        reduced_ok=page.evaluate("""() => [...document.querySelectorAll('*')].every(el => { const s=getComputedStyle(el); const times=v=>v.split(',').every(x=>{x=x.trim();return x.endsWith('ms')?parseFloat(x)===0:parseFloat(x||'0')===0}); return (s.animationName==='none'||times(s.animationDuration)) && times(s.transitionDuration) && s.scrollBehavior!=='smooth'; })""")
+      page.evaluate("() => document.activeElement && document.activeElement.blur()")
+      tab_limit=max(8,page.locator('a[href],button:not([disabled]),input:not([disabled]),select:not([disabled]),textarea:not([disabled]),[tabindex]').count()+3)
+      mode_interactions=[]
+      for item in plan['interactions']:
+        control=page.locator('#'+item['control_id']); target=page.locator('#'+item['target_id']); state=item['state_attribute']
+        ok=control.count()==1 and target.count()==1 and control.is_visible() and target.is_visible()
+        before=control.get_attribute(state) if ok else None; target_before=None; focus_visible=False; scroll_before=None
+        if ok:
+          baseline=control.evaluate("""el => { const s=getComputedStyle(el); return {color:s.color,background:s.backgroundColor,border:s.border,boxShadow:s.boxShadow,textDecoration:s.textDecorationLine}; }""")
+          reachable=False
+          for _ in range(tab_limit):
+            page.keyboard.press('Tab')
+            if control.evaluate('(el)=>document.activeElement===el'):
+              reachable=True; break
+          focused=control.evaluate("""el => { const s=getComputedStyle(el); return {matches:el.matches(':focus-visible'),outlineStyle:s.outlineStyle,outlineWidth:s.outlineWidth,outlineColor:s.outlineColor,color:s.color,background:s.backgroundColor,border:s.border,boxShadow:s.boxShadow,textDecoration:s.textDecorationLine}; }""")
+          outline=focused['outlineStyle']!='none' and float((focused['outlineWidth'] or '0px').replace('px','') or 0)>0 and focused['outlineColor'] not in {'transparent','rgba(0, 0, 0, 0)'}
+          delta=any(baseline.get(key)!=focused.get(key) for key in ('color','background','border','boxShadow','textDecoration'))
+          focus_visible=bool(reachable and focused['matches'] and (outline or focused['boxShadow']!='none' or delta))
+          target_before=target.evaluate("""el => { const s=getComputedStyle(el), r=el.getBoundingClientRect(); return {text:el.innerText,display:s.display,visibility:s.visibility,opacity:s.opacity,color:s.color,background:s.backgroundColor,border:s.border,boxShadow:s.boxShadow,outline:s.outline,transform:s.transform,filter:s.filter,x:r.x+scrollX,y:r.y+scrollY,width:r.width,height:r.height}; }""")
+          scroll_before=page.evaluate('() => ({x:scrollX,y:scrollY})')
+          if reachable: control.press('Enter'); page.wait_for_timeout(100)
+          else: ok=False
+        after=control.get_attribute(state) if ok else None
+        target_after=target.evaluate("""el => { const s=getComputedStyle(el), r=el.getBoundingClientRect(); return {text:el.innerText,display:s.display,visibility:s.visibility,opacity:s.opacity,color:s.color,background:s.backgroundColor,border:s.border,boxShadow:s.boxShadow,outline:s.outline,transform:s.transform,filter:s.filter,x:r.x+scrollX,y:r.y+scrollY,width:r.width,height:r.height}; }""") if ok else None
+        scrolled=bool(ok and item.get('kind')=='navigate' and scroll_before!=page.evaluate('() => ({x:scrollX,y:scrollY})'))
+        target_changed=bool(ok and (target_before!=target_after or scrolled))
+        ok=bool(ok and target.is_visible() and before!=after and target_changed and focus_visible and control.evaluate('(el)=>document.activeElement===el'))
+        mode_interactions.append({'id':item['id'],'passed':ok,'state_changed':before!=after,'target_changed':target_changed,'focus_indicator_visible':focus_visible})
+      try:
+        page.wait_for_function("() => typeof globalThis.__autodesignPendingWork==='function' && globalThis.__autodesignPendingWork()===0",timeout=2500)
+        page.wait_for_timeout(100); quiescent=True
+      except Exception:
+        quiescent=False
+      dom=page.evaluate(DOM_AUDIT,plan)
+      return {'interactions':mode_interactions,'interactions_ok':bool(mode_interactions) and all(item['passed'] for item in mode_interactions),'observable_ok':bool(mode_interactions) and all(item['target_changed'] for item in mode_interactions),'focus_ok':bool(mode_interactions) and all(item['focus_indicator_visible'] for item in mode_interactions),'quiescent':quiescent,'internal_ok':links_ok,'reduced_motion_ok':bool(reduced_ok),'source_grounding':bool(dom['sourceGrounding']),'contract_intact':bool(dom['contractIntact']),'identity_above_fold':bool(initial_dom['identityAboveFold']),'dom_checks':dom['checks']}
+    finally:
+      c.close()
   try:
     with sync_playwright() as pw:
       browser=pw.chromium.launch(headless=True,args=FLAGS)
       try:
-        c=context(browser,reduced=True); page=c.new_page(); page.goto(html.as_uri(),wait_until='load',timeout=30000); page.wait_for_timeout(100)
-        internal=page.locator('a[href^="#"]'); internal_ok=True
-        for i in range(internal.count()):
-          href=internal.nth(i).get_attribute('href') or ''
-          internal_ok = internal_ok and len(href)>1 and page.locator('#'+href[1:]).count()==1
-        motion_ok=page.evaluate("""() => [...document.querySelectorAll('*')].every(el => { const s=getComputedStyle(el); const times=v=>v.split(',').every(x=>{x=x.trim();return x.endsWith('ms')?parseFloat(x)===0:parseFloat(x||'0')===0}); return (s.animationName==='none'||times(s.animationDuration)) && times(s.transitionDuration) && s.scrollBehavior!=='smooth'; })""")
-        identity_ok=bool(page.evaluate("""contract => {
-          const visible = el => { if (!el) return false; for (let n=el;n;n=n.parentElement) { const s=getComputedStyle(n); if (s.display==='none'||s.visibility==='hidden'||Number(s.opacity)<=0) return false; } const r=el.getBoundingClientRect(); return r.width>0 && r.height>0; };
-          const aboveFold = el => { if (!visible(el)) return false; const r=el.getBoundingClientRect(); const w=Math.max(0,Math.min(r.right,innerWidth)-Math.max(r.left,0)); const h=Math.max(0,Math.min(r.bottom,innerHeight)-Math.max(r.top,0)); return w>=Math.min(r.width,innerWidth)*0.5 && h>=Math.min(r.height,innerHeight)*0.5; };
-          const h1=[...document.querySelectorAll('h1')].find(el => (el.getAttribute('data-claim-id')||'').split(/\s+/).includes(contract.title_claim_id));
-          const thesis=document.querySelector('[data-thesis-claim-id="'+CSS.escape(contract.thesis_claim_id)+'"]');
-          const identity=document.querySelector('[data-section-role="identity"]');
-          return aboveFold(identity) && aboveFold(h1) && aboveFold(thesis);
-        }""",plan))
-        page.evaluate("() => document.activeElement && document.activeElement.blur()")
-        tab_limit=max(8,page.locator('a[href],button:not([disabled]),input:not([disabled]),select:not([disabled]),textarea:not([disabled]),[tabindex]').count()+3)
-        for item in plan['interactions']:
-          control=page.locator('#'+item['control_id']); target=page.locator('#'+item['target_id']); state=item['state_attribute']
-          ok=control.count()==1 and target.count()==1 and control.is_visible() and target.is_visible()
-          if ok:
-            ok=bool(control.evaluate("""el => { for(let n=el;n;n=n.parentElement){const s=getComputedStyle(n);if(s.display==='none'||s.visibility==='hidden'||Number(s.opacity)<=0)return false;}return true; }""") and target.evaluate("""el => { for(let n=el;n;n=n.parentElement){const s=getComputedStyle(n);if(s.display==='none'||s.visibility==='hidden'||Number(s.opacity)<=0)return false;}return true; }"""))
-          before=control.get_attribute(state) if ok else None; target_before=None; focus_visible=False; scroll_before=None
-          if ok:
-            baseline=control.evaluate("""el => { const s=getComputedStyle(el); return {color:s.color,background:s.backgroundColor,border:s.border,boxShadow:s.boxShadow,textDecoration:s.textDecorationLine}; }""")
-            reachable=False
-            for _ in range(tab_limit):
-              page.keyboard.press('Tab')
-              if control.evaluate('(el)=>document.activeElement===el'):
-                reachable=True; break
-            focused=control.evaluate("""el => { const s=getComputedStyle(el); return {matches:el.matches(':focus-visible'),outlineStyle:s.outlineStyle,outlineWidth:s.outlineWidth,outlineColor:s.outlineColor,color:s.color,background:s.backgroundColor,border:s.border,boxShadow:s.boxShadow,textDecoration:s.textDecorationLine}; }""")
-            outline=focused['outlineStyle']!='none' and float((focused['outlineWidth'] or '0px').replace('px','') or 0)>0 and focused['outlineColor'] not in {'transparent','rgba(0, 0, 0, 0)'}
-            delta=any(baseline.get(key)!=focused.get(key) for key in ('color','background','border','boxShadow','textDecoration'))
-            focus_visible=bool(reachable and focused['matches'] and (outline or focused['boxShadow']!='none' or delta))
-            target_before=target.evaluate("""el => { const s=getComputedStyle(el), r=el.getBoundingClientRect(); return {text:el.innerText,display:s.display,visibility:s.visibility,opacity:s.opacity,color:s.color,background:s.backgroundColor,border:s.border,boxShadow:s.boxShadow,outline:s.outline,transform:s.transform,filter:s.filter,x:r.x+scrollX,y:r.y+scrollY,width:r.width,height:r.height}; }""")
-            scroll_before=page.evaluate('() => ({x:scrollX,y:scrollY})')
-            if reachable: control.press('Enter'); page.wait_for_timeout(100)
-            else: ok=False
-          after=control.get_attribute(state) if ok else None
-          target_after=target.evaluate("""el => { const s=getComputedStyle(el), r=el.getBoundingClientRect(); return {text:el.innerText,display:s.display,visibility:s.visibility,opacity:s.opacity,color:s.color,background:s.backgroundColor,border:s.border,boxShadow:s.boxShadow,outline:s.outline,transform:s.transform,filter:s.filter,x:r.x+scrollX,y:r.y+scrollY,width:r.width,height:r.height}; }""") if ok else None
-          scrolled=bool(ok and item.get('kind')=='navigate' and scroll_before!=page.evaluate('() => ({x:scrollX,y:scrollY})'))
-          target_changed=bool(ok and (target_before!=target_after or scrolled))
-          ok=bool(ok and target.is_visible() and before!=after and target_changed and focus_visible and control.evaluate('(el)=>document.activeElement===el'))
-          interactions.append({'id':item['id'],'passed':ok,'state_changed':before!=after,'target_changed':target_changed,'focus_indicator_visible':focus_visible})
-        try:
-          page.wait_for_function("() => typeof globalThis.__autodesignPendingWork==='function' && globalThis.__autodesignPendingWork()===0",timeout=2500)
-          page.wait_for_timeout(100); timers_ok=True
-        except Exception:
-          timers_ok=False
-        runtime_grounding_ok=bool(page.evaluate(GROUNDING,plan))
-        c.close()
+        default_report=audit_desktop(browser,reduced=False); reduced_report=audit_desktop(browser,reduced=True)
+        mode_reports={'default':default_report,'reduced':reduced_report}; interactions=reduced_report['interactions']
+        internal_ok=default_report['internal_ok'] and reduced_report['internal_ok']
+        motion_ok=reduced_report['reduced_motion_ok']
+        identity_ok=default_report['identity_above_fold'] and reduced_report['identity_above_fold']
+        timers_ok=default_report['quiescent'] and reduced_report['quiescent']
+        runtime_grounding_ok=default_report['source_grounding'] and reduced_report['source_grounding']
+        runtime_contract_ok=default_report['contract_intact'] and reduced_report['contract_intact']
         c=context(browser,reduced=True,width=390,height=844); mobile=c.new_page(); mobile.goto(html.as_uri(),wait_until='load',timeout=30000); mobile.wait_for_timeout(50)
         usable=0
         for item in plan['interactions']:
@@ -1682,55 +1734,19 @@ def main():
           mobile.wait_for_timeout(100)
         except Exception:
           timers_ok=False
-        runtime_grounding_ok=bool(runtime_grounding_ok and mobile.evaluate(GROUNDING,plan))
+        mobile_dom=mobile.evaluate(DOM_AUDIT,plan)
+        runtime_grounding_ok=bool(runtime_grounding_ok and mobile_dom['sourceGrounding'])
+        runtime_contract_ok=bool(runtime_contract_ok and mobile_dom['contractIntact'])
         c.close()
         c=context(browser,javascript=False,reduced=True); nojs=c.new_page(); nojs.goto(html.as_uri(),wait_until='load',timeout=30000)
-        roles=['identity','abstract','method','evidence','results','limitations','resources','citation']
-        nojs_ok=all(nojs.locator('[data-section-role="'+role+'"]').count()==1 and nojs.locator('[data-section-role="'+role+'"]').is_visible() for role in roles)
-        nojs_ok=nojs_ok and nojs.locator('h1').count()==1 and nojs.locator('h1').is_visible()
-        claims={item['id']:item['text'] for item in plan.get('source_claims',[])}
-        claim_ids=sorted({plan['title_claim_id'],plan['thesis_claim_id'],*(claim for section in plan['sections'] for claim in section['claim_ids'])})
-        visual_ids=sorted({item['visual_id'] for item in plan['visual_allocations']})
-        nojs_ok=nojs_ok and bool(nojs.evaluate("""expected => {
-          const intersect = (a,b) => ({left:Math.max(a.left,b.left),top:Math.max(a.top,b.top),right:Math.min(a.right,b.right),bottom:Math.min(a.bottom,b.bottom)});
-          const area = r => Math.max(0,r.right-r.left)*Math.max(0,r.bottom-r.top);
-          const color = value => { const m=String(value||'').match(/rgba?\(([^)]+)\)/i); if(!m)return null; const p=m[1].split(/[\s,\/]+/).filter(Boolean).map(Number); return {r:p[0],g:p[1],b:p[2],a:p.length>3?p[3]:1}; };
-          const luminance = c => { const f=v=>{v/=255;return v<=.04045?v/12.92:Math.pow((v+.055)/1.055,2.4);}; return .2126*f(c.r)+.7152*f(c.g)+.0722*f(c.b); };
-          const contrast = (a,b) => { const x=luminance(a),y=luminance(b); return (Math.max(x,y)+.05)/(Math.min(x,y)+.05); };
-          const background = el => { for(let n=el;n;n=n.parentElement){const c=color(getComputedStyle(n).backgroundColor);if(c&&c.a>=.99)return c;}return {r:255,g:255,b:255,a:1}; };
-          const visibleRect = el => {
-            if(!el)return null; let result=el.getBoundingClientRect(); if(area(result)<=.5)return null;
-            result=intersect(result,{left:0,top:0,right:document.documentElement.scrollWidth,bottom:document.documentElement.scrollHeight}); if(area(result)<=.5)return null;
-            for(let n=el;n;n=n.parentElement){
-              const s=getComputedStyle(n), r=n.getBoundingClientRect();
-              if(s.display==='none'||['hidden','collapse'].includes(s.visibility)||Number(s.opacity)<=.01||s.contentVisibility==='hidden')return null;
-              const clip=String(s.clip||'auto').replace(/\s+/g,'').toLowerCase();
-              if(s.clipPath!=='none'||(clip!=='auto'&&clip!=='rect(auto,auto,auto,auto)')||(s.maskImage&&s.maskImage!=='none')||(s.webkitMaskImage&&s.webkitMaskImage!=='none'))return null;
-              if(/opacity\(\s*0(?:\.0+)?\s*\)/i.test(s.filter||''))return null;
-              if(n===el||['hidden','clip','scroll','auto'].includes(s.overflowX)||['hidden','clip','scroll','auto'].includes(s.overflowY))result=intersect(result,r);
-              if(area(result)<=.5)return null;
-            }
-            return result;
-          };
-          const textPainted = el => {
-            const walker=document.createTreeWalker(el,NodeFilter.SHOW_TEXT); let node,seen=false;
-            while((node=walker.nextNode())){
-              if(!String(node.data||'').trim())continue; seen=true; const parent=node.parentElement, box=visibleRect(parent); if(!box)return false;
-              const s=getComputedStyle(parent), fill=color(s.webkitTextFillColor), ink=fill||color(s.color); if(!ink||ink.a<=.01||contrast(ink,background(parent))<1.2)return false;
-              const range=document.createRange(); range.selectNodeContents(node); const painted=[...range.getClientRects()].some(rect=>area(intersect(rect,box))>.5); range.detach(); if(!painted)return false;
-            }
-            return seen;
-          };
-          const visible = (el,text=false) => Boolean(visibleRect(el)) && (!text||textPainted(el));
-          const tokenVisible = (attribute,id,text=false) => [...document.querySelectorAll('['+attribute+']')].some(el => (el.getAttribute(attribute)||'').split(/\s+/).includes(id) && visible(el,text));
-          const normalized = value => String(value||'').normalize('NFC').replace(/\s+/g,' ').trim();
-          const claimVisible = id => [...document.querySelectorAll('[data-claim-id]')].some(el => (el.getAttribute('data-claim-id')||'').split(/\s+/).includes(id) && visible(el,true) && (!expected.text[id] || normalized(el.innerText)===normalized(expected.text[id])));
-          return expected.claims.every(claimVisible) && expected.visuals.every(id => tokenVisible('data-source-id',id)) && expected.missing.every(id => tokenVisible('data-missing-metadata',id,true));
-        }""",{'claims':claim_ids,'text':claims,'visuals':visual_ids,'missing':plan['missing_metadata']}))
+        nojs_ok=bool(nojs.evaluate(DOM_AUDIT,plan)['passed'])
         c.close()
       finally: browser.close()
-    checks={'no_javascript_core_visible':bool(nojs_ok),'runtime_source_grounding':bool(runtime_grounding_ok),'keyboard_interactions':bool(interactions) and all(x['passed'] for x in interactions),'observable_interaction_effects':bool(interactions) and all(x['target_changed'] for x in interactions),'mobile_interaction_available':bool(mobile_ok),'desktop_identity_thesis_above_fold':bool(identity_ok),'focus_indicators_visible':bool(interactions) and all(x['focus_indicator_visible'] for x in interactions),'reduced_motion_effective':bool(motion_ok),'internal_links_resolve':bool(internal_ok),'delayed_tasks_quiescent':bool(timers_ok),'no_network_attempts':not blocked and not request_errors,'no_page_errors':not page_errors}
-    result={'format_version':1,'passed':all(checks.values()),'checks':checks,'interactions':interactions,'blocked_request_count':len(blocked),'request_error_count':len(request_errors),'page_error_count':len(page_errors)}
+    keyboard_ok=bool(mode_reports) and all(report['interactions_ok'] for report in mode_reports.values())
+    observable_ok=bool(mode_reports) and all(report['observable_ok'] for report in mode_reports.values())
+    focus_ok=bool(mode_reports) and all(report['focus_ok'] for report in mode_reports.values())
+    checks={'no_javascript_core_visible':bool(nojs_ok),'runtime_source_grounding':bool(runtime_grounding_ok),'runtime_contract_intact':bool(runtime_contract_ok),'default_motion_interactions':bool(mode_reports.get('default',{}).get('interactions_ok')),'reduced_motion_interactions':bool(mode_reports.get('reduced',{}).get('interactions_ok')),'default_motion_quiescent':bool(mode_reports.get('default',{}).get('quiescent')),'reduced_motion_quiescent':bool(mode_reports.get('reduced',{}).get('quiescent')),'keyboard_interactions':keyboard_ok,'observable_interaction_effects':observable_ok,'mobile_interaction_available':bool(mobile_ok),'desktop_identity_thesis_above_fold':bool(identity_ok),'focus_indicators_visible':focus_ok,'reduced_motion_effective':bool(motion_ok),'internal_links_resolve':bool(internal_ok),'delayed_tasks_quiescent':bool(timers_ok),'no_network_attempts':not blocked and not request_errors,'no_page_errors':not page_errors}
+    result={'format_version':1,'passed':all(checks.values()),'checks':checks,'interactions':interactions,'motion_modes':mode_reports,'blocked_request_count':len(blocked),'request_error_count':len(request_errors),'page_error_count':len(page_errors)}
   except Exception as error:
     result={'format_version':1,'passed':False,'checks':{},'interactions':interactions,'runtime_error':type(error).__name__}
   temp=a.report.with_name('.'+a.report.name+'.tmp'); temp.write_text(json.dumps(result,indent=2,sort_keys=True)+'\n',encoding='utf-8'); os.replace(temp,a.report)

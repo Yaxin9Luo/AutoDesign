@@ -127,18 +127,25 @@ written by the harness itself.
 - Keep core research content and evidence visible when JavaScript is disabled.
   JavaScript may annotate, compare, filter, or focus evidence; it may not fetch
   data, hide the only copy of evidence, or gate reading. Browser validation is
-  paint-aware: transparent or background-matched text, clipping, clip paths,
-  masks, zero-scale transforms, and collapsed/clipping ancestors do not count
-  as visible evidence.
+  paint-aware in both the no-JS and JavaScript-enabled DOM: transparent or
+  background-matched text, clipping, clip paths, masks, off-page or zero-scale
+  transforms, collapsed/clipping ancestors, and effective opacity at or below
+  0.01 (including `filter: opacity(...)`) do not count as visible evidence.
+  After scripts settle, the browser revalidates the exact ordered section-root
+  set; body and descendant claim, pseudo-content, and `on*` rules; planned
+  visual allocations; and every interaction target's planned claim/visual
+  binding.
 - Use only local CSS, JS, fonts, images, media, and downloads. Remote assets,
   data URLs, `@import`, iframes, objects, embeds, base tags, forms, meta refresh,
   network APIs, broken fragments, positive tabindex, and unlisted external
   links are forbidden. Duplicate attributes and inline `on*` handlers are also
   forbidden.
 - JavaScript navigation (`location`, `window.open`) is forbidden. Browser QA
-  tracks timers, animation frames, and Web Animations for 2.5 seconds and fails
-  closed if delayed work does not settle or attempts a blocked request; do not
-  use persistent loops or long-delay work.
+  separately exercises interactions and tracks timers, animation frames, and
+  Web Animations for 2.5 seconds in default-motion and reduced-motion desktop
+  contexts. It fails closed if either mode breaks, delayed work does not settle,
+  or a blocked request is attempted; do not use persistent loops or long-delay
+  work.
 - Provide a browser-measurable visible `:focus-visible` treatment, a mobile breakpoint, and effective
   `prefers-reduced-motion: reduce` overrides for every active motion mode.
 - Use 3-8 restrained functional inline SVG icons. Name interactive icons; hide

@@ -1128,6 +1128,117 @@ class WebpageSkillRealBrowserTest(unittest.TestCase):
             self.assertTrue(interaction["checks"]["desktop_identity_thesis_above_fold"])
             self.assertTrue(interaction["checks"]["focus_indicators_visible"])
 
+    def test_failed_review_resumes_at_attempt_02_and_finalizes_real_browser_delivery(self) -> None:
+        cache = self._browser_cache()
+        harness = _load_harness()
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            source = root / "paper.md"
+            source.write_text(_source_text(), encoding="utf-8")
+            visual = root / "pipeline.svg"
+            visual.write_text(_svg(), encoding="utf-8")
+            run = root / "run"
+            harness.initialize_webpage_run(
+                run, source, extra_assets=[visual], install_browser=False
+            )
+            harness.save_webpage_plan(run, _plan())
+
+            first = harness.begin_webpage_attempt(run)
+            first_visual = harness.stage_visual(run, first, "vis-001")
+            first_artifact = run / "attempts" / first / "artifact"
+            (first_artifact / "index.html").write_text(
+                _valid_html(first_visual), encoding="utf-8"
+            )
+            harness.write_webpage_source_map(run, first, _claims())
+
+            def fake_browser(_html, *, output_dir, **_kwargs):
+                output_dir.mkdir(parents=True, exist_ok=True)
+                (output_dir / "desktop.png").write_bytes(b"desktop-first")
+                (output_dir / "mobile.png").write_bytes(b"mobile-first")
+                return {
+                    "format_version": 1,
+                    "viewports": {
+                        "desktop": {"passed": True, "screenshot": "desktop.png"},
+                        "mobile": {"passed": True, "screenshot": "mobile.png"},
+                    },
+                    "passed": True,
+                }
+
+            harness.validate_webpage_attempt(
+                run,
+                first,
+                browser_audit=fake_browser,
+                interaction_audit=lambda **_kwargs: {
+                    "format_version": 1,
+                    "passed": True,
+                    "checks": {},
+                },
+                allow_browser_install=False,
+            )
+            first_context = harness.create_webpage_review_context(run, first)
+            failed_review = {
+                "format_version": 1,
+                "attempt_id": first,
+                "review_context_sha256": first_context["context_sha256"],
+                "artifact_hashes": first_context["artifact_hashes"],
+                "preview_hashes": first_context["preview_hashes"],
+                "reviewed_frame_ids": sorted(first_context["preview_hashes"]),
+                "source_manifest_sha256": first_context["source_manifest_sha256"],
+                "source_map_sha256": first_context["source_map_sha256"],
+                "rubric_sha256": first_context["rubric_sha256"],
+                "reviewer_mode": "fresh_host_vlm",
+                "dimension_scores": {
+                    dimension: 4 for dimension in first_context["rubric"]["dimensions"]
+                },
+                "blockers": ["Repair the evidence hierarchy."],
+                "localized_repairs": ["identity and method hierarchy"],
+                "verdict": "fail",
+                "complete": True,
+            }
+            harness.record_webpage_review(run, first, failed_review)
+            self.assertEqual(harness.resume_webpage_run(run)["next_action"], "repair")
+
+            second = harness.begin_webpage_attempt(run)
+            self.assertEqual(second, "02")
+            second_visual = harness.stage_visual(run, second, "vis-001")
+            second_artifact = run / "attempts" / second / "artifact"
+            (second_artifact / "index.html").write_text(
+                _valid_html(second_visual), encoding="utf-8"
+            )
+            harness.write_webpage_source_map(run, second, _claims())
+            second_report = harness.validate_webpage_attempt(
+                run, second, browser_cache=cache, allow_browser_install=False
+            )
+            self.assertTrue(second_report["passed"], second_report)
+
+            second_context = harness.create_webpage_review_context(run, second)
+            passing_review = {
+                "format_version": 1,
+                "attempt_id": second,
+                "review_context_sha256": second_context["context_sha256"],
+                "artifact_hashes": second_context["artifact_hashes"],
+                "preview_hashes": second_context["preview_hashes"],
+                "reviewed_frame_ids": sorted(second_context["preview_hashes"]),
+                "source_manifest_sha256": second_context["source_manifest_sha256"],
+                "source_map_sha256": second_context["source_map_sha256"],
+                "rubric_sha256": second_context["rubric_sha256"],
+                "reviewer_mode": "fresh_host_vlm",
+                "dimension_scores": {
+                    dimension: 4 for dimension in second_context["rubric"]["dimensions"]
+                },
+                "blockers": [],
+                "localized_repairs": [],
+                "verdict": "pass",
+                "complete": True,
+            }
+            harness.record_webpage_review(run, second, passing_review)
+            manifest = harness.finalize_webpage_attempt(run, second)
+
+            self.assertEqual(manifest["attempt_id"], "02")
+            self.assertEqual(harness.resume_webpage_run(run)["next_action"], "complete")
+            self.assertTrue((run / "attempts" / "01" / "artifact" / "index.html").is_file())
+            self.assertTrue((run / "final" / "index.html").is_file())
+
     def test_browser_rejects_aria_only_interaction_without_visible_target_change(self) -> None:
         cache = self._browser_cache()
         harness = _load_harness()
@@ -1631,6 +1742,150 @@ class WebpageSkillRealBrowserTest(unittest.TestCase):
 
                 self.assertFalse(report["passed"], (label, report))
                 self.assertFalse(report["checks"]["delayed_tasks_quiescent"])
+
+    def test_default_motion_gate_rejects_broken_interaction_and_persistent_work(self) -> None:
+        harness = _load_harness()
+        scripts = {
+            "interaction-noop": (
+                "if(!matchMedia('(prefers-reduced-motion: reduce)').matches){"
+                "const old=document.getElementById('inspect-method-control');"
+                "old.replaceWith(old.cloneNode(true));}"
+            ),
+            "persistent-raf": (
+                "if(!matchMedia('(prefers-reduced-motion: reduce)').matches){"
+                "function spin(){requestAnimationFrame(spin);}spin();}"
+            ),
+        }
+        for label, script in scripts.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as raw:
+                root = Path(raw)
+                _run, _attempt, artifact = self._author_browser_attempt(
+                    root,
+                    harness,
+                    lambda html, script=script: html.replace(
+                        "</script>", script + "</script>", 1
+                    ),
+                )
+
+                report = self._run_probe(root, harness, artifact)
+
+                self.assertFalse(report["passed"], (label, report))
+                check = (
+                    "default_motion_interactions"
+                    if label == "interaction-noop"
+                    else "default_motion_quiescent"
+                )
+                self.assertFalse(report["checks"][check], (label, report))
+
+    def test_javascript_runtime_grounding_is_paint_aware(self) -> None:
+        harness = _load_harness()
+        mutations = {
+            "transparent": "node.style.color='transparent';",
+            "same-color": "node.style.color='#f7f3ea';",
+            "low-alpha-contrast": "node.style.color='rgba(24,32,51,.02)';",
+            "clip-path": "node.style.clipPath='inset(50%)';",
+            "mask": "node.style.maskImage='linear-gradient(transparent,transparent)';",
+            "translated-away": "node.style.transform='translateX(-100000px)';",
+            "translated-positive-away": "node.style.transform='translateX(100000px)';",
+        }
+        for label, mutation in mutations.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as raw:
+                root = Path(raw)
+                script = (
+                    "const node=document.querySelector('[data-claim-id=claim-results]');"
+                    + mutation
+                )
+                _run, _attempt, artifact = self._author_browser_attempt(
+                    root,
+                    harness,
+                    lambda html, script=script: html.replace(
+                        "</script>", script + "</script>", 1
+                    ),
+                )
+
+                report = self._run_probe(root, harness, artifact)
+
+                self.assertFalse(report["passed"], (label, report))
+                self.assertFalse(
+                    report["checks"]["runtime_source_grounding"], (label, report)
+                )
+
+    def test_live_dom_revalidates_complete_content_and_interaction_contract(self) -> None:
+        harness = _load_harness()
+        scripts = {
+            "extra-section-root": (
+                "const extra=document.createElement('section');extra.id='rogue';"
+                "extra.dataset.sectionRole='rogue';extra.textContent='Rogue section';"
+                "document.querySelector('main').append(extra);"
+            ),
+            "body-pseudo": (
+                "const style=document.createElement('style');"
+                "style.textContent='body::before{content:\"Runtime label\"}';"
+                "document.head.append(style);"
+            ),
+            "body-unknown-claim": (
+                "const claim=document.createElement('p');"
+                "claim.dataset.claimId='claim-rogue';"
+                "claim.textContent='Unmapped runtime claim';document.body.append(claim);"
+            ),
+            "body-inline-handler": "document.body.setAttribute('onclick','void 0');",
+            "visual-allocation-drift": (
+                "document.querySelectorAll('[data-source-id]').forEach("
+                "node=>node.removeAttribute('data-source-id'));"
+            ),
+            "unbound-extra-visual": (
+                "const image=document.createElement('img');"
+                "image.src='assets/vis-001.svg';image.alt='Unbound duplicate visual';"
+                "document.querySelector('footer').append(image);"
+            ),
+            "interaction-target-unbound": (
+                "const target=document.getElementById('method-figure');"
+                "target.removeAttribute('data-source-id');"
+                "target.querySelectorAll('[data-source-id]').forEach("
+                "node=>node.removeAttribute('data-source-id'));"
+                "document.getElementById('method').dataset.sourceId='vis-001';"
+            ),
+        }
+        for label, script in scripts.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as raw:
+                root = Path(raw)
+                _run, _attempt, artifact = self._author_browser_attempt(
+                    root,
+                    harness,
+                    lambda html, script=script: html.replace(
+                        "</script>", script + "</script>", 1
+                    ),
+                )
+
+                report = self._run_probe(root, harness, artifact)
+
+                self.assertFalse(report["passed"], (label, report))
+                check = (
+                    "runtime_source_grounding"
+                    if label in {"body-pseudo", "body-unknown-claim"}
+                    else "runtime_contract_intact"
+                )
+                self.assertFalse(report["checks"][check], (label, report))
+
+    def test_filter_opacity_below_visibility_threshold_is_not_painted(self) -> None:
+        harness = _load_harness()
+        for opacity in ("0.005", "0.01", "1%"):
+            with self.subTest(opacity=opacity), tempfile.TemporaryDirectory() as raw:
+                root = Path(raw)
+                _run, _attempt, artifact = self._author_browser_attempt(
+                    root,
+                    harness,
+                    lambda html, opacity=opacity: html.replace(
+                        '<p data-claim-id="claim-results">',
+                        f'<p style="filter:opacity({opacity})" data-claim-id="claim-results">',
+                        1,
+                    ),
+                )
+
+                report = self._run_probe(root, harness, artifact)
+
+                self.assertFalse(report["passed"], report)
+                self.assertFalse(report["checks"]["no_javascript_core_visible"])
 
     def test_no_javascript_gate_rejects_css_hidden_claim_evidence(self) -> None:
         cache = self._browser_cache()

@@ -30,11 +30,13 @@ Fail before scoring when any of these is visible or evidenced:
   claim IDs that differ from the plan, generated pseudo-element prose, or a
   thesis marker that is not itself the exact thesis claim, including equivalent
   text or claim mutation injected after load;
-- paint-transparent, background-matched, clipped, masked, transformed-away, or
-  collapsed evidence in the no-JS state;
+- paint-transparent, background-matched, clipped, masked, transformed-away,
+  effectively transparent, or collapsed evidence in either the no-JS or
+  JavaScript-enabled state;
 - duplicate attributes, inline event handlers, any additional HTML sidecar,
   unreachable/scratch/hardlinked artifact files, delayed/persistent timers,
-  animation frames or Web Animations, or scripted navigation/egress paths;
+  animation frames or Web Animations in default or reduced motion, or scripted
+  navigation/egress paths;
 - incomplete screenshot set or any context/hash mismatch.
 
 ## Dimensions
