@@ -47,10 +47,11 @@ harness rejects unknown, incomplete, stale, symlinked, or hash-drifted inputs.
 
 The eight roles are required once each, in the shown order. Section IDs,
 interaction IDs, controls, and targets are stable HTML identifiers. The plan
-needs at least one `inspect` or `compare` interaction bound to planned claims or
-visuals. `navigate` may supplement it. Valid state attributes are
-`aria-current`, `aria-expanded`, `aria-pressed`, `aria-selected`, `data-active`,
-and `data-state`. `max_attempts` is 1-6.
+needs at least one `inspect` or `compare` interaction bound to claims declared
+by the section plan or to approved visuals. Every interaction claim must also
+exist in the attempt source map. `navigate` may supplement it. Valid state
+attributes are `aria-current`, `aria-expanded`, `aria-pressed`,
+`aria-selected`, `data-active`, and `data-state`. `max_attempts` is 1-6.
 
 Copy the user's actual request into `brief`; do not silently replace its
 language, audience, emphasis, or visual constraints with a generic default.
@@ -89,16 +90,25 @@ finite number from 0.8 through 1. An explicit attached asset is already eligible
 ## HTML and asset closure
 
 The canonical artifact is `attempts/<id>/artifact/index.html` plus local files
-under the same `artifact/` directory. `index.html` is the only allowed HTML
-document: do not ship linked or unlinked `.html`/`.htm` sidecars.
+under the same `artifact/` directory that are reachable from `index.html`.
+`index.html` is the only allowed HTML document: do not ship linked or unlinked
+`.html`/`.htm` sidecars, author notes, scratch files, or unreachable assets.
+Every artifact file must own its bytes (`st_nlink == 1`); symlinks and hardlinks
+are forbidden. The only non-reachable files allowed are the three audit reports
+written by the harness itself.
 
 - Use HTML5 doctype, `html[lang]`, viewport metadata, one `main`, one visible
   `h1`, a labeled `nav`, and a skip link to `#main`.
 - Mark the eight narrative containers with `data-section-role`. Bind the H1 and
   thesis to the plan and keep at least half of each visible within the initial
-  1440 x 1000 desktop viewport. Mark every visible source claim with one `data-claim-id`; after
-  whitespace normalization its visible text must exactly equal that source-map
-  claim's text.
+  1440 x 1000 desktop viewport. Each container must render exactly its planned
+  claim-ID set. The element carrying `data-thesis-claim-id` must itself carry
+  exactly the thesis `data-claim-id`. Mark every visible source claim with one
+  `data-claim-id`; after whitespace normalization its visible text must exactly
+  equal that source-map claim's text. Any visible numeric, URL, or formula
+  assertion must be inside such an exact binding. Non-empty `::before`/`::after`
+  content is forbidden. Runtime scripts may not mutate exact claim text or
+  inject unbound assertions/pseudo-element text after the static audit.
 - Write each unavailable field in visible native text and tag it with
   `data-missing-metadata`. The marker set must exactly equal the plan.
 - Mark a staged evidence image with `data-source-id` on the `img`, `source`, or
@@ -108,20 +118,27 @@ document: do not ship linked or unlinked `.html`/`.htm` sidecars.
   `data-interaction-id`, `aria-controls`, an accessible name, and the planned
   observable state attribute. Its target must contain a bound claim or visual.
   Activation must also visibly change the target's text, geometry, or computed
-  presentation; changing only ARIA/data attributes is a no-op and fails. At
-  least one planned control must remain visible, enabled, unclipped, and at
-  least 24 x 24 CSS pixels at 390 px width, and its activation must still
-  produce the planned visible target change there.
+  presentation; changing only ARIA/data attributes is a no-op and fails. Every
+  planned control must be reachable through sequential keyboard focus without
+  programmatic focus. At least one planned `inspect` or `compare` control—not a
+  navigation-only control—must remain visible, enabled, unclipped, and at least
+  24 x 24 CSS pixels at 390 px width, and its activation must still produce the
+  planned visible target change there.
 - Keep core research content and evidence visible when JavaScript is disabled.
   JavaScript may annotate, compare, filter, or focus evidence; it may not fetch
-  data, hide the only copy of evidence, or gate reading.
+  data, hide the only copy of evidence, or gate reading. Browser validation is
+  paint-aware: transparent or background-matched text, clipping, clip paths,
+  masks, zero-scale transforms, and collapsed/clipping ancestors do not count
+  as visible evidence.
 - Use only local CSS, JS, fonts, images, media, and downloads. Remote assets,
   data URLs, `@import`, iframes, objects, embeds, base tags, forms, meta refresh,
   network APIs, broken fragments, positive tabindex, and unlisted external
-  links are forbidden.
+  links are forbidden. Duplicate attributes and inline `on*` handlers are also
+  forbidden.
 - JavaScript navigation (`location`, `window.open`) is forbidden. Browser QA
-  tracks timers for 2.5 seconds and fails closed if delayed work does not settle
-  or attempts a blocked request; do not use persistent or long-delay timers.
+  tracks timers, animation frames, and Web Animations for 2.5 seconds and fails
+  closed if delayed work does not settle or attempts a blocked request; do not
+  use persistent loops or long-delay work.
 - Provide a browser-measurable visible `:focus-visible` treatment, a mobile breakpoint, and effective
   `prefers-reduced-motion: reduce` overrides for every active motion mode.
 - Use 3-8 restrained functional inline SVG icons. Name interactive icons; hide

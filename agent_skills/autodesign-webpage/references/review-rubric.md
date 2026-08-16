@@ -23,10 +23,18 @@ Fail before scoring when any of these is visible or evidenced:
 - a broken primary navigation/control, absent keyboard affordance, or an
   interaction whose initial state is the only way to access evidence;
 - an interaction that changes only ARIA/data state without a visible target
-  change, no usable interaction control at 390 px, an invisible keyboard focus
-  treatment, or a title/thesis pushed below the initial desktop viewport;
-- any additional HTML sidecar, delayed/persistent browser task, or scripted
-  navigation/egress path;
+  change, no usable `inspect`/`compare` control at 390 px, a control skipped by
+  sequential keyboard focus, an invisible keyboard focus treatment, or a
+  title/thesis pushed below the initial desktop viewport;
+- visible numeric/URL/formula assertions outside exact source bindings, section
+  claim IDs that differ from the plan, generated pseudo-element prose, or a
+  thesis marker that is not itself the exact thesis claim, including equivalent
+  text or claim mutation injected after load;
+- paint-transparent, background-matched, clipped, masked, transformed-away, or
+  collapsed evidence in the no-JS state;
+- duplicate attributes, inline event handlers, any additional HTML sidecar,
+  unreachable/scratch/hardlinked artifact files, delayed/persistent timers,
+  animation frames or Web Animations, or scripted navigation/egress paths;
 - incomplete screenshot set or any context/hash mismatch.
 
 ## Dimensions

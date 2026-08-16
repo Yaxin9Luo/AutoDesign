@@ -12,6 +12,8 @@ from pathlib import Path
 from unittest import mock
 
 
+sys.dont_write_bytecode = True
+
 ROOT = Path(__file__).resolve().parents[1]
 SKILL_ROOT = ROOT / "agent_skills" / "autodesign-webpage"
 HARNESS_PATH = SKILL_ROOT / "scripts" / "webpage_harness.py"
@@ -195,7 +197,7 @@ def _valid_html(asset_path: str = "assets/vis-001.svg") -> str:
     <figure id="method-figure" data-source-id="vis-001"><img src="{asset_path}" data-source-id="vis-001" alt="Three-stage Atlas method pipeline"><figcaption>Source method overview linked to claim-method.</figcaption></figure>
     <p>{filler}</p></section>
   <section id="evidence" data-section-role="evidence"><h2>Evidence map</h2><p data-claim-id="claim-method">The method plans the research story, composes source-bound sections, and validates the rendered page.</p><p>{filler}</p></section>
-  <section id="results" data-section-role="results"><h2>Results</h2><p data-claim-id="claim-results">Atlas improved evidence coverage from 62% to 91% on the synthetic evaluation.</p><table><caption>Source-backed evidence coverage</caption><thead><tr><th>System</th><th>Coverage</th></tr></thead><tbody><tr><td>Baseline</td><td>62%</td></tr><tr><td>Atlas</td><td>91%</td></tr></tbody></table><p>{filler}</p></section>
+  <section id="results" data-section-role="results"><h2>Results</h2><p data-claim-id="claim-results">Atlas improved evidence coverage from 62% to 91% on the synthetic evaluation.</p><table><caption>Source-backed evidence coverage</caption><thead><tr><th>System</th><th>Coverage</th></tr></thead><tbody><tr><td>Baseline</td><td>Reported in the source result</td></tr><tr><td>Atlas</td><td>Reported in the source result</td></tr></tbody></table><p>{filler}</p></section>
   <section id="limitations" data-section-role="limitations"><h2>Limitations</h2><p data-claim-id="claim-limitations">The synthetic evaluation is small and browser coverage is limited to Chromium.</p><p>{filler}</p></section>
   <section id="resources" data-section-role="resources"><h2>Resources</h2><p data-claim-id="claim-resource">The paper resource is https://example.org/atlas-paper.</p><div class="resource-list"><a data-resource-link="Paper" href="https://example.org/atlas-paper" rel="noopener">Paper</a></div>
     <p data-missing-metadata="code_url">Code URL was not provided in the source.</p><p data-missing-metadata="data_url">Dataset URL was not provided in the source.</p><p data-missing-metadata="license">License was not provided in the source.</p></section>
@@ -338,6 +340,15 @@ class WebpageSkillTest(unittest.TestCase):
         with self.assertRaisesRegex(self.harness.WebpageContractError, "unknown fields"):
             self.harness.validate_webpage_plan(self.run, plan)
 
+    def test_plan_rejects_interaction_claims_outside_the_section_plan(self) -> None:
+        plan = _plan()
+        plan["interactions"][0]["claim_ids"] = ["claim-invented"]
+
+        with self.assertRaisesRegex(
+            self.harness.WebpageContractError, "outside the planned research claims"
+        ):
+            self.harness.validate_webpage_plan(self.run, plan)
+
     def test_staged_visual_is_hash_bound_and_plan_authorized(self) -> None:
         self.harness.save_webpage_plan(self.run, _plan())
         attempt_id = self.harness.begin_webpage_attempt(self.run)
@@ -386,6 +397,207 @@ class WebpageSkillTest(unittest.TestCase):
         self.assertEqual(report["metrics"]["required_section_count"], 8)
         self.assertEqual(report["metrics"]["source_grounded_interaction_count"], 1)
         self.assertEqual(report["metrics"]["missing_metadata_count"], 7)
+
+    def test_static_contract_rejects_unbound_visible_assertions(self) -> None:
+        mutations = {
+            "numeric": "<p>Independent evaluation accuracy reached 99.9%.</p>",
+            "url": "<p>Supplement: https://invented.example/results</p>",
+            "formula": "<p>The final relation is E = mc^2.</p>",
+        }
+        for label, assertion in mutations.items():
+            with self.subTest(label=label):
+                with tempfile.TemporaryDirectory() as raw:
+                    root = Path(raw)
+                    source = root / "paper.md"
+                    source.write_text(_source_text(), encoding="utf-8")
+                    visual = root / "pipeline.svg"
+                    visual.write_text(_svg(), encoding="utf-8")
+                    run = root / "run"
+                    self.harness.initialize_webpage_run(
+                        run, source, extra_assets=[visual], install_browser=False
+                    )
+                    self.harness.save_webpage_plan(run, _plan())
+                    attempt_id = self.harness.begin_webpage_attempt(run)
+                    staged = self.harness.stage_visual(run, attempt_id, "vis-001")
+                    artifact = run / "attempts" / attempt_id / "artifact"
+                    (artifact / "index.html").write_text(
+                        _valid_html(staged).replace("</footer>", assertion + "</footer>"),
+                        encoding="utf-8",
+                    )
+                    self.harness.write_webpage_source_map(run, attempt_id, _claims())
+
+                    report = self.harness.validate_webpage_html(run, attempt_id)
+
+                    self.assertIn(
+                        "ungrounded_visible_assertion",
+                        {finding["code"] for finding in report["findings"]},
+                    )
+
+    def test_static_contract_rejects_nonempty_css_generated_content(self) -> None:
+        attempt_id = self._author_valid_attempt()
+        path = self.run / "attempts" / attempt_id / "artifact" / "index.html"
+        path.write_text(
+            path.read_text(encoding="utf-8").replace(
+                "section, header {",
+                ".result::before { content:'99.9%'; } section, header {",
+                1,
+            ),
+            encoding="utf-8",
+        )
+
+        report = self.harness.validate_webpage_html(self.run, attempt_id)
+
+        self.assertIn(
+            "css_generated_content",
+            {finding["code"] for finding in report["findings"]},
+        )
+
+    def test_static_contract_requires_each_section_exactly_match_planned_claims(self) -> None:
+        attempt_id = self._author_valid_attempt()
+        path = self.run / "attempts" / attempt_id / "artifact" / "index.html"
+        path.write_text(
+            path.read_text(encoding="utf-8").replace(
+                '<section id="evidence" data-section-role="evidence"><h2>Evidence map</h2><p data-claim-id="claim-method">',
+                '<section id="evidence" data-section-role="evidence"><h2>Evidence map</h2><p>',
+                1,
+            ),
+            encoding="utf-8",
+        )
+
+        report = self.harness.validate_webpage_html(self.run, attempt_id)
+
+        self.assertIn(
+            "section_claim_mismatch",
+            {finding["code"] for finding in report["findings"]},
+        )
+
+    def test_static_contract_requires_every_planned_section(self) -> None:
+        plan = _plan()
+        plan["sections"].append(
+            {"id": "appendix", "role": "appendix", "claim_ids": ["claim-results"]}
+        )
+        self.harness.save_webpage_plan(self.run, plan)
+        attempt_id = self.harness.begin_webpage_attempt(self.run)
+        staged = self.harness.stage_visual(self.run, attempt_id, "vis-001")
+        artifact = self.run / "attempts" / attempt_id / "artifact"
+        (artifact / "index.html").write_text(_valid_html(staged), encoding="utf-8")
+        self.harness.write_webpage_source_map(self.run, attempt_id, _claims())
+
+        report = self.harness.validate_webpage_html(self.run, attempt_id)
+
+        self.assertIn(
+            "section_role_count",
+            {finding["code"] for finding in report["findings"]},
+        )
+
+    def test_static_contract_ignores_nonvisible_head_metadata_assertions(self) -> None:
+        attempt_id = self._author_valid_attempt()
+        path = self.run / "attempts" / attempt_id / "artifact" / "index.html"
+        path.write_text(
+            path.read_text(encoding="utf-8").replace(
+                "<title>Atlas: Evidence-Aware Research Communication</title>",
+                "<title>Atlas 2: Evidence-Aware Research Communication</title>",
+                1,
+            ),
+            encoding="utf-8",
+        )
+
+        report = self.harness.validate_webpage_html(self.run, attempt_id)
+
+        self.assertNotIn(
+            "ungrounded_visible_assertion",
+            {finding["code"] for finding in report["findings"]},
+        )
+
+    def test_static_contract_requires_thesis_marker_to_be_the_exact_claim_node(self) -> None:
+        attempt_id = self._author_valid_attempt()
+        path = self.run / "attempts" / attempt_id / "artifact" / "index.html"
+        original = (
+            '<p data-thesis-claim-id="claim-thesis" data-claim-id="claim-thesis">'
+            "Atlas turns one source paper into an evidence-aware research page.</p>"
+        )
+        replacement = (
+            '<p data-thesis-claim-id="claim-thesis">Thesis</p>'
+            '<p data-claim-id="claim-thesis">Atlas turns one source paper into an '
+            "evidence-aware research page.</p>"
+        )
+        path.write_text(
+            path.read_text(encoding="utf-8").replace(original, replacement, 1),
+            encoding="utf-8",
+        )
+
+        report = self.harness.validate_webpage_html(self.run, attempt_id)
+
+        self.assertIn(
+            "thesis_claim_binding",
+            {finding["code"] for finding in report["findings"]},
+        )
+
+    def test_static_contract_rejects_duplicate_attributes(self) -> None:
+        attempt_id = self._author_valid_attempt()
+        path = self.run / "attempts" / attempt_id / "artifact" / "index.html"
+        path.write_text(
+            path.read_text(encoding="utf-8").replace(
+                '<a href="#method">',
+                '<a href="#method" href="https://invented.example/egress">',
+                1,
+            ),
+            encoding="utf-8",
+        )
+
+        report = self.harness.validate_webpage_html(self.run, attempt_id)
+
+        self.assertIn(
+            "duplicate_attribute",
+            {finding["code"] for finding in report["findings"]},
+        )
+
+    def test_static_contract_rejects_inline_event_handlers(self) -> None:
+        attempt_id = self._author_valid_attempt()
+        path = self.run / "attempts" / attempt_id / "artifact" / "index.html"
+        path.write_text(
+            path.read_text(encoding="utf-8").replace(
+                'id="inspect-method-control"',
+                'id="inspect-method-control" onclick="location.href=\'https://invented.example\'"',
+                1,
+            ),
+            encoding="utf-8",
+        )
+
+        report = self.harness.validate_webpage_html(self.run, attempt_id)
+
+        self.assertIn(
+            "inline_event_handler",
+            {finding["code"] for finding in report["findings"]},
+        )
+
+    def test_static_contract_rejects_unreachable_files_anywhere_in_artifact(self) -> None:
+        attempt_id = self._author_valid_attempt()
+        artifact = self.run / "attempts" / attempt_id / "artifact"
+        (artifact / "notes.txt").write_text("author scratch", encoding="utf-8")
+
+        report = self.harness.validate_webpage_html(self.run, attempt_id)
+
+        self.assertIn(
+            "unreachable_artifact_file",
+            {finding["code"] for finding in report["findings"]},
+        )
+
+    def test_static_contract_rejects_hardlinked_artifact_files(self) -> None:
+        attempt_id = self._author_valid_attempt()
+        artifact = self.run / "attempts" / attempt_id / "artifact"
+        staged = artifact / "assets" / "vis-001.svg"
+        external = self.root / "mutable-external.svg"
+        external.write_bytes(staged.read_bytes())
+        staged.unlink()
+        os.link(external, staged)
+
+        report = self.harness.validate_webpage_html(self.run, attempt_id)
+
+        self.assertIn(
+            "hardlinked_artifact_file",
+            {finding["code"] for finding in report["findings"]},
+        )
 
     def test_static_contract_rejects_visible_claim_text_drift_with_a_valid_id(self) -> None:
         attempt_id = self._author_valid_attempt()
@@ -851,6 +1063,25 @@ class WebpageSkillRealBrowserTest(unittest.TestCase):
         harness.write_webpage_source_map(run, attempt, _claims())
         return run, attempt, artifact
 
+    @classmethod
+    def _run_probe(cls, root: Path, harness, artifact: Path, plan=None):
+        contract = plan or _plan()
+        contract = json.loads(json.dumps(contract))
+        contract["source_claims"] = _claims()
+        runtime = harness.setup_browser.ensure_browser_runtime(
+            cache_root=cls._browser_cache(), allow_install=False
+        )
+        return harness._run_interaction_audit(
+            html_path=artifact / "index.html",
+            workspace_root=artifact,
+            output_dir=root / "probe",
+            interactions=contract["interactions"],
+            content_contract=contract,
+            runtime=runtime,
+            browser_cache=cls._browser_cache(),
+            allow_install=False,
+        )
+
     def test_real_browser_checks_desktop_mobile_keyboard_no_js_and_reduced_motion(self) -> None:
         cache = self._browser_cache()
         harness = _load_harness()
@@ -978,6 +1209,75 @@ class WebpageSkillRealBrowserTest(unittest.TestCase):
                 (artifact / "interaction-audit.json").read_text(encoding="utf-8")
             )
             self.assertFalse(audit["checks"]["mobile_interaction_available"])
+
+    def test_browser_does_not_treat_navigation_as_the_mobile_research_interaction(self) -> None:
+        harness = _load_harness()
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+
+            def add_navigation_only_mobile(html: str) -> str:
+                return html.replace(
+                    '<a href="#results">',
+                    '<a id="jump-results-control" data-interaction-id="jump-results" '
+                    'aria-controls="results" aria-current="false" href="#results">',
+                    1,
+                ).replace(
+                    "@media (max-width:720px) {",
+                    "@media (max-width:720px) { #inspect-method-control { display:none!important; }",
+                    1,
+                ).replace(
+                    "const control=document.getElementById('inspect-method-control');",
+                    "document.getElementById('jump-results-control').addEventListener('click',"
+                    "event=>event.currentTarget.setAttribute('aria-current','true'));"
+                    "const control=document.getElementById('inspect-method-control');",
+                    1,
+                )
+
+            _run, _attempt, artifact = self._author_browser_attempt(
+                root, harness, add_navigation_only_mobile
+            )
+            plan = _plan()
+            plan["interactions"].append(
+                {
+                    "id": "jump-results",
+                    "kind": "navigate",
+                    "claim_ids": ["claim-results"],
+                    "visual_ids": [],
+                    "control_id": "jump-results-control",
+                    "target_id": "results",
+                    "state_attribute": "aria-current",
+                }
+            )
+
+            report = self._run_probe(root, harness, artifact, plan)
+
+            self.assertFalse(report["passed"])
+            self.assertFalse(report["checks"]["mobile_interaction_available"])
+
+    def test_browser_requires_interactions_to_be_sequentially_keyboard_reachable(self) -> None:
+        cache = self._browser_cache()
+        harness = _load_harness()
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            run, attempt, artifact = self._author_browser_attempt(
+                root,
+                harness,
+                lambda html: html.replace(
+                    'id="inspect-method-control" type="button"',
+                    'id="inspect-method-control" tabindex="-1" type="button"',
+                    1,
+                ),
+            )
+
+            report = harness.validate_webpage_attempt(
+                run, attempt, browser_cache=cache, allow_browser_install=False
+            )
+
+            self.assertFalse(report["passed"])
+            audit = json.loads(
+                (artifact / "interaction-audit.json").read_text(encoding="utf-8")
+            )
+            self.assertFalse(audit["checks"]["keyboard_interactions"])
 
     def test_browser_requires_the_mobile_interaction_to_work(self) -> None:
         cache = self._browser_cache()
@@ -1174,7 +1474,7 @@ class WebpageSkillRealBrowserTest(unittest.TestCase):
             self.assertTrue(report["passed"], report)
             self.assertTrue(report["checks"]["no_javascript_core_visible"])
 
-    def test_no_javascript_gate_rejects_hidden_source_text_with_css_replacement(self) -> None:
+    def test_static_gate_rejects_hidden_source_text_with_css_replacement(self) -> None:
         cache = self._browser_cache()
         harness = _load_harness()
         with tempfile.TemporaryDirectory() as raw:
@@ -1200,10 +1500,137 @@ class WebpageSkillRealBrowserTest(unittest.TestCase):
             )
 
             self.assertFalse(report["passed"])
-            interaction = json.loads(
-                (artifact / "interaction-audit.json").read_text(encoding="utf-8")
+            self.assertIn(
+                "css_generated_content",
+                {
+                    finding["code"]
+                    for finding in report["static"]["findings"]
+                },
             )
-            self.assertFalse(interaction["checks"]["no_javascript_core_visible"])
+
+    def test_no_javascript_gate_is_paint_aware_for_claim_evidence(self) -> None:
+        harness = _load_harness()
+        mutations = {
+            "transparent": 'style="color:transparent"',
+            "same-color": 'style="color:#f7f3ea"',
+            "clip": 'style="position:absolute;clip:rect(0 0 0 0)"',
+            "clip-path": 'style="clip-path:inset(50%)"',
+            "mask": 'style="-webkit-mask-image:linear-gradient(transparent,transparent);mask-image:linear-gradient(transparent,transparent)"',
+            "transform": 'style="transform:scale(0)"',
+            "translated-away": 'style="transform:translateX(-100000px)"',
+        }
+        for label, attribute in mutations.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as raw:
+                root = Path(raw)
+                _run, _attempt, artifact = self._author_browser_attempt(
+                    root,
+                    harness,
+                    lambda html, attribute=attribute: html.replace(
+                        '<p data-claim-id="claim-results">',
+                        f'<p {attribute} data-claim-id="claim-results">',
+                        1,
+                    ),
+                )
+
+                report = self._run_probe(root, harness, artifact)
+
+                self.assertFalse(report["passed"], (label, report))
+                self.assertFalse(
+                    report["checks"]["no_javascript_core_visible"], (label, report)
+                )
+
+    def test_browser_rejects_runtime_generated_unbound_assertions(self) -> None:
+        harness = _load_harness()
+        scripts = {
+            "text": (
+                "const note=document.createElement('p');"
+                "note.textContent='Unreviewed score: 99.9%';"
+                "document.querySelector('footer').append(note);"
+            ),
+            "pseudo": (
+                "const style=document.createElement('style');"
+                "style.textContent='footer::after{content:\"Unreviewed score: 99.9%\"}';"
+                "document.head.append(style);"
+            ),
+            "delayed-text": (
+                "setTimeout(()=>{const note=document.createElement('p');"
+                "note.textContent='Delayed unreviewed score: 99.9%';"
+                "document.querySelector('footer').append(note);},2000);"
+            ),
+            "mobile-only-text": (
+                "if(innerWidth<500){const note=document.createElement('p');"
+                "note.textContent='Mobile unreviewed score: 99.9%';"
+                "document.querySelector('footer').append(note);}"
+            ),
+            "split-formula": (
+                "const note=document.createElement('p');"
+                "note.innerHTML='E<span>=</span>mc';"
+                "document.querySelector('footer').append(note);"
+            ),
+        }
+        for label, script in scripts.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as raw:
+                root = Path(raw)
+                _run, _attempt, artifact = self._author_browser_attempt(
+                    root,
+                    harness,
+                    lambda html, script=script: html.replace(
+                        "</script>", script + "</script>", 1
+                    ),
+                )
+
+                report = self._run_probe(root, harness, artifact)
+
+                self.assertFalse(report["passed"], (label, report))
+                self.assertFalse(report["checks"]["runtime_source_grounding"])
+
+    def test_no_javascript_gate_rejects_claim_clipped_by_collapsed_ancestor(self) -> None:
+        harness = _load_harness()
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            _run, _attempt, artifact = self._author_browser_attempt(
+                root,
+                harness,
+                lambda html: html.replace(
+                    '<p data-claim-id="claim-results">',
+                    '<div style="height:0;overflow:hidden"><p data-claim-id="claim-results">',
+                    1,
+                ).replace(
+                    "</p><table><caption>Source-backed evidence coverage</caption>",
+                    "</p></div><table><caption>Source-backed evidence coverage</caption>",
+                    1,
+                ),
+            )
+
+            report = self._run_probe(root, harness, artifact)
+
+            self.assertFalse(report["passed"], report)
+            self.assertFalse(report["checks"]["no_javascript_core_visible"])
+
+    def test_reduced_motion_gate_rejects_persistent_raf_and_web_animations(self) -> None:
+        harness = _load_harness()
+        scripts = {
+            "raf": "function spin(){ requestAnimationFrame(spin); } spin();",
+            "web-animation": (
+                "document.getElementById('method-figure').animate("
+                "[{opacity:1},{opacity:.9}],{duration:1000,iterations:Infinity});"
+            ),
+        }
+        for label, script in scripts.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as raw:
+                root = Path(raw)
+                _run, _attempt, artifact = self._author_browser_attempt(
+                    root,
+                    harness,
+                    lambda html, script=script: html.replace(
+                        "</script>", script + "</script>", 1
+                    ),
+                )
+
+                report = self._run_probe(root, harness, artifact)
+
+                self.assertFalse(report["passed"], (label, report))
+                self.assertFalse(report["checks"]["delayed_tasks_quiescent"])
 
     def test_no_javascript_gate_rejects_css_hidden_claim_evidence(self) -> None:
         cache = self._browser_cache()

@@ -147,6 +147,19 @@ _MARKETING_PATTERNS = (
     re.compile(r"\bunlock the power\b", re.IGNORECASE),
     re.compile(r"\btransform your workflow\b", re.IGNORECASE),
 )
+_VISIBLE_URL = re.compile(r"https?://[^\s<>'\"]+", re.IGNORECASE)
+_VISIBLE_NUMBER = re.compile(r"(?<![\w])[-+]?\d[\d,]*(?:\.\d+)?(?:\s*[%‰])?")
+_VISIBLE_FORMULA = re.compile(
+    r"(?:\\\(|\\\[|\$[^$\n]+\$|\\(?:frac|sum|prod|sqrt|int)\b|"
+    r"[∑∏√∫≈≠≤≥±]|\b[A-Za-z][A-Za-z0-9_]*\s*(?:=|<=|>=|<|>)\s*[^,.;:]+|"
+    r"\^[{]?[-+]?\d)",
+    re.IGNORECASE,
+)
+_GENERATED_ARTIFACT_REPORTS = {
+    "browser-audit.json",
+    "interaction-audit.json",
+    "webpage-validation.json",
+}
 
 
 class WebpageHarnessError(RuntimeError):
@@ -197,6 +210,7 @@ class _DocumentParser(HTMLParser):
         self.stack = [self.root]
         self.doctype = False
         self.parse_errors: list[str] = []
+        self.duplicate_attributes: list[dict[str, Any]] = []
 
     def handle_decl(self, decl: str) -> None:
         if decl.strip().lower() == "doctype html":
@@ -205,7 +219,15 @@ class _DocumentParser(HTMLParser):
     def handle_starttag(
         self, tag: str, attrs: list[tuple[str, str | None]]
     ) -> None:
-        normalized = {str(key).lower(): str(value or "") for key, value in attrs}
+        normalized: dict[str, str] = {}
+        for key, value in attrs:
+            name = str(key).lower()
+            if name in normalized:
+                self.duplicate_attributes.append(
+                    {"tag": tag.lower(), "attribute": name, "line": self.getpos()[0]}
+                )
+                continue
+            normalized[name] = str(value or "")
         node = _Node(tag.lower(), normalized, self.stack[-1], self.getpos()[0])
         self.stack[-1].children.append(node)
         if node.tag not in VOID_TAGS:
@@ -398,6 +420,7 @@ def validate_webpage_plan(run_dir: Path | str, plan: Mapping[str, Any]) -> dict[
         raise WebpageContractError("plan requires semantic sections")
     section_ids: list[str] = []
     section_roles: list[str] = []
+    planned_claim_ids: set[str] = set()
     for section in sections:
         if not isinstance(section, dict):
             raise WebpageContractError("each section must be an object")
@@ -409,7 +432,12 @@ def validate_webpage_plan(run_dir: Path | str, plan: Mapping[str, Any]) -> dict[
             raise WebpageContractError("section ids must be stable HTML identifiers")
         if not role:
             raise WebpageContractError("each section requires a role")
-        _strings(section.get("claim_ids"), f"section {section_id} claim_ids", allow_empty=True)
+        claim_ids = _strings(
+            section.get("claim_ids"),
+            f"section {section_id} claim_ids",
+            allow_empty=True,
+        )
+        planned_claim_ids.update(claim_ids)
         section_ids.append(section_id)
         section_roles.append(role)
     if len(set(section_ids)) != len(section_ids) or len(set(section_roles)) != len(section_roles):
@@ -422,6 +450,16 @@ def validate_webpage_plan(run_dir: Path | str, plan: Mapping[str, Any]) -> dict[
     required_positions = [section_roles.index(role) for role in REQUIRED_SECTION_ROLES]
     if required_positions != sorted(required_positions):
         raise WebpageContractError("research sections must follow the evidence-first narrative order")
+    identity_claims = set(
+        sections[section_roles.index("identity")].get("claim_ids", [])
+    )
+    if {
+        str(value["title_claim_id"]),
+        str(value["thesis_claim_id"]),
+    } - identity_claims:
+        raise WebpageContractError(
+            "title and thesis claims must be declared by the identity section"
+        )
 
     allocations = value.get("visual_allocations")
     if not isinstance(allocations, list):
@@ -477,6 +515,10 @@ def validate_webpage_plan(run_dir: Path | str, plan: Mapping[str, Any]) -> dict[
         )
         if not claim_ids and not visual_ids:
             raise WebpageContractError("interaction must bind claims or source visuals")
+        if any(claim_id not in planned_claim_ids for claim_id in claim_ids):
+            raise WebpageContractError(
+                "interaction references claims outside the planned research claims"
+            )
         if any(visual_id not in allocated_visuals for visual_id in visual_ids):
             raise WebpageContractError("interaction references a visual outside the approved plan")
         for field in ("control_id", "target_id"):
@@ -731,6 +773,54 @@ def _normalized_claim_text(value: str) -> str:
     return " ".join(unicodedata.normalize("NFC", value).split())
 
 
+def _bound_claim_ancestor(node: _Node) -> _Node | None:
+    current: _Node | None = node
+    while current is not None and current.tag != "#document":
+        if _attr_tokens(current, "data-claim-id"):
+            return current
+        current = current.parent
+    return None
+
+
+def _inside_tag(node: _Node, tags: set[str]) -> bool:
+    current: _Node | None = node
+    while current is not None and current.tag != "#document":
+        if current.tag in tags:
+            return True
+        current = current.parent
+    return False
+
+
+def _visible_assertion_kind(node: _Node) -> str | None:
+    if _inside_tag(node, {"head", "script", "style", "template"}):
+        return None
+    text = _normalized_claim_text(" ".join(node.data))
+    if node.tag == "math":
+        return "formula"
+    if not text:
+        return None
+    if _VISIBLE_URL.search(text):
+        return "url"
+    if _VISIBLE_FORMULA.search(text):
+        return "formula"
+    if _VISIBLE_NUMBER.search(text):
+        return "numeric"
+    return None
+
+
+def _has_nonempty_pseudo_content(css: str) -> bool:
+    for rule in re.finditer(r"([^{}]+)\{([^{}]*)\}", css, re.DOTALL):
+        selector, declarations = rule.groups()
+        if not re.search(r"::?(?:before|after)\b", selector, re.IGNORECASE):
+            continue
+        for match in re.finditer(r"(?:^|;)\s*content\s*:\s*([^;}]+)", declarations, re.I):
+            value = re.sub(r"\s*!important\s*$", "", match.group(1)).strip()
+            if value.lower() in {"none", "normal", "''", '""'}:
+                continue
+            return True
+    return False
+
+
 def _finding(code: str, message: str, **details: Any) -> dict[str, Any]:
     return {"code": code, "message": message, **details}
 
@@ -776,8 +866,32 @@ def validate_webpage_html(run_dir: Path | str, attempt_id: str) -> dict[str, Any
         findings.append(_finding("missing_doctype", "use the HTML5 doctype"))
     if parser.parse_errors:
         findings.append(_finding("malformed_html", "; ".join(parser.parse_errors[:3])))
+    if parser.duplicate_attributes:
+        findings.append(
+            _finding(
+                "duplicate_attribute",
+                "duplicate HTML attributes are ambiguous and forbidden",
+                attributes=parser.duplicate_attributes,
+            )
+        )
     if duplicate_ids:
         findings.append(_finding("duplicate_ids", "HTML ids must be unique", ids=sorted(duplicate_ids)))
+    inline_handlers = sorted(
+        {
+            attribute
+            for node in nodes
+            for attribute in node.attrs
+            if attribute.lower().startswith("on")
+        }
+    )
+    if inline_handlers:
+        findings.append(
+            _finding(
+                "inline_event_handler",
+                "inline event handlers are forbidden; bind local behavior from a script",
+                attributes=inline_handlers,
+            )
+        )
 
     html_nodes = [node for node in nodes if node.tag == "html"]
     if len(html_nodes) != 1 or not html_nodes[0].attrs.get("lang", "").strip():
@@ -859,19 +973,33 @@ def validate_webpage_html(run_dir: Path | str, attempt_id: str) -> dict[str, Any
                     line=node.line,
                 )
             )
+    for node in nodes:
+        assertion_kind = _visible_assertion_kind(node)
+        if assertion_kind and _bound_claim_ancestor(node) is None:
+            findings.append(
+                _finding(
+                    "ungrounded_visible_assertion",
+                    "visible numeric, URL, and formula assertions must live inside an exact source claim node",
+                    kind=assertion_kind,
+                    line=node.line,
+                )
+            )
 
     role_nodes: dict[str, list[_Node]] = {}
     for node in nodes:
         role = node.attrs.get("data-section-role", "").strip()
         if role:
             role_nodes.setdefault(role, []).append(node)
-    for role in REQUIRED_SECTION_ROLES:
+    planned_roles = [str(section["role"]) for section in plan["sections"]]
+    planned_sections = {
+        str(section["role"]): section for section in plan["sections"]
+    }
+    for role in planned_roles:
         if len(role_nodes.get(role, [])) != 1:
             findings.append(_finding("section_role_count", f"require exactly one {role} section", role=role))
             continue
-        planned_id = next(
-            str(section["id"]) for section in plan["sections"] if section["role"] == role
-        )
+        planned_section = planned_sections[role]
+        planned_id = str(planned_section["id"])
         if role_nodes[role][0].attrs.get("id") != planned_id:
             findings.append(
                 _finding(
@@ -881,19 +1009,38 @@ def validate_webpage_html(run_dir: Path | str, attempt_id: str) -> dict[str, Any
                     actual=role_nodes[role][0].attrs.get("id", ""),
                 )
             )
+        section_node = role_nodes[role][0]
+        actual_claims = {
+            claim_id
+            for node in [section_node, *section_node.descendants()]
+            for claim_id in _attr_tokens(node, "data-claim-id")
+        }
+        expected_claims = set(planned_section.get("claim_ids", []))
+        if actual_claims != expected_claims:
+            findings.append(
+                _finding(
+                    "section_claim_mismatch",
+                    f"{role} must render exactly its planned source claims",
+                    role=role,
+                    missing=sorted(expected_claims - actual_claims),
+                    unexpected=sorted(actual_claims - expected_claims),
+                )
+            )
     visible_roles = [
         node.attrs.get("data-section-role")
         for node in nodes
-        if node.attrs.get("data-section-role") in REQUIRED_SECTION_ROLES
+        if node.attrs.get("data-section-role")
     ]
-    if visible_roles != list(REQUIRED_SECTION_ROLES):
+    if visible_roles != planned_roles:
         findings.append(_finding("section_order", "render the complete research narrative in plan order"))
     for role, candidates in role_nodes.items():
-        if role in REQUIRED_SECTION_ROLES and candidates and _inside_hidden(candidates[0]):
+        if role in planned_sections and candidates and _inside_hidden(candidates[0]):
             findings.append(_finding("hidden_core_section", f"{role} must be visible without JavaScript", role=role))
 
     h1_nodes = [node for node in nodes if node.tag == "h1"]
-    if len(h1_nodes) != 1 or plan["title_claim_id"] not in _attr_tokens(h1_nodes[0], "data-claim-id"):
+    if len(h1_nodes) != 1 or _attr_tokens(h1_nodes[0], "data-claim-id") != {
+        str(plan["title_claim_id"])
+    }:
         findings.append(_finding("paper_identity", "one visible h1 must bind the paper title claim"))
     identity = role_nodes.get("identity", [])
     thesis_nodes = [
@@ -903,6 +1050,15 @@ def validate_webpage_html(run_dir: Path | str, attempt_id: str) -> dict[str, Any
     ]
     if len(thesis_nodes) != 1:
         findings.append(_finding("missing_first_viewport_thesis", "identity must expose the source-backed thesis"))
+    elif _attr_tokens(thesis_nodes[0], "data-claim-id") != {
+        str(plan["thesis_claim_id"])
+    }:
+        findings.append(
+            _finding(
+                "thesis_claim_binding",
+                "the first-viewport thesis marker must itself be the exact thesis claim node",
+            )
+        )
 
     missing_markers = {
         marker
@@ -922,7 +1078,7 @@ def validate_webpage_html(run_dir: Path | str, attempt_id: str) -> dict[str, Any
 
     styles: list[tuple[str, Path]] = []
     scripts: list[str] = []
-    referenced_files: set[Path] = set()
+    referenced_files: set[Path] = {html_path.resolve()}
     for node in nodes:
         if node.tag == "style":
             styles.append((node.text(), artifact))
@@ -962,6 +1118,13 @@ def validate_webpage_html(run_dir: Path | str, attempt_id: str) -> dict[str, Any
                 else:
                     referenced_files.add(path)
     css = "\n".join(content for content, _base in styles)
+    if _has_nonempty_pseudo_content(css):
+        findings.append(
+            _finding(
+                "css_generated_content",
+                "non-empty CSS pseudo-element content is forbidden because it bypasses source binding",
+            )
+        )
     for content, base in styles:
         if re.search(r"@import\b", content, re.IGNORECASE):
             findings.append(_finding("remote_asset", "CSS @import is forbidden"))
@@ -1064,6 +1227,17 @@ def validate_webpage_html(run_dir: Path | str, attempt_id: str) -> dict[str, Any
     interactions = {str(item["id"]): item for item in plan["interactions"]}
     grounded_interactions = 0
     for interaction_id, interaction in interactions.items():
+        unmapped_interaction_claims = sorted(
+            set(interaction.get("claim_ids", [])) - set(source_claims)
+        )
+        if unmapped_interaction_claims:
+            findings.append(
+                _finding(
+                    "interaction_claim_unmapped",
+                    f"interaction {interaction_id} references claims outside the source map",
+                    ids=unmapped_interaction_claims,
+                )
+            )
         control = by_id.get(str(interaction["control_id"]))
         target = by_id.get(str(interaction["target_id"]))
         if control is None or target is None:
@@ -1167,6 +1341,59 @@ def validate_webpage_html(run_dir: Path | str, attempt_id: str) -> dict[str, Any
     if asset_files - referenced_files:
         findings.append(_finding("orphan_local_asset", "artifact contains unreferenced staged assets"))
 
+    artifact_files: dict[Path, str] = {}
+    unsafe_entries: list[str] = []
+    hardlinked_files: list[str] = []
+    for current, directories, files in os.walk(artifact, followlinks=False):
+        current_path = Path(current)
+        for name in directories:
+            path = current_path / name
+            if path.is_symlink():
+                unsafe_entries.append(path.relative_to(artifact).as_posix())
+        for name in files:
+            path = current_path / name
+            relative = path.relative_to(artifact).as_posix()
+            if path.is_symlink() or not path.is_file():
+                unsafe_entries.append(relative)
+                continue
+            resolved = path.resolve(strict=True)
+            artifact_files[resolved] = relative
+            if path.lstat().st_nlink > 1:
+                hardlinked_files.append(relative)
+    if unsafe_entries:
+        findings.append(
+            _finding(
+                "unsafe_artifact_entry",
+                "artifact closure must contain only ordinary local files and directories",
+                paths=sorted(unsafe_entries),
+            )
+        )
+    if hardlinked_files:
+        findings.append(
+            _finding(
+                "hardlinked_artifact_file",
+                "artifact files must own their bytes and cannot be hardlinked",
+                paths=sorted(hardlinked_files),
+            )
+        )
+    generated_reports = {
+        (artifact / name).resolve(strict=True)
+        for name in _GENERATED_ARTIFACT_REPORTS
+        if (artifact / name).is_file() and not (artifact / name).is_symlink()
+    }
+    unreachable = sorted(
+        artifact_files[path]
+        for path in set(artifact_files) - referenced_files - generated_reports
+    )
+    if unreachable:
+        findings.append(
+            _finding(
+                "unreachable_artifact_file",
+                "every authored artifact file must be reachable from index.html",
+                paths=unreachable,
+            )
+        )
+
     icon_nodes = [node for node in nodes if node.tag == "svg" and "data-icon" in node.attrs]
     if not 3 <= len(icon_nodes) <= 8:
         findings.append(_finding("functional_icon_count", "use 3-8 restrained functional inline SVG icons", actual=len(icon_nodes)))
@@ -1258,6 +1485,8 @@ BLOCK = r"""
   }
   if (navigator.sendBeacon) navigator.sendBeacon = deny('sendBeacon');
   const pending = new Set();
+  const pendingFrames = new Set();
+  const pendingAnimations = new Set();
   const nativeSetTimeout = globalThis.setTimeout.bind(globalThis);
   const nativeClearTimeout = globalThis.clearTimeout.bind(globalThis);
   const nativeSetInterval = globalThis.setInterval.bind(globalThis);
@@ -1280,11 +1509,79 @@ BLOCK = r"""
     return identifier;
   };
   globalThis.clearInterval = (identifier) => { pending.delete(identifier); return nativeClearInterval(identifier); };
-  Object.defineProperty(globalThis, '__autodesignPendingTimers', {
-    value: () => pending.size, configurable: false, writable: false
+  if (globalThis.requestAnimationFrame) {
+    const nativeRequestAnimationFrame = globalThis.requestAnimationFrame.bind(globalThis);
+    const nativeCancelAnimationFrame = globalThis.cancelAnimationFrame.bind(globalThis);
+    globalThis.requestAnimationFrame = callback => {
+      let identifier;
+      identifier = nativeRequestAnimationFrame(timestamp => {
+        pendingFrames.delete(identifier);
+        return callback(timestamp);
+      });
+      pendingFrames.add(identifier);
+      return identifier;
+    };
+    globalThis.cancelAnimationFrame = identifier => {
+      pendingFrames.delete(identifier);
+      return nativeCancelAnimationFrame(identifier);
+    };
+  }
+  if (globalThis.Element && Element.prototype.animate) {
+    const nativeAnimate = Element.prototype.animate;
+    Element.prototype.animate = function(...args) {
+      const animation = nativeAnimate.apply(this, args);
+      pendingAnimations.add(animation);
+      animation.finished.then(
+        () => pendingAnimations.delete(animation),
+        () => pendingAnimations.delete(animation),
+      );
+      return animation;
+    };
+  }
+  Object.defineProperty(globalThis, '__autodesignPendingWork', {
+    value: () => pending.size + pendingFrames.size + pendingAnimations.size
+      + document.getAnimations().filter(animation => !['finished','idle'].includes(animation.playState)).length,
+    configurable: false, writable: false
   });
 })();
 """
+
+GROUNDING = r"""contract => {
+  const normalized=value=>String(value||'').normalize('NFC').replace(/\s+/g,' ').trim();
+  const tokens=(el,name)=>(el.getAttribute(name)||'').split(/\s+/).filter(Boolean);
+  const expected=new Map((contract.source_claims||[]).map(item=>[String(item.id),normalized(item.text)]));
+  const visible=el=>{ if(!el)return false; for(let n=el;n;n=n.parentElement){const s=getComputedStyle(n);if(s.display==='none'||['hidden','collapse'].includes(s.visibility)||Number(s.opacity)<=.01)return false;}const r=el.getBoundingClientRect();return r.width>.5&&r.height>.5; };
+  const formula=/(?:\\\(|\\\[|\$[^$\n]+\$|\\(?:frac|sum|prod|sqrt|int)\b|[∑∏√∫≈≠≤≥±]|\b[A-Za-z][A-Za-z0-9_]*\s*(?:=|<=|>=|<|>)\s*[^,.;:]+|\^[{]?[-+]?\d)/i;
+  const assertion=/(?:https?:\/\/[^\s<>\"']+|(?<![\w])[-+]?\d[\d,]*(?:\.\d+)?(?:\s*[%‰])?)/i;
+  const claimNodes=[...document.querySelectorAll('[data-claim-id]')];
+  if(!claimNodes.every(el=>{const ids=tokens(el,'data-claim-id');return visible(el)&&ids.length===1&&expected.has(ids[0])&&normalized(el.innerText)===expected.get(ids[0]);}))return false;
+  if(![...expected].every(([id])=>claimNodes.some(el=>tokens(el,'data-claim-id').includes(id))))return false;
+  if(!(contract.sections||[]).every(section=>{
+    const roots=[...document.querySelectorAll('[data-section-role]')].filter(el=>el.getAttribute('data-section-role')===section.role);
+    if(roots.length!==1||roots[0].id!==section.id)return false;
+    const actual=[roots[0],...roots[0].querySelectorAll('[data-claim-id]')].flatMap(el=>tokens(el,'data-claim-id')).sort();
+    return JSON.stringify(actual)===JSON.stringify([...section.claim_ids].sort());
+  }))return false;
+  const h1=[...document.querySelectorAll('h1')];
+  if(h1.length!==1||JSON.stringify(tokens(h1[0],'data-claim-id'))!==JSON.stringify([contract.title_claim_id]))return false;
+  const thesis=[...document.querySelectorAll('[data-thesis-claim-id]')].filter(el=>el.getAttribute('data-thesis-claim-id')===contract.thesis_claim_id);
+  if(thesis.length!==1||JSON.stringify(tokens(thesis[0],'data-claim-id'))!==JSON.stringify([contract.thesis_claim_id]))return false;
+  const unboundText=el=>{
+    const walker=document.createTreeWalker(el,NodeFilter.SHOW_TEXT); let node, text='';
+    while((node=walker.nextNode())){
+      if(visible(node.parentElement)&&!node.parentElement.closest('[data-claim-id]'))text+=node.data;
+    }
+    return normalized(text);
+  };
+  if([...document.body.querySelectorAll('*')].some(el=>{
+    if(!visible(el)||el.closest('[data-claim-id]'))return false;
+    const text=unboundText(el); return Boolean(text&&(assertion.test(text)||formula.test(text)));
+  }))return false;
+  return [...document.body.querySelectorAll('*')].every(el=>['::before','::after'].every(pseudo=>{
+    const content=getComputedStyle(el,pseudo).content;
+    return !content||['none','normal','\"\"',"''"].includes(content);
+  }));
+}"""
 
 def inside(path, root):
   try: path.relative_to(root); return True
@@ -1310,7 +1607,7 @@ def main():
     c.add_init_script(BLOCK); c.on('weberror',lambda error: page_errors.append(type(error).__name__)); c.on('requestfailed',lambda request: request_errors.append(urlsplit(request.url).scheme or 'unknown'))
     return c
   result={'format_version':1,'passed':False,'checks':{},'interactions':[]}
-  nojs_ok=False; motion_ok=False; internal_ok=False; mobile_ok=False; identity_ok=False; timers_ok=False
+  nojs_ok=False; motion_ok=False; internal_ok=False; mobile_ok=False; identity_ok=False; timers_ok=False; runtime_grounding_ok=False
   try:
     with sync_playwright() as pw:
       browser=pw.chromium.launch(headless=True,args=FLAGS)
@@ -1329,6 +1626,8 @@ def main():
           const identity=document.querySelector('[data-section-role="identity"]');
           return aboveFold(identity) && aboveFold(h1) && aboveFold(thesis);
         }""",plan))
+        page.evaluate("() => document.activeElement && document.activeElement.blur()")
+        tab_limit=max(8,page.locator('a[href],button:not([disabled]),input:not([disabled]),select:not([disabled]),textarea:not([disabled]),[tabindex]').count()+3)
         for item in plan['interactions']:
           control=page.locator('#'+item['control_id']); target=page.locator('#'+item['target_id']); state=item['state_attribute']
           ok=control.count()==1 and target.count()==1 and control.is_visible() and target.is_visible()
@@ -1336,16 +1635,20 @@ def main():
             ok=bool(control.evaluate("""el => { for(let n=el;n;n=n.parentElement){const s=getComputedStyle(n);if(s.display==='none'||s.visibility==='hidden'||Number(s.opacity)<=0)return false;}return true; }""") and target.evaluate("""el => { for(let n=el;n;n=n.parentElement){const s=getComputedStyle(n);if(s.display==='none'||s.visibility==='hidden'||Number(s.opacity)<=0)return false;}return true; }"""))
           before=control.get_attribute(state) if ok else None; target_before=None; focus_visible=False; scroll_before=None
           if ok:
-            page.evaluate("() => document.activeElement && document.activeElement.blur()")
             baseline=control.evaluate("""el => { const s=getComputedStyle(el); return {color:s.color,background:s.backgroundColor,border:s.border,boxShadow:s.boxShadow,textDecoration:s.textDecorationLine}; }""")
-            page.keyboard.press('Tab'); control.focus()
+            reachable=False
+            for _ in range(tab_limit):
+              page.keyboard.press('Tab')
+              if control.evaluate('(el)=>document.activeElement===el'):
+                reachable=True; break
             focused=control.evaluate("""el => { const s=getComputedStyle(el); return {matches:el.matches(':focus-visible'),outlineStyle:s.outlineStyle,outlineWidth:s.outlineWidth,outlineColor:s.outlineColor,color:s.color,background:s.backgroundColor,border:s.border,boxShadow:s.boxShadow,textDecoration:s.textDecorationLine}; }""")
             outline=focused['outlineStyle']!='none' and float((focused['outlineWidth'] or '0px').replace('px','') or 0)>0 and focused['outlineColor'] not in {'transparent','rgba(0, 0, 0, 0)'}
             delta=any(baseline.get(key)!=focused.get(key) for key in ('color','background','border','boxShadow','textDecoration'))
-            focus_visible=bool(focused['matches'] and (outline or focused['boxShadow']!='none' or delta))
+            focus_visible=bool(reachable and focused['matches'] and (outline or focused['boxShadow']!='none' or delta))
             target_before=target.evaluate("""el => { const s=getComputedStyle(el), r=el.getBoundingClientRect(); return {text:el.innerText,display:s.display,visibility:s.visibility,opacity:s.opacity,color:s.color,background:s.backgroundColor,border:s.border,boxShadow:s.boxShadow,outline:s.outline,transform:s.transform,filter:s.filter,x:r.x+scrollX,y:r.y+scrollY,width:r.width,height:r.height}; }""")
             scroll_before=page.evaluate('() => ({x:scrollX,y:scrollY})')
-            control.press('Enter'); page.wait_for_timeout(100)
+            if reachable: control.press('Enter'); page.wait_for_timeout(100)
+            else: ok=False
           after=control.get_attribute(state) if ok else None
           target_after=target.evaluate("""el => { const s=getComputedStyle(el), r=el.getBoundingClientRect(); return {text:el.innerText,display:s.display,visibility:s.visibility,opacity:s.opacity,color:s.color,background:s.backgroundColor,border:s.border,boxShadow:s.boxShadow,outline:s.outline,transform:s.transform,filter:s.filter,x:r.x+scrollX,y:r.y+scrollY,width:r.width,height:r.height}; }""") if ok else None
           scrolled=bool(ok and item.get('kind')=='navigate' and scroll_before!=page.evaluate('() => ({x:scrollX,y:scrollY})'))
@@ -1353,10 +1656,11 @@ def main():
           ok=bool(ok and target.is_visible() and before!=after and target_changed and focus_visible and control.evaluate('(el)=>document.activeElement===el'))
           interactions.append({'id':item['id'],'passed':ok,'state_changed':before!=after,'target_changed':target_changed,'focus_indicator_visible':focus_visible})
         try:
-          page.wait_for_function("() => typeof globalThis.__autodesignPendingTimers==='function' && globalThis.__autodesignPendingTimers()===0",timeout=2500)
+          page.wait_for_function("() => typeof globalThis.__autodesignPendingWork==='function' && globalThis.__autodesignPendingWork()===0",timeout=2500)
           page.wait_for_timeout(100); timers_ok=True
         except Exception:
           timers_ok=False
+        runtime_grounding_ok=bool(page.evaluate(GROUNDING,plan))
         c.close()
         c=context(browser,reduced=True,width=390,height=844); mobile=c.new_page(); mobile.goto(html.as_uri(),wait_until='load',timeout=30000); mobile.wait_for_timeout(50)
         usable=0
@@ -1366,18 +1670,19 @@ def main():
             control.scroll_into_view_if_needed(); box=control.bounding_box(); style=control.evaluate("""el => { let visible=true; for(let n=el;n;n=n.parentElement){const s=getComputedStyle(n);if(s.display==='none'||s.visibility==='hidden'||Number(s.opacity)<=0)visible=false;} return {visible,pointer:getComputedStyle(el).pointerEvents}; }""")
             target_visible=target.evaluate("""el => { for(let n=el;n;n=n.parentElement){const s=getComputedStyle(n);if(s.display==='none'||s.visibility==='hidden'||Number(s.opacity)<=0)return false;}return true; }""")
             if box and style['visible'] and target_visible and box['width']>=24 and box['height']>=24 and box['x']>=0 and box['x']+box['width']<=390 and style['pointer']!='none':
-              before=control.get_attribute(state); control.focus()
+              before=control.get_attribute(state)
               target_before=target.evaluate("""el => { const s=getComputedStyle(el), r=el.getBoundingClientRect(); return {text:el.innerText,display:s.display,visibility:s.visibility,opacity:s.opacity,color:s.color,background:s.backgroundColor,border:s.border,boxShadow:s.boxShadow,outline:s.outline,transform:s.transform,filter:s.filter,x:r.x+scrollX,y:r.y+scrollY,width:r.width,height:r.height}; }""")
-              scroll_before=mobile.evaluate('() => ({x:scrollX,y:scrollY})'); control.press('Enter'); mobile.wait_for_timeout(100)
+              scroll_before=mobile.evaluate('() => ({x:scrollX,y:scrollY})'); control.click(); mobile.wait_for_timeout(100)
               target_after=target.evaluate("""el => { const s=getComputedStyle(el), r=el.getBoundingClientRect(); return {text:el.innerText,display:s.display,visibility:s.visibility,opacity:s.opacity,color:s.color,background:s.backgroundColor,border:s.border,boxShadow:s.boxShadow,outline:s.outline,transform:s.transform,filter:s.filter,x:r.x+scrollX,y:r.y+scrollY,width:r.width,height:r.height}; }""")
               scrolled=item.get('kind')=='navigate' and scroll_before!=mobile.evaluate('() => ({x:scrollX,y:scrollY})')
-              if before!=control.get_attribute(state) and (target_before!=target_after or scrolled) and target.is_visible(): usable+=1
+              if item.get('kind') in {'inspect','compare'} and before!=control.get_attribute(state) and (target_before!=target_after or scrolled) and target.is_visible(): usable+=1
         mobile_ok=usable>=1
         try:
-          mobile.wait_for_function("() => typeof globalThis.__autodesignPendingTimers==='function' && globalThis.__autodesignPendingTimers()===0",timeout=2500)
+          mobile.wait_for_function("() => typeof globalThis.__autodesignPendingWork==='function' && globalThis.__autodesignPendingWork()===0",timeout=2500)
           mobile.wait_for_timeout(100)
         except Exception:
           timers_ok=False
+        runtime_grounding_ok=bool(runtime_grounding_ok and mobile.evaluate(GROUNDING,plan))
         c.close()
         c=context(browser,javascript=False,reduced=True); nojs=c.new_page(); nojs.goto(html.as_uri(),wait_until='load',timeout=30000)
         roles=['identity','abstract','method','evidence','results','limitations','resources','citation']
@@ -1387,15 +1692,44 @@ def main():
         claim_ids=sorted({plan['title_claim_id'],plan['thesis_claim_id'],*(claim for section in plan['sections'] for claim in section['claim_ids'])})
         visual_ids=sorted({item['visual_id'] for item in plan['visual_allocations']})
         nojs_ok=nojs_ok and bool(nojs.evaluate("""expected => {
-          const visible = el => { if (!el) return false; for (let n=el;n;n=n.parentElement) { const s=getComputedStyle(n); if (s.display==='none'||s.visibility==='hidden'||Number(s.opacity)<=0) return false; } const r=el.getBoundingClientRect(); return r.width>0 && r.height>0; };
-          const tokenVisible = (attribute,id) => [...document.querySelectorAll('['+attribute+']')].some(el => (el.getAttribute(attribute)||'').split(/\s+/).includes(id) && visible(el));
+          const intersect = (a,b) => ({left:Math.max(a.left,b.left),top:Math.max(a.top,b.top),right:Math.min(a.right,b.right),bottom:Math.min(a.bottom,b.bottom)});
+          const area = r => Math.max(0,r.right-r.left)*Math.max(0,r.bottom-r.top);
+          const color = value => { const m=String(value||'').match(/rgba?\(([^)]+)\)/i); if(!m)return null; const p=m[1].split(/[\s,\/]+/).filter(Boolean).map(Number); return {r:p[0],g:p[1],b:p[2],a:p.length>3?p[3]:1}; };
+          const luminance = c => { const f=v=>{v/=255;return v<=.04045?v/12.92:Math.pow((v+.055)/1.055,2.4);}; return .2126*f(c.r)+.7152*f(c.g)+.0722*f(c.b); };
+          const contrast = (a,b) => { const x=luminance(a),y=luminance(b); return (Math.max(x,y)+.05)/(Math.min(x,y)+.05); };
+          const background = el => { for(let n=el;n;n=n.parentElement){const c=color(getComputedStyle(n).backgroundColor);if(c&&c.a>=.99)return c;}return {r:255,g:255,b:255,a:1}; };
+          const visibleRect = el => {
+            if(!el)return null; let result=el.getBoundingClientRect(); if(area(result)<=.5)return null;
+            result=intersect(result,{left:0,top:0,right:document.documentElement.scrollWidth,bottom:document.documentElement.scrollHeight}); if(area(result)<=.5)return null;
+            for(let n=el;n;n=n.parentElement){
+              const s=getComputedStyle(n), r=n.getBoundingClientRect();
+              if(s.display==='none'||['hidden','collapse'].includes(s.visibility)||Number(s.opacity)<=.01||s.contentVisibility==='hidden')return null;
+              const clip=String(s.clip||'auto').replace(/\s+/g,'').toLowerCase();
+              if(s.clipPath!=='none'||(clip!=='auto'&&clip!=='rect(auto,auto,auto,auto)')||(s.maskImage&&s.maskImage!=='none')||(s.webkitMaskImage&&s.webkitMaskImage!=='none'))return null;
+              if(/opacity\(\s*0(?:\.0+)?\s*\)/i.test(s.filter||''))return null;
+              if(n===el||['hidden','clip','scroll','auto'].includes(s.overflowX)||['hidden','clip','scroll','auto'].includes(s.overflowY))result=intersect(result,r);
+              if(area(result)<=.5)return null;
+            }
+            return result;
+          };
+          const textPainted = el => {
+            const walker=document.createTreeWalker(el,NodeFilter.SHOW_TEXT); let node,seen=false;
+            while((node=walker.nextNode())){
+              if(!String(node.data||'').trim())continue; seen=true; const parent=node.parentElement, box=visibleRect(parent); if(!box)return false;
+              const s=getComputedStyle(parent), fill=color(s.webkitTextFillColor), ink=fill||color(s.color); if(!ink||ink.a<=.01||contrast(ink,background(parent))<1.2)return false;
+              const range=document.createRange(); range.selectNodeContents(node); const painted=[...range.getClientRects()].some(rect=>area(intersect(rect,box))>.5); range.detach(); if(!painted)return false;
+            }
+            return seen;
+          };
+          const visible = (el,text=false) => Boolean(visibleRect(el)) && (!text||textPainted(el));
+          const tokenVisible = (attribute,id,text=false) => [...document.querySelectorAll('['+attribute+']')].some(el => (el.getAttribute(attribute)||'').split(/\s+/).includes(id) && visible(el,text));
           const normalized = value => String(value||'').normalize('NFC').replace(/\s+/g,' ').trim();
-          const claimVisible = id => [...document.querySelectorAll('[data-claim-id]')].some(el => (el.getAttribute('data-claim-id')||'').split(/\s+/).includes(id) && visible(el) && (!expected.text[id] || normalized(el.innerText)===normalized(expected.text[id])));
-          return expected.claims.every(claimVisible) && expected.visuals.every(id => tokenVisible('data-source-id',id)) && expected.missing.every(id => tokenVisible('data-missing-metadata',id));
+          const claimVisible = id => [...document.querySelectorAll('[data-claim-id]')].some(el => (el.getAttribute('data-claim-id')||'').split(/\s+/).includes(id) && visible(el,true) && (!expected.text[id] || normalized(el.innerText)===normalized(expected.text[id])));
+          return expected.claims.every(claimVisible) && expected.visuals.every(id => tokenVisible('data-source-id',id)) && expected.missing.every(id => tokenVisible('data-missing-metadata',id,true));
         }""",{'claims':claim_ids,'text':claims,'visuals':visual_ids,'missing':plan['missing_metadata']}))
         c.close()
       finally: browser.close()
-    checks={'no_javascript_core_visible':bool(nojs_ok),'keyboard_interactions':bool(interactions) and all(x['passed'] for x in interactions),'observable_interaction_effects':bool(interactions) and all(x['target_changed'] for x in interactions),'mobile_interaction_available':bool(mobile_ok),'desktop_identity_thesis_above_fold':bool(identity_ok),'focus_indicators_visible':bool(interactions) and all(x['focus_indicator_visible'] for x in interactions),'reduced_motion_effective':bool(motion_ok),'internal_links_resolve':bool(internal_ok),'delayed_tasks_quiescent':bool(timers_ok),'no_network_attempts':not blocked and not request_errors,'no_page_errors':not page_errors}
+    checks={'no_javascript_core_visible':bool(nojs_ok),'runtime_source_grounding':bool(runtime_grounding_ok),'keyboard_interactions':bool(interactions) and all(x['passed'] for x in interactions),'observable_interaction_effects':bool(interactions) and all(x['target_changed'] for x in interactions),'mobile_interaction_available':bool(mobile_ok),'desktop_identity_thesis_above_fold':bool(identity_ok),'focus_indicators_visible':bool(interactions) and all(x['focus_indicator_visible'] for x in interactions),'reduced_motion_effective':bool(motion_ok),'internal_links_resolve':bool(internal_ok),'delayed_tasks_quiescent':bool(timers_ok),'no_network_attempts':not blocked and not request_errors,'no_page_errors':not page_errors}
     result={'format_version':1,'passed':all(checks.values()),'checks':checks,'interactions':interactions,'blocked_request_count':len(blocked),'request_error_count':len(request_errors),'page_error_count':len(page_errors)}
   except Exception as error:
     result={'format_version':1,'passed':False,'checks':{},'interactions':interactions,'runtime_error':type(error).__name__}
@@ -1493,6 +1827,8 @@ def _artifact_files(attempt: Path) -> list[str]:
             path = current_path / name
             if path.is_symlink() or not path.is_file():
                 raise WebpageContractError("artifact closure contains a non-regular file")
+            if path.lstat().st_nlink > 1:
+                raise WebpageContractError("artifact closure must not contain hardlinked files")
             result.append(f"artifact/{path.relative_to(artifact).as_posix()}")
     return sorted(result)
 

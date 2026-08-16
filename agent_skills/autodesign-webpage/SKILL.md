@@ -68,8 +68,13 @@ files only; use inline SVG only for restrained functional icons. Bind visible
 claims with `data-claim-id`, and make the normalized visible text of each
 binding exactly match that claim's source-map text. Bind source visuals with
 `data-source-id`, sections with `data-section-role`, and interactions with the
-IDs and accessible state in the plan. Copy no text, logos, claims, figures,
-links, or codes from style references.
+IDs and accessible state in the plan. Every section must contain exactly its
+planned claim IDs; the thesis marker must itself be the exact thesis claim
+node. Put every visible number, URL, or formula inside an exact claim binding.
+Do not synthesize visible text with CSS pseudo-elements, duplicate attributes,
+or inline `on*` handlers, including through runtime DOM/style injection. Scripts
+must not mutate exact claim text after load. Copy no text, logos, claims,
+figures, links, or codes from style references.
 
 Write a source-map claims JSON, then validate:
 
@@ -81,7 +86,13 @@ python3 "$HARNESS" validate --run-dir "$RUN_DIR" --attempt "$ATTEMPT_ID"
 Validation is deterministic-first and renders desktop/mobile screenshots in a
 pinned offline Chromium runtime. It also checks keyboard activation, no-JS core
 content, reduced motion, internal links, local asset closure, source hashes, and
-responsive geometry. Do not waive a failing check. Begin the next attempt and
+responsive geometry. Controls must be reachable by sequential keyboard focus;
+at 390 px, an actual `inspect` or `compare` interaction must remain usable.
+Paint-transparent, clipped, masked, transformed-away, or collapsed evidence is
+not visible. Persistent timers, animation frames, and Web Animations fail the
+quiescence gate. Only `index.html`, files it reaches locally, and harness-written
+audit reports may exist in `artifact/`; do not add scratch or hardlinked files.
+Do not waive a failing check. Begin the next attempt and
 repair only reported regions; preserve every prior attempt. Every repair must
 capture the new `attempt_id` returned by `begin` into `ATTEMPT_ID` before any
 stage, source-map, validate, review, or finalize command. After resuming an
