@@ -32,6 +32,9 @@ Score every dimension from 1 through 5:
 Any invented/unbound claim, unsafe asset, unreadable evidence, nondeterministic
 motion, clipped narration, forced/burned-in-only subtitles, or invalid media
 contract is a blocker. Localized repairs name scene IDs and concrete changes.
+For `verdict: "pass"`, every dimension must independently score at least 4/5;
+an average score cannot compensate for a weaker dimension. Missing, Boolean,
+NaN, infinite, or out-of-range scores are invalid.
 
 Return this exact JSON shape, copying every hash from `review-context` without
 alteration:
@@ -68,4 +71,6 @@ alteration:
 context. A passing verdict requires no blockers. Use `needs_visual_review` only
 when actual visual inspection was impossible, never as a substitute for a
 partial review. Stale hashes, skipped frames, missing dimensions, a self-review,
-or a review from another attempt are rejected.
+or a review from another attempt are rejected. `record-review`, `resume`, and
+`finalize` each revalidate the bound rubric hash, complete score vector, and
+per-dimension passing threshold before advancing.

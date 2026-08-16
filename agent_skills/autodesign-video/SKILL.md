@@ -20,8 +20,11 @@ browsers, virtual environments, or `node_modules` inside the installed Skill.
 
 ## Execute
 
-Run `python "$SKILL_ROOT/scripts/video_harness.py" --help` and
-`python "$SKILL_ROOT/scripts/setup_video.py" --help` for exact flags.
+Choose a supported Python launcher first: try `python3 --version`, then
+`python --version`, and on Windows `py -3 --version`; use the first command
+that reports Python 3.10–3.12. Run that exact launcher (including both tokens
+in `py -3`) with `$SKILL_ROOT/scripts/video_harness.py --help` and
+`$SKILL_ROOT/scripts/setup_video.py --help` for exact flags.
 
 1. Run `doctor`. If it reports a missing runtime, run `setup`. Setup requires
    Node 22+, npm, ffmpeg, ffprobe, and Python 3.10–3.12. It installs exact
@@ -85,7 +88,9 @@ Run `python "$SKILL_ROOT/scripts/video_harness.py" --help` and
    Windows compatibility and recovers interrupted stage/backup transactions;
    copy failures are retryable and never expose a partial live artifact. Hidden
    files, `.env`, debug files, and unreferenced assets fail instead of leaking
-   into the artifact.
+   into the artifact. Before any generated media is written, every existing
+   project path is checked for symlink, hard-link, and containment escapes.
+   Published delivery reports use only stable project-relative paths.
 7. Run `review-context RUN ID`. Give the exact MP4, narration WAV, contact sheet,
    and all six individual frames to a fresh vision- and audio-capable host or
    subagent that did not author the project. The returned context exposes
@@ -95,6 +100,8 @@ Run `python "$SKILL_ROOT/scripts/video_harness.py" --help` and
    return the exact
    hash-bound schema in [review-rubric.md](references/review-rubric.md). Record
    it with `record-review`; never infer visual quality from HTML or self-certify.
+   A passing verdict requires every rubric dimension to score at least 4/5;
+   there is no averaging exception.
 8. If an authoring gate fails, start the next bounded attempt and repair the
    localized findings. If setup, TTS execution, ffmpeg, ffprobe, or another
    deterministic runtime stage fails, repair the runtime and resume the same

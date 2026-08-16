@@ -90,7 +90,10 @@ scripts, styles, media, iframes, executable downloads, dynamic `new Image`,
 `fetch`, XHR, WebSocket, EventSource, `sendBeacon`, dynamic imports, and CSS
 URLs that are absolute, encoded escapes, or traverse `..`. Every project path
 stays inside the project and is neither a symlink nor hard link. Rendering runs
-without provider credentials. A real Chromium preflight blocks non-project
+without provider credentials. Before TTS or any other generated output is
+written, the complete existing project tree and pipeline-owned `narration`,
+`assets`, `renders`, and `frames` paths are checked for linked ancestors,
+linked targets, and containment escapes. A real Chromium preflight blocks non-project
 requests and enumerates every visible enabled native or ARIA control, including
 buttons, supported inputs, selects, textareas, summaries, anchors, and custom
 roles. It operates each one and records a unique identity, operation, and
@@ -152,10 +155,14 @@ The selected attempt retains and hash-binds:
 
 Finalization is forbidden unless every delivered byte, preview, source map,
 review context, and reviewer verdict still matches its recorded hash. Before
-publishing, the project must equal the plan-derived allowlist exactly. Hidden
+passing semantic review, all seven rubric dimensions must be present, finite,
+and at least 4/5; record, resume, and finalize all revalidate that threshold and
+the current rubric binding. Before publishing, the project must equal the
+plan-derived allowlist exactly. Hidden
 files, `.env`, logs, render scratch files, and unreferenced assets are rejected,
-not copied. Allowlisted files are copied into a same-parent staging directory
-and atomically promoted only after the staged set is complete. Because portable
+not copied. Published reports contain only stable project-relative paths, never
+machine-local absolute paths. Allowlisted files are copied into a same-parent
+staging directory and atomically promoted only after the staged set is complete. Because portable
 run creation pre-creates an empty `artifact/`, promotion first atomically moves
 that placeholder to a same-parent empty backup, then renames the complete stage
 into the now-absent destination; this works on Windows, where replacing an

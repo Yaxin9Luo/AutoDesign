@@ -23,6 +23,9 @@ from pathlib import Path
 from typing import Callable, Mapping, Sequence
 
 
+sys.dont_write_bytecode = True
+
+
 SCRIPT_DIR = Path(__file__).resolve().parent
 SKILL_ROOT = SCRIPT_DIR.parent
 if str(SCRIPT_DIR) not in sys.path:

@@ -512,6 +512,59 @@ class AutoDesignVideoSkillTests(unittest.TestCase):
         self.assertIsNotNone(module, f"missing standalone video implementation: {path}")
         return module
 
+    def _review_ready_run(
+        self,
+        harness: object,
+        name: str,
+    ) -> tuple[Path, str, dict[str, object]]:
+        source = self.root / f"{name}-source.md"
+        plan = _plan()
+        source.write_text(
+            "# Grounded video\n\n"
+            + "\n\n".join(str(claim["text"]) for claim in _claims(plan))
+            + "\n",
+            encoding="utf-8",
+        )
+        run = self.root / name
+        harness.core.initialize_run(run, SKILL_ROOT, release_version="0.1.0")
+        harness.core.prepare_source(run, source)
+        harness.core.save_plan(run, plan)
+        attempt_id = harness.begin_video_attempt(run)
+        project = _write_project(self.root / f"{name}-project", plan)
+        report = harness.deliver_project(
+            project,
+            plan,
+            _fake_runtime(self.root / f"{name}-runtime"),
+            claims=_claims(plan),
+            canonical_plan_sha256=harness.sha256_file(run / "plan.json"),
+            smoke=True,
+        )
+        self.assertTrue(report["passed"], report)
+        harness.record_attempt_delivery(
+            run, attempt_id, project, report, claims=_claims(plan)
+        )
+        context = harness.create_video_review_context(run, attempt_id)
+        review: dict[str, object] = {
+            "format_version": 1,
+            "attempt_id": attempt_id,
+            "review_context_sha256": context["context_sha256"],
+            "artifact_hashes": context["artifact_hashes"],
+            "preview_hashes": context["preview_hashes"],
+            "reviewed_frame_ids": sorted(context["preview_hashes"]),
+            "source_manifest_sha256": context["source_manifest_sha256"],
+            "source_map_sha256": context["source_map_sha256"],
+            "rubric_sha256": context["rubric_sha256"],
+            "reviewer_mode": "fresh_host_vlm",
+            "dimension_scores": {
+                name: 5 for name in harness.REVIEW_RUBRIC["dimensions"]
+            },
+            "blockers": [],
+            "localized_repairs": [],
+            "verdict": "pass",
+            "complete": True,
+        }
+        return run, attempt_id, review
+
     def test_cli_help_exposes_complete_video_lifecycle(self) -> None:
         completed = subprocess.run(
             [sys.executable, str(HARNESS_PATH), "--help"],
@@ -547,6 +600,214 @@ class AutoDesignVideoSkillTests(unittest.TestCase):
         self.assertNotEqual(unbound_delivery.returncode, 0)
         for required in ("--run", "--attempt", "--claims"):
             self.assertIn(required, unbound_delivery.stderr)
+
+    def test_help_keeps_fresh_writable_skill_tree_byte_identical(self) -> None:
+        def fingerprint(root: Path) -> dict[str, str]:
+            return {
+                path.relative_to(root).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+                for path in sorted(root.rglob("*"))
+                if path.is_file()
+            }
+
+        for entrypoint in ("video_harness.py", "setup_video.py"):
+            with self.subTest(entrypoint=entrypoint):
+                installed = self.root / f"installed-{entrypoint}"
+                shutil.copytree(SKILL_ROOT, installed)
+                before = fingerprint(installed)
+                child_env = dict(os.environ)
+                child_env.pop("PYTHONDONTWRITEBYTECODE", None)
+                child_env.pop("PYTHONPYCACHEPREFIX", None)
+                completed = subprocess.run(
+                    [sys.executable, str(installed / "scripts" / entrypoint), "--help"],
+                    cwd=self.root,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                    env=child_env,
+                )
+                self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+                self.assertEqual(fingerprint(installed), before)
+                self.assertFalse(any(installed.rglob("__pycache__")))
+
+    def test_video_review_pass_requires_every_dimension_at_least_four(self) -> None:
+        harness = self._require(self.harness, HARNESS_PATH)
+        run, attempt_id, review = self._review_ready_run(harness, "review-threshold")
+        context = json.loads(
+            (run / "attempts" / attempt_id / "qa" / "review-context.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(context["rubric"]["minimum_passing_score_per_dimension"], 4)
+        scores = review["dimension_scores"]
+        self.assertIsInstance(scores, dict)
+
+        for label, mutate in (
+            ("below", lambda value: value.update({name: 1 for name in value})),
+            ("missing", lambda value: value.pop(next(iter(value)))),
+            ("nonfinite", lambda value: value.update({next(iter(value)): float("nan")})),
+        ):
+            with self.subTest(label=label):
+                candidate = json.loads(json.dumps(review))
+                candidate_scores = candidate["dimension_scores"]
+                self.assertIsInstance(candidate_scores, dict)
+                mutate(candidate_scores)
+                with self.assertRaisesRegex(
+                    harness.VideoContractError,
+                    "dimension|score|4",
+                ):
+                    harness.record_video_semantic_review(run, attempt_id, candidate)
+                self.assertFalse(
+                    (run / "attempts" / attempt_id / "qa" / "semantic-review.json").exists()
+                )
+
+        review["dimension_scores"] = {
+            name: 4 for name in harness.REVIEW_RUBRIC["dimensions"]
+        }
+        recorded = harness.record_video_semantic_review(run, attempt_id, review)
+        self.assertEqual(min(recorded["dimension_scores"].values()), 4)
+        self.assertEqual(json.loads((run / "run.json").read_text())["state"], "semantic_passed")
+
+    def test_resume_and_finalize_revalidate_persisted_video_review(self) -> None:
+        harness = self._require(self.harness, HARNESS_PATH)
+
+        low_run, low_attempt, low_review = self._review_ready_run(
+            harness, "persisted-low-review"
+        )
+        low_review["dimension_scores"] = {
+            name: 1 for name in harness.REVIEW_RUBRIC["dimensions"]
+        }
+        harness.core.record_semantic_review(low_run, low_attempt, low_review)
+        for operation in (
+            lambda: harness.resume_video_run(low_run),
+            lambda: harness.finalize_video_attempt(low_run, low_attempt),
+        ):
+            with self.assertRaisesRegex(harness.VideoContractError, "4"):
+                operation()
+        self.assertFalse((low_run / "final").exists())
+
+        stale_run, stale_attempt, stale_review = self._review_ready_run(
+            harness, "persisted-stale-review"
+        )
+        harness.core.record_semantic_review(stale_run, stale_attempt, stale_review)
+        review_path = stale_run / "attempts" / stale_attempt / "qa" / "semantic-review.json"
+        persisted = json.loads(review_path.read_text(encoding="utf-8"))
+        persisted["review_context_sha256"] = "0" * 64
+        review_path.write_text(json.dumps(persisted) + "\n", encoding="utf-8")
+        for operation in (
+            lambda: harness.resume_video_run(stale_run),
+            lambda: harness.finalize_video_attempt(stale_run, stale_attempt),
+        ):
+            with self.assertRaises(harness.core.ContractError):
+                operation()
+        self.assertFalse((stale_run / "final").exists())
+
+    def test_passing_delivery_report_uses_only_portable_project_relative_paths(self) -> None:
+        harness = self._require(self.harness, HARNESS_PATH)
+        plan = _plan()
+        project = _write_project(self.root / "portable-report", plan)
+        navigation = (project / "index.html").as_uri() + "#scene_01"
+        report = harness.deliver_project(
+            project,
+            plan,
+            _fake_runtime(
+                self.root / "portable-report-runtime",
+                control_results=[
+                    {
+                        "identity": {
+                            "token": "control-1",
+                            "tag": "a",
+                            "id": "",
+                            "type": "",
+                            "role": "",
+                            "name": "",
+                            "aria_label": "Start",
+                            "href": "#scene_01",
+                            "text": "Start",
+                        },
+                        "kind": "anchor",
+                        "operation": "click",
+                        "result": "ok",
+                        "navigation": navigation,
+                    }
+                ],
+            ),
+            claims=_claims(plan),
+            smoke=True,
+        )
+        self.assertTrue(report["passed"], report)
+        persisted = json.loads((project / "delivery-report.json").read_text(encoding="utf-8"))
+        self.assertEqual(persisted["mp4_path"], "conference-video.mp4")
+        self.assertEqual(persisted["contact_sheet"], "contact-sheet.png")
+        self.assertEqual(
+            persisted["stages"][3]["control_results"][0]["navigation"],
+            "index.html#scene_01",
+        )
+        serialized = json.dumps(persisted, sort_keys=True)
+        self.assertNotIn(str(project), serialized)
+        self.assertNotIn(str(self.root), serialized)
+        report_strings: list[str] = []
+        pending: list[object] = [persisted]
+        while pending:
+            value = pending.pop()
+            if isinstance(value, str):
+                report_strings.append(value)
+            elif isinstance(value, dict):
+                pending.extend(value.values())
+            elif isinstance(value, list):
+                pending.extend(value)
+        self.assertEqual(
+            [
+                value
+                for value in report_strings
+                if value.startswith("file://")
+                or Path(value).is_absolute()
+                or re.match(r"^[A-Za-z]:[\\/]", value)
+            ],
+            [],
+        )
+
+    def test_pipeline_owned_directory_symlinks_fail_before_any_generated_write(self) -> None:
+        harness = self._require(self.harness, HARNESS_PATH)
+        plan = _plan()
+        for owned_name in ("narration", "assets", "renders", "frames"):
+            with self.subTest(owned_name=owned_name):
+                case = self.root / f"unsafe-{owned_name}"
+                project = _write_project(case, plan)
+                outside = self.root / f"outside-{owned_name}"
+                outside.mkdir()
+                sentinel = outside / "sentinel.txt"
+                sentinel.write_text("unchanged", encoding="utf-8")
+                owned = project / owned_name
+                if owned_name == "assets":
+                    figure = (owned / "figure.png").read_bytes()
+                    shutil.rmtree(owned)
+                    (outside / "figure.png").write_bytes(figure)
+                owned.symlink_to(outside, target_is_directory=True)
+                before = {
+                    path.relative_to(outside).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+                    for path in outside.rglob("*")
+                    if path.is_file()
+                }
+
+                report = harness.deliver_project(
+                    project,
+                    plan,
+                    _fake_runtime(self.root / f"unsafe-{owned_name}-runtime"),
+                    claims=_claims(plan),
+                    smoke=True,
+                )
+
+                self.assertFalse(report["passed"], report)
+                self.assertEqual(report["failed_stage"], "structural")
+                self.assertFalse((project / "delivery-report.json").exists())
+                after = {
+                    path.relative_to(outside).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+                    for path in outside.rglob("*")
+                    if path.is_file()
+                }
+                self.assertEqual(after, before)
+                if owned_name != "narration":
+                    self.assertFalse((project / "narration").exists())
 
     def test_plan_defaults_to_12_scenes_and_360_seconds(self) -> None:
         harness = self._require(self.harness, HARNESS_PATH)

@@ -16,10 +16,14 @@ import subprocess
 import sys
 import time
 import urllib.parse
+import urllib.request
 import uuid
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Mapping, Sequence
+
+
+sys.dont_write_bytecode = True
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -42,6 +46,7 @@ MIN_SCENES = 10
 MAX_SCENES = 14
 MIN_DURATION_S = 300
 MAX_DURATION_S = 600
+MIN_PASSING_REVIEW_SCORE = 4
 SPEECH_END_MARGIN_S = 0.5
 MAX_TTS_SPEED = 1.30
 FRESH_MTIME_TOLERANCE_NS = 2_000_000_000
@@ -73,6 +78,7 @@ REVIEW_RUBRIC: dict[str, Any] = {
     "format_version": FORMAT_VERSION,
     "artifact_type": "conference_video",
     "scale": {"min": 1, "max": 5},
+    "minimum_passing_score_per_dimension": MIN_PASSING_REVIEW_SCORE,
     "dimensions": [
         "research_story_and_source_fidelity",
         "scene_composition_and_visual_hierarchy",
@@ -417,6 +423,33 @@ def _safe_project_file(project: Path, reference: str) -> Path:
     except ValueError as error:
         raise VideoContractError(f"local asset escapes project: {reference}") from error
     return candidate
+
+
+def _assert_project_tree_safe_for_writes(project: Path) -> None:
+    """Reject linked project paths before the delivery pipeline creates any output."""
+    if project.is_symlink() or not project.is_dir():
+        raise VideoContractError("project must be a regular non-symlink directory")
+    root = project.resolve()
+    try:
+        for current, directories, files in os.walk(project, followlinks=False):
+            current_path = Path(current)
+            current_path.resolve().relative_to(root)
+            for name in directories:
+                path = current_path / name
+                if path.is_symlink():
+                    raise VideoContractError(
+                        f"project directory symlink is forbidden: {path.relative_to(project)}"
+                    )
+                path.resolve().relative_to(root)
+            for name in files:
+                path = current_path / name
+                if path.is_symlink() or not path.is_file() or path.stat().st_nlink != 1:
+                    raise VideoContractError(
+                        f"project file must be regular and singly linked: {path.relative_to(project)}"
+                    )
+                path.resolve().relative_to(root)
+    except ValueError as error:
+        raise VideoContractError("project path escapes its root") from error
 
 
 def _classes(attrs: Mapping[str, str]) -> set[str]:
@@ -1598,6 +1631,46 @@ const inside = value => value === projectRoot || value.startsWith(projectRoot + 
                 f"control operation failed for {token}",
                 failure_class="authoring",
             )
+        navigation = result.get("navigation")
+        if navigation is not None:
+            if not isinstance(navigation, str):
+                raise StageError(
+                    "browser_preflight",
+                    f"control navigation is invalid for {token}",
+                    failure_class="runtime",
+                )
+            parsed_navigation = urllib.parse.urlsplit(navigation)
+            if parsed_navigation.scheme != "file" or parsed_navigation.netloc not in {"", "localhost"}:
+                raise StageError(
+                    "browser_preflight",
+                    f"control navigation left the local project for {token}",
+                    failure_class="authoring",
+                )
+            try:
+                navigation_path = Path(
+                    urllib.request.url2pathname(parsed_navigation.path)
+                ).resolve()
+                relative_path = navigation_path.relative_to(project.resolve()).as_posix()
+            except ValueError as error:
+                raise StageError(
+                    "browser_preflight",
+                    f"control navigation left the local project for {token}",
+                    failure_class="authoring",
+                ) from error
+            if (
+                not relative_path
+                or relative_path.startswith(("/", "~"))
+                or "\\" in relative_path
+                or ".." in Path(relative_path).parts
+            ):
+                raise StageError(
+                    "browser_preflight",
+                    f"control navigation path is unsafe for {token}",
+                    failure_class="authoring",
+                )
+            result["navigation"] = urllib.parse.urlunsplit(
+                ("", "", relative_path, parsed_navigation.query, parsed_navigation.fragment)
+            )
         control_tokens.add(token)
     quiescence = payload.get("quiescence")
     checkpoints = quiescence.get("checkpoints") if isinstance(quiescence, Mapping) else None
@@ -1840,6 +1913,18 @@ def deliver_project(
     project = Path(project_dir).absolute()
     stages: list[dict[str, Any]] = []
     try:
+        _assert_project_tree_safe_for_writes(project)
+    except VideoContractError as error:
+        return {
+            "format_version": FORMAT_VERSION,
+            "passed": False,
+            "failed_stage": "structural",
+            "failure_class": "authoring",
+            "authoring_retryable": True,
+            "error": str(error),
+            "stages": stages,
+        }
+    try:
         if runtime.get("status") != "ready" or runtime.get("hyperframes_version") != setup_video.HYPERFRAMES_VERSION:
             raise StageError("runtime", "exact HyperFrames 0.7.86 runtime is not ready", failure_class="runtime")
         for name in ("hyperframes", "ffmpeg", "ffprobe", "python", "home_dir", "node", "node_root", "browser"):
@@ -1896,7 +1981,7 @@ def deliver_project(
         stages.append({"id": "browser_preflight", **browser})
 
         try:
-            lint = _run(
+            _run(
                 [str(runtime["hyperframes"]), "lint"], cwd=project, env=env,
                 timeout=120, stage="full_lint", failure_class="authoring",
             )
@@ -1909,7 +1994,6 @@ def deliver_project(
                 "id": "full_lint",
                 "passed": True,
                 "narration_sha256": narration_hash,
-                "output": ((lint.stdout or "") + (lint.stderr or ""))[-2000:],
             }
         )
 
@@ -1918,7 +2002,7 @@ def deliver_project(
         raw_mp4 = renders / f"hyperframes-{time.time_ns()}-{uuid.uuid4().hex}.mp4"
         started = time.time_ns()
         try:
-            render = _run(
+            _run(
                 [
                     str(runtime["hyperframes"]), "render", "--fps", "30", "--resolution", "landscape",
                     "--strict", "--no-best-effort", "--output", str(raw_mp4.relative_to(project)), ".",
@@ -1966,7 +2050,6 @@ def deliver_project(
                 "renderer": "hyperframes@0.7.86",
                 "hyperframes_mp4_sha256": raw_hash,
                 "subtitle_mux_only": True,
-                "output": ((render.stdout or "") + (render.stderr or ""))[-2000:],
             }
         )
 
@@ -2027,9 +2110,9 @@ def deliver_project(
             "renderer": "hyperframes@0.7.86",
             "plain_ffmpeg_delivery": False,
             "stages": stages,
-            "mp4_path": str(final_mp4),
+            "mp4_path": final_mp4.relative_to(project).as_posix(),
             "mp4_sha256": sha256_file(final_mp4),
-            "contact_sheet": str(contact),
+            "contact_sheet": contact.relative_to(project).as_posix(),
             "contact_sheet_sha256": sha256_file(contact),
             "media_probe": probe,
             "media_probe_sha256": sha256_file(project / "media_probe.json"),
@@ -2332,7 +2415,13 @@ def record_delivery_failure(
 
 def resume_video_run(run_dir: Path | str) -> dict[str, Any]:
     """Resume core state while preserving a durable runtime-repair route."""
-    run = Path(run_dir).absolute()
+    run, state = core._load_run(run_dir)
+    persisted_attempt = state.get("active_attempt")
+    if isinstance(persisted_attempt, str):
+        attempt = core.safe_path(run / "attempts", persisted_attempt, must_exist=True)
+        review_path = core.safe_path(attempt, "qa/semantic-review.json")
+        if review_path.exists() or review_path.is_symlink():
+            _read_validated_video_review(run, persisted_attempt)
     result = core.resume_run(run, skill_root=SKILL_ROOT)
     attempt_id = result.get("active_attempt")
     if result.get("state") != "authoring" or not isinstance(attempt_id, str):
@@ -2498,6 +2587,74 @@ def create_video_review_context(run_dir: Path | str, attempt_id: str) -> dict[st
     return {**context, "review_materials": materials}
 
 
+def _validate_video_review_threshold(review: Mapping[str, Any]) -> dict[str, Any]:
+    """Require a complete finite score vector and a strong score in every passing dimension."""
+    value = dict(review)
+    scores = value.get("dimension_scores")
+    expected = REVIEW_RUBRIC["dimensions"]
+    if not isinstance(scores, Mapping) or set(scores) != set(expected):
+        raise VideoContractError(
+            "video review dimension scores must contain every bound rubric dimension exactly once"
+        )
+    invalid = [
+        name
+        for name in expected
+        if (
+            not isinstance(scores[name], (int, float))
+            or isinstance(scores[name], bool)
+            or not math.isfinite(float(scores[name]))
+            or not 1 <= float(scores[name]) <= 5
+        )
+    ]
+    if invalid:
+        raise VideoContractError(
+            "video review dimension scores must be finite numbers from 1 through 5: "
+            + ", ".join(invalid)
+        )
+    if value.get("verdict") == "pass":
+        below = [
+            name
+            for name in expected
+            if float(scores[name]) < MIN_PASSING_REVIEW_SCORE
+        ]
+        if below:
+            raise VideoContractError(
+                f"passing video review requires every dimension >= {MIN_PASSING_REVIEW_SCORE}: "
+                + ", ".join(below)
+            )
+    return value
+
+
+def _read_validated_video_review(run: Path, attempt_id: str) -> dict[str, Any]:
+    context = core._validate_review_context(run, attempt_id)
+    if context.get("rubric") != REVIEW_RUBRIC:
+        raise VideoContractError("persisted video review rubric is stale")
+    review = core._read_validated_semantic_review(run, attempt_id)
+    return _validate_video_review_threshold(review)
+
+
+def record_video_semantic_review(
+    run_dir: Path | str,
+    attempt_id: str,
+    review: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Record a hash-bound review only after enforcing the Video pass threshold."""
+    run = Path(run_dir).absolute()
+    _validate_video_review_threshold(review)
+    context = core._validate_review_context(run, attempt_id)
+    if context.get("rubric") != REVIEW_RUBRIC:
+        raise VideoContractError("video review context uses a stale rubric")
+    core.record_semantic_review(run, attempt_id, review)
+    return _read_validated_video_review(run, attempt_id)
+
+
+def finalize_video_attempt(run_dir: Path | str, attempt_id: str) -> dict[str, Any]:
+    """Finalize only an attempt whose persisted review still meets the Video rubric."""
+    run = Path(run_dir).absolute()
+    _read_validated_video_review(run, attempt_id)
+    return core.finalize_attempt(run, attempt_id)
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -2613,11 +2770,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.command == "review-context":
             result = create_video_review_context(args.run, args.attempt)
         elif args.command == "record-review":
-            result = core.record_semantic_review(
+            result = record_video_semantic_review(
                 args.run, args.attempt, _read_json(args.review_json)
             )
         elif args.command == "finalize":
-            result = core.finalize_attempt(args.run, args.attempt)
+            result = finalize_video_attempt(args.run, args.attempt)
         else:
             result = resume_video_run(args.run)
         print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
