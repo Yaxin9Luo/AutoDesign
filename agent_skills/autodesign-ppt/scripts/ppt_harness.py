@@ -872,18 +872,81 @@ def _number_precedes_structure(gap: str) -> bool:
     )
 
 
+def _bounded_relation_tokens(gap: str) -> tuple[str, ...] | None:
+    normalized = re.sub(r"[-\u2010-\u2015]", " ", gap.lower()).replace("：", ":")
+    if re.search(r"[^a-z:=\s]", normalized):
+        return None
+    tokens = tuple(re.findall(r"[a-z]+|[:=]", normalized))
+    return tokens if len(tokens) <= 8 else None
+
+
+def _consume_relation_noun(tokens: tuple[str, ...], index: int) -> int | None:
+    if index >= len(tokens):
+        return None
+    if tokens[index] == "of":
+        return index + 1
+    if tokens[index] not in {"count", "number", "value"}:
+        return None
+    index += 1
+    return index + 1 if index < len(tokens) and tokens[index] == "of" else index
+
+
+def _consume_relation_copula(tokens: tuple[str, ...], index: int) -> int | None:
+    patterns = (
+        ("is", "exactly", "equal", "to"),
+        ("are", "exactly", "equal", "to"),
+        ("was", "exactly", "equal", "to"),
+        ("were", "exactly", "equal", "to"),
+        ("is", "equal", "to"),
+        ("are", "equal", "to"),
+        ("was", "equal", "to"),
+        ("were", "equal", "to"),
+        ("equal", "to"),
+        ("equals",),
+        ("equal",),
+        ("is",),
+        ("are",),
+        ("was",),
+        ("were",),
+        ("has",),
+        ("had",),
+    )
+    for pattern in patterns:
+        if tokens[index : index + len(pattern)] == pattern:
+            return index + len(pattern)
+    return None
+
+
 def _structure_precedes_number(gap: str, *, cardinality_term: bool) -> bool:
     if not cardinality_term:
         return False
-    return re.fullmatch(
-        (
-            r"\s*(?:(?:(?:count|number|value)(?:\s+of)?|of)\s*)?"
-            r"(?:(?:(?:is|are|was|were)\s+equal\s+to|equals?|equal\s+to|"
-            r"is|are|was|were|has|had)\s*)?"
-            r"(?:[:=：]\s*)?"
-        ),
-        gap,
-    ) is not None
+    tokens = _bounded_relation_tokens(gap)
+    if tokens is None:
+        return False
+    index = 0
+    primary_end = _consume_relation_noun(tokens, index)
+    if primary_end is not None:
+        index = primary_end
+    copula_end = _consume_relation_copula(tokens, index)
+    has_copula = copula_end is not None
+    if copula_end is not None:
+        index = copula_end
+    if index < len(tokens) and tokens[index] == "exactly":
+        index += 1
+    if has_copula:
+        has_determiner = index < len(tokens) and tokens[index] in {"a", "an", "the"}
+        if has_determiner:
+            index += 1
+        secondary_end = _consume_relation_noun(tokens, index)
+        if secondary_end is not None:
+            index = secondary_end
+        elif has_determiner:
+            return False
+        if index < len(tokens) and tokens[index] == "exactly":
+            index += 1
+    if index < len(tokens) and tokens[index] in {":", "="}:
+        index += 1
+    return index == len(tokens)
 
 
 def _structurally_bound_number_spans(normalized_text: str) -> set[tuple[int, int]]:

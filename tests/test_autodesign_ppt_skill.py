@@ -26,43 +26,32 @@ EXPORTER_PATH = SKILL_ROOT / "scripts" / "export_pptx.py"
 SETUP_PATH = SKILL_ROOT / "scripts" / "setup_ppt.py"
 PPT_LOCK_PATH = SKILL_ROOT / "scripts" / "requirements-ppt.lock"
 SAFE_NAVIGATION_SCRIPT = "(()=>{const s=[...document.querySelectorAll('.deck-slide')];const i=()=>Math.max(0,s.findIndex(x=>'#'+x.id===location.hash));const g=n=>{const x=s[Math.min(s.length-1,Math.max(0,n))];if(x){location.hash=x.id;x.scrollIntoView({block:'start'})}};addEventListener('keydown',e=>{if(e.key==='ArrowLeft'){e.preventDefault();g(i()-1)}else if(e.key==='ArrowRight'){e.preventDefault();g(i()+1)}});addEventListener('hashchange',()=>{const x=s[i()];if(x)x.scrollIntoView({block:'start'})})})();"
+STRUCTURAL_COUNT_TERMS = ("head", "depth", "block", "layer", "stage")
 STRUCTURAL_COUNT_RELATION_MATRIX = (
-    (
-        "count-of",
-        "W/o routing module head count of 2 reports accuracy; "
-        "full model head count of 4 reports accuracy.",
-    ),
-    (
-        "number-of",
-        "W/o routing module head number of 2 reports accuracy; "
-        "full model head number of 4 reports accuracy.",
-    ),
-    (
-        "value-of",
-        "W/o routing module depth value of 2 reports accuracy; "
-        "full model depth value of 4 reports accuracy.",
-    ),
-    (
-        "count-copula",
-        "W/o routing module head count is 2 and reports accuracy; "
-        "full model head count is 4 and reports accuracy.",
-    ),
-    (
-        "number-copula",
-        "W/o routing module head number was 2 and reports accuracy; "
-        "full model head number was 4 and reports accuracy.",
-    ),
-    (
-        "value-copula",
-        "W/o routing module depth value equals 2 and reports accuracy; "
-        "full model depth value equals 4 and reports accuracy.",
-    ),
-    (
-        "value-is-equal-to",
-        "W/o routing module depth value is equal to 2 and reports accuracy; "
-        "full model depth value is equal to 4 and reports accuracy.",
-    ),
+    ("count-of", "{term} count of {value}"),
+    ("number-of", "{term} number of {value}"),
+    ("value-of", "{term} value of {value}"),
+    ("count-copula", "{term} count is {value}"),
+    ("number-copula", "{term} number was {value}"),
+    ("value-copula", "{term} value equals {value}"),
+    ("value-equal-to", "{term} value is equal to {value}"),
+    ("composed-value", "{term} count has a value of {value}"),
+    ("exactly", "{term} is exactly {value}"),
+    ("hyphen-count", "{term}-count of {value}"),
+    ("determiner", "{term} has the count of {value}"),
+    ("copula-composed-value", "{term} count is a value of {value}"),
 )
+
+
+def _structural_count_relation_comparisons() -> tuple[str, ...]:
+    return tuple(
+        (
+            f"W/o routing module {template.format(term=term, value=2)} reports accuracy; "
+            f"full model {template.format(term=term, value=4)} reports accuracy."
+        )
+        for term in STRUCTURAL_COUNT_TERMS
+        for _relation, template in STRUCTURAL_COUNT_RELATION_MATRIX
+    )
 
 
 def _load_script(name: str, path: Path):
@@ -708,7 +697,7 @@ class AutoDesignPptSkillTests(unittest.TestCase):
                 "W/o routing module has 2 heads and reports accuracy; "
                 "full model has 4 heads and reports accuracy."
             ),
-        ) + tuple(text for _relation, text in STRUCTURAL_COUNT_RELATION_MATRIX)
+        ) + _structural_count_relation_comparisons()
         for text in false_comparisons:
             with (
                 self.subTest(text=text),
@@ -808,7 +797,7 @@ class AutoDesignPptSkillTests(unittest.TestCase):
                 "W/o routing module has 2 heads and reports accuracy; "
                 "full model has 4 heads and reports accuracy."
             ),
-        ) + tuple(text for _relation, text in STRUCTURAL_COUNT_RELATION_MATRIX)
+        ) + _structural_count_relation_comparisons()
         for text in false_comparisons:
             evidence_texts, _roles, _role_refs = self._conditioned_story_fixture()
             evidence_texts["ev-013"] = text
@@ -1072,7 +1061,7 @@ class AutoDesignPptSkillTests(unittest.TestCase):
                 "W/o routing module has 2 heads and reports accuracy; "
                 "full model has 4 heads and reports accuracy."
             ),
-        ) + tuple(text for _relation, text in STRUCTURAL_COUNT_RELATION_MATRIX)
+        ) + _structural_count_relation_comparisons()
         for text in false_comparisons:
             evidence_texts, roles, role_refs = self._conditioned_story_fixture()
             evidence_texts["ev-019"] = text

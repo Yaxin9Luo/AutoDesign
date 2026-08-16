@@ -45,10 +45,10 @@ localized evidence are invalid repair instructions.
   and share a measured metric or percentage scale;
 - a `w/o`/`full` comparison authorized by architecture counts rather than an
   observed outcome;
-- a token-bound structure value such as `2 heads`, `2-stage`, `depth: 4`,
-  `head count of 4`, or `depth value equals 4` accepted as an outcome because a
-  metric word appears elsewhere, or a real metric-bound value rejected merely
-  because a distant structure phrase exists;
+- a token-bound structure value such as `2 heads`, `2-stage`, `depth is exactly
+  4`, `head-count of 4`, or `head count has a value of 4` accepted as an outcome
+  because a metric word appears elsewhere, or a real metric-bound value rejected
+  merely because a distant structure phrase exists;
 - a slide not inspected by the reviewer;
 - illegible, clipped, overlapping, or blank content;
 - visible remote/missing asset or runtime error;
