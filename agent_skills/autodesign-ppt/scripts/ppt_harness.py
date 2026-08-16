@@ -1,0 +1,1032 @@
+#!/usr/bin/env python3
+"""Standalone evidence, authoring, QA, review, and delivery harness for decks."""
+
+from __future__ import annotations
+
+import argparse
+import importlib.util
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import uuid
+from collections import Counter
+from pathlib import Path
+from typing import Any, Mapping, Sequence
+from urllib.parse import unquote, urlsplit
+
+
+DEFAULT_SLIDE_COUNT = 18
+MAX_REPAIR_ATTEMPTS = 3
+RELEASE_VERSION = "0.1.0"
+SLIDE_WIDTH = 1920
+SLIDE_HEIGHT = 1080
+
+
+class PptHarnessError(RuntimeError):
+    """The standalone deck workflow cannot safely continue."""
+
+
+def _external_output(path: Path | str) -> Path:
+    target = Path(path).expanduser().resolve(strict=False)
+    package = Path(__file__).resolve().parent.parent
+    try:
+        target.relative_to(package)
+    except ValueError:
+        return target
+    raise PptHarnessError("generated output must stay outside the installed Skill")
+
+
+def _load_sibling(name: str, filename: str):
+    path = Path(__file__).resolve().with_name(filename)
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise PptHarnessError(f"could not load bundled runtime module: {filename}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+portable = _load_sibling("autodesign_ppt_portable", "_portable.py")
+browser_setup = _load_sibling("autodesign_ppt_browser_setup", "setup_browser.py")
+ppt_setup = _load_sibling("autodesign_ppt_runtime_setup", "setup_ppt.py")
+exporter = _load_sibling("autodesign_ppt_exporter", "export_pptx.py")
+
+
+_EXPLICIT_COUNT_PATTERNS = (
+    re.compile(r"(?<!\d)([1-5]?\d|60)\s*-?\s*(?:slides?|pages?|页)(?!\w)", re.IGNORECASE),
+    re.compile(r"(?:slides?|pages?)\s*(?:count|total)?\s*[:=]?\s*([1-5]?\d|60)(?!\d)", re.IGNORECASE),
+    re.compile(r"(?:生成|做成|制作|需要|共)\s*([1-5]?\d|60)\s*页"),
+)
+
+_ACADEMIC_ARC = (
+    ("cover", "Opening", "State the paper identity and central thesis"),
+    ("outline", "Roadmap", "Orient the audience to the research argument"),
+    ("problem", "Problem", "Define the research problem and stakes"),
+    ("motivation", "Motivation", "Show why the problem matters now"),
+    ("prior-gap", "Prior work gap", "Identify the unresolved limitation"),
+    ("contributions", "Contributions", "Make the paper's contributions explicit"),
+    ("method-overview", "Method overview", "Explain the full method at a glance"),
+    ("mechanism", "Core mechanism", "Explain the central design mechanism"),
+    ("objective", "Technical formulation", "Ground the algorithm, objective, or architecture"),
+    ("setup", "Experimental setup", "Establish data, baselines, and evaluation protocol"),
+    ("primary-results", "Primary results", "Present the main quantitative finding"),
+    ("robustness", "Robustness", "Test whether the finding holds across conditions"),
+    ("ablation", "Ablation", "Isolate which components create the gain"),
+    ("qualitative", "Qualitative evidence", "Show representative source-backed examples"),
+    ("limitations", "Limitations", "State scope, failure modes, and uncertainty"),
+    ("implications", "Implications", "Connect results to research practice"),
+    ("takeaways", "Takeaways", "Compress the argument into memorable conclusions"),
+    ("closing", "Closing", "End with the thesis and discussion prompt"),
+)
+
+
+def _explicit_slide_count(brief: str) -> int | None:
+    for pattern in _EXPLICIT_COUNT_PATTERNS:
+        match = pattern.search(brief)
+        if match:
+            value = int(match.group(1))
+            if 1 <= value <= 60:
+                return value
+    return None
+
+
+def _arc_for_count(count: int) -> list[tuple[str, str, str]]:
+    if count == len(_ACADEMIC_ARC):
+        return list(_ACADEMIC_ARC)
+    if count == 1:
+        return [_ACADEMIC_ARC[0]]
+    if count < len(_ACADEMIC_ARC):
+        selected = {
+            round(index * (len(_ACADEMIC_ARC) - 1) / (count - 1))
+            for index in range(count)
+        }
+        while len(selected) < count:
+            selected.add(next(index for index in range(len(_ACADEMIC_ARC)) if index not in selected))
+        return [_ACADEMIC_ARC[index] for index in sorted(selected)]
+    result = list(_ACADEMIC_ARC[:-2])
+    for index in range(count - len(_ACADEMIC_ARC)):
+        number = index + 1
+        result.append(
+            (
+                f"evidence-deep-dive-{number}",
+                f"Evidence deep dive {number}",
+                "Explain one additional source-backed result or mechanism",
+            )
+        )
+    result.extend(_ACADEMIC_ARC[-2:])
+    return result
+
+
+def build_deck_plan(
+    brief: str,
+    evidence_ids: Sequence[str],
+    *,
+    slide_count: int | None = None,
+) -> dict[str, Any]:
+    """Return the shared paper-deck plan: 18 by default, explicit requests win."""
+
+    requested = slide_count if slide_count is not None else _explicit_slide_count(brief)
+    count = requested if requested is not None else DEFAULT_SLIDE_COUNT
+    if isinstance(count, bool) or not isinstance(count, int) or not 1 <= count <= 60:
+        raise PptHarnessError("slide count must be an integer from 1 through 60")
+    sources = [item for item in dict.fromkeys(evidence_ids) if re.fullmatch(r"ev-\d{3,}", item)]
+    if not sources:
+        raise PptHarnessError("deck planning requires at least one evidence ID")
+    slides: list[dict[str, Any]] = []
+    for index, (role, title, communication_job) in enumerate(_arc_for_count(count), start=1):
+        source_id = sources[(index - 1) % len(sources)]
+        slides.append(
+            {
+                "slide_id": f"slide-{index:02d}",
+                "slide_index": index,
+                "role": role,
+                "chapter": "paper-talk",
+                "communication_job": communication_job,
+                "assertion_title": title,
+                "evidence_refs": [source_id],
+                "speaker_note_intent": f"[Sources] {source_id} [Talk] {communication_job}.",
+                "layout_family": "editorial-evidence",
+            }
+        )
+    return {
+        "format_version": 1,
+        "artifact_type": "deck",
+        "brief": brief,
+        "slide_count": count,
+        "count_source": "explicit_user" if requested is not None else "academic_default",
+        "canvas": {"width": SLIDE_WIDTH, "height": SLIDE_HEIGHT},
+        "visual_allocations": [],
+        "slides": slides,
+    }
+
+
+def _contained_dependency(root: Path, base: Path, reference: str) -> Path | None:
+    parsed = urlsplit(reference.strip().strip("'\""))
+    if parsed.scheme or parsed.netloc or not parsed.path or parsed.path.startswith("/"):
+        return None
+    candidate = (base / Path(unquote(parsed.path))).resolve(strict=True)
+    try:
+        candidate.relative_to(root)
+    except ValueError as error:
+        raise PptHarnessError(f"local deck dependency escapes the workspace: {reference}") from error
+    if candidate.is_symlink() or not candidate.is_file():
+        raise PptHarnessError(f"local deck dependency is missing or unsafe: {reference}")
+    return candidate
+
+
+def _dependency_closure(deck: Any) -> list[Path]:
+    root = deck.html_path.parent.resolve(strict=True)
+    pending: list[Path] = []
+    for _tag, _attribute, reference in deck.resources:
+        dependency = _contained_dependency(root, root, reference)
+        if dependency is not None:
+            pending.append(dependency)
+    resolved: set[Path] = set()
+    css_url = re.compile(
+        r"url\(\s*(?:(['\"])(.*?)\1|([^)'\"\s]+))\s*\)", re.IGNORECASE
+    )
+    css_import = re.compile(r"@import\s+(['\"])(.*?)\1", re.IGNORECASE)
+    while pending:
+        path = pending.pop()
+        if path in resolved:
+            continue
+        resolved.add(path)
+        if path.suffix.lower() != ".css":
+            continue
+        try:
+            css = path.read_text(encoding="utf-8")
+        except UnicodeError as error:
+            raise PptHarnessError(f"CSS dependency is not UTF-8: {path.name}") from error
+        references = [
+            (match.group(2) or match.group(3)) for match in css_url.finditer(css)
+        ]
+        references.extend(match.group(2) for match in css_import.finditer(css))
+        for reference in references:
+            nested = _contained_dependency(root, path.parent, reference)
+            if nested is not None:
+                pending.append(nested)
+    return sorted(resolved)
+
+
+def _copy_dependencies(deck: Any, destination_root: Path) -> None:
+    root = deck.html_path.parent.resolve(strict=True)
+    for path in _dependency_closure(deck):
+        relative = path.relative_to(root)
+        target = destination_root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(path, target)
+
+
+def create_slide_audit_variants(
+    html_path: Path | str,
+    output_dir: Path | str,
+    expected_slide_count: int,
+) -> list[Path]:
+    """Create one immutable local-asset-closed browser target per slide."""
+
+    source = Path(html_path).expanduser().resolve(strict=True)
+    validation = exporter.validate_deck_html(source, expected_slide_count=expected_slide_count)
+    if not validation["passed"]:
+        codes = ", ".join(sorted({issue["code"] for issue in validation["issues"]}))
+        raise PptHarnessError(f"deck HTML contract failed before browser QA: {codes}")
+    root = _external_output(output_dir)
+    if root.exists() and any(root.iterdir()):
+        raise PptHarnessError("slide audit output directory must be empty")
+    root.mkdir(parents=True, exist_ok=True)
+    raw = source.read_text(encoding="utf-8")
+    deck = exporter.parse_deck_html(source)
+    variants: list[Path] = []
+    for index in range(1, expected_slide_count + 1):
+        slide_id = f"slide-{index:02d}"
+        slide_root = root / slide_id
+        slide_root.mkdir()
+        _copy_dependencies(deck, slide_root)
+        isolation = (
+            "<style data-autodesign-slide-audit>"
+            "html,body{width:1920px!important;height:1080px!important;overflow:hidden!important;"
+            "margin:0!important;background:#fff!important}"
+            ".deck-slide{display:none!important;margin:0!important}"
+            f"#{slide_id}{{display:block!important;width:1920px!important;height:1080px!important}}"
+            "</style>"
+        )
+        closing_head = re.search(r"</head\s*>", raw, re.IGNORECASE)
+        if closing_head is None:
+            raise PptHarnessError("deck HTML requires a head element")
+        variant = raw[: closing_head.start()] + isolation + raw[closing_head.start() :]
+        target = slide_root / "index.html"
+        target.write_text(variant, encoding="utf-8")
+        variants.append(target)
+    return variants
+
+
+def write_contact_sheet_html(
+    preview_paths: Sequence[Path | str], output_path: Path | str
+) -> Path:
+    """Create a self-contained visual review sheet without modifying previews."""
+
+    previews = [Path(path).expanduser().resolve(strict=True) for path in preview_paths]
+    if not previews:
+        raise PptHarnessError("contact sheet requires at least one slide preview")
+    output = _external_output(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    assets = output.parent / "assets"
+    assets.mkdir(exist_ok=True)
+    cards: list[str] = []
+    for index, preview in enumerate(previews, start=1):
+        target = assets / f"slide-{index:02d}.png"
+        shutil.copyfile(preview, target)
+        cards.append(
+            f'<figure><img src="assets/{target.name}" alt="Slide {index} preview">'
+            f"<figcaption>Slide {index}</figcaption></figure>"
+        )
+    html = "".join(
+        (
+            "<!doctype html><html><head><meta charset=\"utf-8\">",
+            "<title>Deck contact sheet</title><style>",
+            "*{box-sizing:border-box}body{margin:0;padding:32px;background:#ecebe6;color:#171717;",
+            "font:16px Arial,Helvetica,sans-serif}main{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));",
+            "gap:24px}figure{margin:0;background:#fff;border:1px solid #cbc8bf;padding:10px}",
+            "img{display:block;width:100%;aspect-ratio:16/9;object-fit:contain;background:#fff}",
+            "figcaption{margin-top:8px;font-weight:700}</style></head><body><main>",
+            *cards,
+            "</main></body></html>",
+        )
+    )
+    output.write_text(html, encoding="utf-8")
+    return output
+
+
+def _browser_pdf(
+    html_path: Path,
+    output_path: Path,
+    runtime: Any,
+    *,
+    timeout_seconds: int = 180,
+) -> None:
+    output_path = _external_output(output_path)
+    script = """
+import sys
+from pathlib import Path
+from playwright.sync_api import sync_playwright
+source = Path(sys.argv[1]).resolve(strict=True).as_uri()
+target = Path(sys.argv[2]).resolve(strict=False)
+with sync_playwright() as p:
+    browser = p.chromium.launch(headless=True, args=[
+        '--disable-background-networking', '--disable-component-update',
+        '--disable-default-apps', '--disable-domain-reliability', '--disable-sync',
+        '--metrics-recording-only', '--no-first-run', '--no-default-browser-check',
+        '--host-resolver-rules=MAP * 0.0.0.0, EXCLUDE localhost',
+    ])
+    page = browser.new_page(viewport={'width': 1920, 'height': 1080})
+    page.route('http://**/*', lambda route: route.abort('blockedbyclient'))
+    page.route('https://**/*', lambda route: route.abort('blockedbyclient'))
+    page.goto(source, wait_until='load', timeout=30000)
+    page.wait_for_timeout(250)
+    page.pdf(path=str(target), width='1920px', height='1080px',
+             margin={'top':'0','right':'0','bottom':'0','left':'0'},
+             print_background=True, prefer_css_page_size=False)
+    browser.close()
+"""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output_path.with_name(f".{output_path.name}.tmp-{uuid.uuid4().hex}")
+    env = browser_setup.isolated_environment(
+        browsers_path=runtime.browsers_path,
+        allow_network_configuration=False,
+    )
+    try:
+        result = subprocess.run(
+            [str(runtime.python_executable), "-I", "-c", script, str(html_path), str(temporary)],
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+            env=env,
+            check=False,
+        )
+        if result.returncode != 0 or not temporary.is_file():
+            detail = (result.stderr or result.stdout or "no browser output").strip()[-1000:]
+            raise PptHarnessError(f"browser could not export deck PDF: {detail}")
+        os.replace(temporary, output_path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _run_exporter(
+    runtime: Any,
+    command: Sequence[str],
+    *,
+    timeout_seconds: int = 240,
+    allowed_returncodes: Sequence[int] = (0,),
+) -> int:
+    result = subprocess.run(
+        [str(runtime.python_executable), "-I", str(Path(exporter.__file__).resolve()), *command],
+        capture_output=True,
+        text=True,
+        timeout=timeout_seconds,
+        check=False,
+    )
+    if result.returncode not in allowed_returncodes:
+        detail = (result.stderr or result.stdout or "no exporter output").strip()[-1200:]
+        raise PptHarnessError(f"editable PPTX runtime failed: {detail}")
+    return result.returncode
+
+
+def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
+    path = _external_output(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp-{uuid.uuid4().hex}")
+    try:
+        with temporary.open("w", encoding="utf-8", newline="\n") as handle:
+            json.dump(dict(value), handle, ensure_ascii=True, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def prepare_qa_directory(attempt_root: Path | str) -> Path:
+    """Replace only scratch QA from an interrupted, uncommitted validation."""
+
+    attempt = Path(attempt_root).expanduser().resolve(strict=True)
+    deterministic = attempt / "qa" / "deterministic.json"
+    target = attempt / "qa" / "deck"
+    if deterministic.exists():
+        raise PptHarnessError("reviewed deterministic QA is immutable")
+    if target.exists() or target.is_symlink():
+        if target.is_symlink():
+            raise PptHarnessError("QA scratch directory must not be a symlink")
+        quarantine = target.with_name(f".{target.name}.interrupted-{uuid.uuid4().hex}")
+        os.replace(target, quarantine)
+        if quarantine.is_dir():
+            shutil.rmtree(quarantine)
+        else:
+            quarantine.unlink()
+    target.mkdir(parents=True)
+    return target
+
+
+def _optional_office_comparison(
+    pptx_path: Path,
+    previews_dir: Path,
+    qa_dir: Path,
+    count: int,
+    ppt_runtime: Any,
+) -> dict[str, Any]:
+    office = exporter.render_pptx_with_libreoffice(pptx_path, qa_dir / "office")
+    if not office.get("performed"):
+        return office
+    office["passed"] = office.get("page_count") == count
+    if not office["passed"]:
+        return office
+    rasterizer = shutil.which("pdftoppm")
+    if not rasterizer:
+        return {**office, "comparison_performed": False, "reason": "pdftoppm unavailable"}
+    rendered = qa_dir / "office" / "rendered"
+    rendered.mkdir(parents=True, exist_ok=True)
+    result = subprocess.run(
+        [rasterizer, "-png", "-r", "144", str(office["pdf"]), str(rendered / "slide")],
+        capture_output=True,
+        text=True,
+        timeout=180,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise PptHarnessError("pdftoppm could not rasterize the reopened PPTX")
+    report_path = qa_dir / "pptx-render-comparison.json"
+    _run_exporter(
+        ppt_runtime,
+        [
+            "compare",
+            "--canonical-dir",
+            str(previews_dir),
+            "--rendered-dir",
+            str(rendered),
+            "--expected-slide-count",
+            str(count),
+            "--report",
+            str(report_path),
+        ],
+        allowed_returncodes=(0, 2),
+    )
+    comparison = json.loads(report_path.read_text(encoding="utf-8"))
+    return {**office, **comparison, "comparison_performed": True}
+
+
+def render_and_validate_deck(
+    html_path: Path | str,
+    *,
+    expected_slide_count: int,
+    qa_dir: Path | str,
+    browser_cache: Path | str | None = None,
+    ppt_cache: Path | str | None = None,
+    offline_browser: bool = False,
+    offline_ppt: bool = False,
+) -> dict[str, Any]:
+    """Run every deterministic gate and create PDF/PPTX delivery artifacts."""
+
+    html = Path(html_path).expanduser().resolve(strict=True)
+    qa = _external_output(qa_dir)
+    if qa.is_symlink():
+        raise PptHarnessError("QA directory must not be a symlink")
+    qa.mkdir(parents=True, exist_ok=True)
+    contract = exporter.validate_deck_html(html, expected_slide_count=expected_slide_count)
+    if not contract["passed"]:
+        return {
+            "format_version": 1,
+            "passed": False,
+            "html_contract": contract,
+            "checks": [{"name": "html_contract", "passed": False}],
+        }
+
+    browser_runtime = browser_setup.ensure_browser_runtime(
+        cache_root=Path(browser_cache) if browser_cache is not None else None,
+        allow_install=not offline_browser,
+    )
+    ppt_runtime = ppt_setup.ensure_ppt_runtime(
+        cache_root=Path(ppt_cache) if ppt_cache is not None else None,
+        allow_install=not offline_ppt,
+    )
+    variants = create_slide_audit_variants(html, qa / "variants", expected_slide_count)
+    previews = qa / "previews"
+    previews.mkdir(exist_ok=True)
+    browser_reports: dict[str, Any] = {}
+    preview_paths: list[Path] = []
+    for index, variant in enumerate(variants, start=1):
+        slide_id = f"slide-{index:02d}"
+        output = variant.parent / "audit"
+        report = browser_setup.audit_local_html(
+            variant,
+            workspace_root=variant.parent,
+            output_dir=output,
+            viewports=[f"{slide_id}:1920x1080"],
+            runtime=browser_runtime,
+            allow_install=False,
+        )
+        browser_reports[slide_id] = report
+        source_preview = output / f"{slide_id}.png"
+        if not source_preview.is_file():
+            raise PptHarnessError(f"browser audit omitted preview for {slide_id}")
+        preview = previews / f"{slide_id}.png"
+        shutil.copyfile(source_preview, preview)
+        preview_paths.append(preview)
+
+    contact_html = write_contact_sheet_html(preview_paths, qa / "contact" / "index.html")
+    contact_report = browser_setup.audit_local_html(
+        contact_html,
+        workspace_root=contact_html.parent,
+        output_dir=qa / "contact" / "audit",
+        viewports=["contact-sheet:1440x900"],
+        runtime=browser_runtime,
+        allow_install=False,
+    )
+    contact_sheet = qa / "contact-sheet.png"
+    shutil.copyfile(qa / "contact" / "audit" / "contact-sheet.png", contact_sheet)
+
+    pdf_path = html.parent / "deck.pdf"
+    _browser_pdf(html, pdf_path, browser_runtime)
+    page_count = exporter.pdf_page_count(pdf_path)
+    pptx_path = html.parent / "deck.pptx"
+    pptx_report_path = qa / "pptx-validation.json"
+    _run_exporter(
+        ppt_runtime,
+        [
+            "export",
+            "--html",
+            str(html),
+            "--output",
+            str(pptx_path),
+            "--report",
+            str(pptx_report_path),
+            "--preview-dir",
+            str(previews),
+            "--background-dir",
+            str(qa / "backgrounds"),
+        ],
+    )
+    pptx_validation = json.loads(pptx_report_path.read_text(encoding="utf-8"))
+    office = _optional_office_comparison(
+        pptx_path, previews, qa, expected_slide_count, ppt_runtime
+    )
+    browser_pass = all(report.get("passed") is True for report in browser_reports.values())
+    office_pass = not office.get("performed") or (
+        office.get("page_count") == expected_slide_count and office.get("passed", True)
+    )
+    checks = [
+        {"name": "html_contract", "passed": bool(contract["passed"])},
+        {"name": "per_slide_browser_qa", "passed": browser_pass},
+        {"name": "contact_sheet_browser_qa", "passed": contact_report.get("passed") is True},
+        {"name": "pdf_page_count", "passed": page_count == expected_slide_count, "actual": page_count},
+        {"name": "editable_pptx_reopen", "passed": pptx_validation.get("passed") is True},
+        {"name": "rendered_pptx_comparison", "passed": office_pass, "performed": bool(office.get("performed"))},
+    ]
+    result = {
+        "format_version": 1,
+        "passed": all(check["passed"] is True for check in checks),
+        "checks": checks,
+        "html_contract": contract,
+        "browser_reports": browser_reports,
+        "contact_sheet_report": contact_report,
+        "preview_paths": [str(path) for path in [*preview_paths, contact_sheet]],
+        "contact_sheet": str(contact_sheet),
+        "pdf_path": str(pdf_path),
+        "pdf_page_count": page_count,
+        "pptx_path": str(pptx_path),
+        "pptx_validation": pptx_validation,
+        "rendered_pptx_comparison": office,
+    }
+    _atomic_json(qa / "deck-validation.json", result)
+    return result
+
+
+REVIEW_RUBRIC = {
+    "format_version": 1,
+    "dimensions": [
+        "source_fidelity",
+        "narrative_coherence",
+        "visual_hierarchy",
+        "typography_legibility",
+        "layout_composition",
+        "evidence_communication",
+        "speaker_notes",
+    ],
+    "minimum_score": 4,
+    "instructions": (
+        "A fresh host VLM or fresh subagent must inspect the contact sheet and every slide preview; "
+        "report localized repairs and never infer quality from HTML alone."
+    ),
+}
+
+
+def _skill_root() -> Path:
+    return Path(__file__).resolve().parent.parent
+
+
+def _run_state(run_dir: Path) -> dict[str, Any]:
+    return json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+
+
+def _resume(run_dir: Path) -> dict[str, Any]:
+    return portable.resume_run(run_dir, skill_root=_skill_root())
+
+
+def _active_attempt(run_dir: Path) -> str:
+    state = _run_state(run_dir)
+    attempt = state.get("active_attempt")
+    if not isinstance(attempt, str):
+        raise PptHarnessError("run has no active attempt")
+    return attempt
+
+
+def _begin_attempt(run_dir: Path) -> str:
+    state = _run_state(run_dir)
+    if int(state.get("attempt_count", 0)) >= MAX_REPAIR_ATTEMPTS:
+        raise PptHarnessError(f"bounded repair limit reached ({MAX_REPAIR_ATTEMPTS} attempts)")
+    return portable.begin_attempt(run_dir)
+
+
+def _command_init(args: argparse.Namespace) -> dict[str, Any]:
+    portable.initialize_run(
+        args.run_dir,
+        _skill_root(),
+        release_version=RELEASE_VERSION,
+        archive_sha256=args.archive_sha256,
+    )
+    manifest = portable.prepare_source(
+        args.run_dir,
+        args.source,
+        extra_assets=args.extra_asset,
+        reference_images=args.reference_image,
+    )
+    return {
+        "passed": manifest.get("status") == "ready",
+        "source_manifest": manifest,
+        "resume": _resume(args.run_dir),
+    }
+
+
+def _command_plan(args: argparse.Namespace) -> dict[str, Any]:
+    _resume(args.run_dir)
+    evidence = portable.load_evidence(args.run_dir)
+    plan = build_deck_plan(
+        args.brief,
+        [item["id"] for item in evidence],
+        slide_count=args.slide_count,
+    )
+    if args.visual_allocations is not None:
+        allocations = json.loads(args.visual_allocations.read_text(encoding="utf-8"))
+        if not isinstance(allocations, list) or any(not isinstance(item, dict) for item in allocations):
+            raise PptHarnessError("visual allocations must be a JSON list of objects")
+        slide_ids = {item["slide_id"] for item in plan["slides"]}
+        for allocation in allocations:
+            if allocation.get("slide_id") not in slide_ids:
+                raise PptHarnessError("visual allocation targets an unknown slide")
+        visual_check = portable.validate_visual_plan(args.run_dir, allocations)
+        if not visual_check["valid"]:
+            raise PptHarnessError("visual allocation exceeds an allowed reuse limit")
+        plan["visual_allocations"] = allocations
+    portable.save_plan(args.run_dir, plan)
+    return plan
+
+
+def _command_evidence(args: argparse.Namespace) -> dict[str, Any]:
+    _resume(args.run_dir)
+    evidence = portable.load_evidence(args.run_dir)
+    return {
+        "query": args.query,
+        "results": portable.lexical_retrieve(evidence, args.query, limit=args.limit),
+    }
+
+
+def _command_visuals(args: argparse.Namespace) -> dict[str, Any]:
+    _resume(args.run_dir)
+    return json.loads((args.run_dir / "evidence" / "source_visuals.json").read_text(encoding="utf-8"))
+
+
+def _command_bind_visuals(args: argparse.Namespace) -> dict[str, Any]:
+    _resume(args.run_dir)
+    review = json.loads(args.review.read_text(encoding="utf-8"))
+    result = portable.bind_host_vlm_visuals(args.run_dir, review)
+    return {"source_visuals": result, "resume": _resume(args.run_dir)}
+
+
+def _command_begin(args: argparse.Namespace) -> dict[str, Any]:
+    _resume(args.run_dir)
+    attempt = _begin_attempt(args.run_dir)
+    artifact = args.run_dir / "attempts" / attempt / "artifact" / "deck.html"
+    return {"attempt_id": attempt, "author_target": str(artifact)}
+
+
+def _command_stage_visual(args: argparse.Namespace) -> dict[str, Any]:
+    _resume(args.run_dir)
+    attempt = args.attempt or _active_attempt(args.run_dir)
+    plan = json.loads((args.run_dir / "plan.json").read_text(encoding="utf-8"))
+    allocation = next(
+        (
+            item
+            for item in plan.get("visual_allocations", [])
+            if item.get("visual_id") == args.visual_id
+        ),
+        None,
+    )
+    if allocation is None:
+        raise PptHarnessError("visual must be approved in the immutable deck plan before staging")
+    catalog = json.loads(
+        (args.run_dir / "evidence" / "source_visuals.json").read_text(encoding="utf-8")
+    )
+    visual = next(
+        (item for item in catalog.get("visuals", []) if item.get("id") == args.visual_id),
+        None,
+    )
+    if not isinstance(visual, dict) or visual.get("eligibility") != "eligible":
+        raise PptHarnessError("visual is unknown or not content-eligible")
+    relative = visual.get("path")
+    if not isinstance(relative, str):
+        raise PptHarnessError("visual has no staged evidence path")
+    source = portable.safe_path(args.run_dir / "evidence", relative, must_exist=True)
+    if portable.sha256_file(source) != visual.get("sha256"):
+        raise PptHarnessError("visual bytes differ from the evidence catalog")
+    if source.suffix.lower() not in {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tif", ".tiff"}:
+        raise PptHarnessError("native PPTX export requires a supported raster image")
+    target = (
+        args.run_dir
+        / "attempts"
+        / attempt
+        / "artifact"
+        / "assets"
+        / f"{args.visual_id}{source.suffix.lower()}"
+    )
+    portable.atomic_write_bytes(target, source.read_bytes())
+    return {
+        "attempt_id": attempt,
+        "visual_id": args.visual_id,
+        "slide_id": allocation.get("slide_id"),
+        "artifact_src": f"assets/{target.name}",
+        "sha256": portable.sha256_file(target),
+    }
+
+
+def _run_visual_gate(run_dir: Path, deck: Any, plan: Mapping[str, Any]) -> dict[str, Any]:
+    allocations = plan.get("visual_allocations", [])
+    if not isinstance(allocations, list):
+        return {"name": "visual_provenance", "passed": False, "issues": ["invalid plan allocations"]}
+    by_id: dict[str, list[dict[str, Any]]] = {}
+    for item in allocations:
+        if isinstance(item, dict) and isinstance(item.get("visual_id"), str):
+            by_id.setdefault(item["visual_id"], []).append(item)
+    catalog = json.loads((run_dir / "evidence" / "source_visuals.json").read_text(encoding="utf-8"))
+    catalog_by_id = {
+        item.get("id"): item for item in catalog.get("visuals", []) if isinstance(item, dict)
+    }
+    used: Counter[tuple[str, str]] = Counter()
+    issues: list[str] = []
+    for slide in deck.slides:
+        for element in slide.elements:
+            if element.kind != "image":
+                continue
+            source_ids = [
+                item
+                for item in re.split(r"[\s,;]+", element.attrs.get("data-source-ids", "").strip())
+                if item
+            ]
+            matches = [item for item in source_ids if item in by_id]
+            if len(matches) != 1:
+                issues.append(f"{slide.slide_id}: image must name exactly one planned visual ID")
+                continue
+            visual_id = matches[0]
+            visual_allocations = by_id[visual_id]
+            visual = catalog_by_id.get(visual_id)
+            if not any(item.get("slide_id") == slide.slide_id for item in visual_allocations):
+                issues.append(f"{slide.slide_id}: visual {visual_id} is allocated to another slide")
+            if not isinstance(visual, dict) or visual.get("eligibility") != "eligible":
+                issues.append(f"{slide.slide_id}: visual {visual_id} is not content-eligible")
+                continue
+            source_path = element.attrs.get("src", "")
+            try:
+                staged = _contained_dependency(
+                    deck.html_path.parent.resolve(strict=True),
+                    deck.html_path.parent.resolve(strict=True),
+                    source_path,
+                )
+            except (OSError, PptHarnessError):
+                staged = None
+            if staged is None:
+                issues.append(f"{slide.slide_id}: staged visual {visual_id} is missing")
+            elif portable.sha256_file(staged) != visual.get("sha256"):
+                issues.append(f"{slide.slide_id}: staged visual {visual_id} has the wrong hash")
+            used[(visual_id, slide.slide_id)] += 1
+    planned: Counter[tuple[str, str]] = Counter(
+        (visual_id, str(item.get("slide_id", "")))
+        for visual_id, items in by_id.items()
+        for item in items
+    )
+    missing = sorted((planned - used).elements())
+    issues.extend(
+        f"planned visual {visual_id} is absent from {slide_id}"
+        for visual_id, slide_id in missing
+    )
+    extra = sorted((used - planned).elements())
+    issues.extend(
+        f"visual {visual_id} is used more often than planned on {slide_id}"
+        for visual_id, slide_id in extra
+    )
+    return {"name": "visual_provenance", "passed": not issues, "issues": issues}
+
+
+def _command_validate(args: argparse.Namespace) -> dict[str, Any]:
+    _resume(args.run_dir)
+    attempt = args.attempt or _active_attempt(args.run_dir)
+    attempt_root = args.run_dir / "attempts" / attempt
+    qa_root = prepare_qa_directory(attempt_root)
+    artifact_root = attempt_root / "artifact"
+    html = artifact_root / "deck.html"
+    plan = json.loads((args.run_dir / "plan.json").read_text(encoding="utf-8"))
+    deck = exporter.parse_deck_html(html)
+    portable.write_source_map(args.run_dir, attempt, exporter.claims_from_deck(deck))
+    notes_path = artifact_root / "notes.json"
+    _atomic_json(notes_path, {"format_version": 1, "slides": exporter.notes_from_deck(deck)})
+    visual_gate = _run_visual_gate(args.run_dir, deck, plan)
+    if visual_gate["passed"]:
+        result = render_and_validate_deck(
+            html,
+            expected_slide_count=int(plan["slide_count"]),
+            qa_dir=qa_root,
+            browser_cache=args.browser_cache,
+            ppt_cache=args.ppt_cache,
+            offline_browser=args.offline_browser,
+            offline_ppt=args.offline_ppt,
+        )
+        result["checks"] = [visual_gate, *result.get("checks", [])]
+        result["passed"] = visual_gate["passed"] and bool(result.get("passed"))
+        _atomic_json(qa_root / "deck-validation.json", result)
+    else:
+        result = {
+            "format_version": 1,
+            "passed": False,
+            "checks": [visual_gate],
+            "preview_paths": [],
+        }
+        _atomic_json(qa_root / "deck-validation.json", result)
+    artifact_paths = [
+        f"artifact/{path.relative_to(artifact_root).as_posix()}"
+        for path in sorted(artifact_root.rglob("*"))
+        if path.is_file() and not path.is_symlink()
+    ]
+    preview_paths: dict[str, str] = {}
+    for path_text in result.get("preview_paths", []):
+        path = Path(path_text)
+        frame = "contact-sheet" if path.name == "contact-sheet.png" else path.stem
+        preview_paths[frame] = path.relative_to(attempt_root).as_posix()
+    portable.record_deterministic_result(
+        args.run_dir,
+        attempt,
+        passed=bool(result.get("passed")),
+        checks=result.get("checks", []),
+        artifact_paths=artifact_paths,
+        preview_paths=preview_paths,
+    )
+    return {"attempt_id": attempt, **result, "resume": _resume(args.run_dir)}
+
+
+def _command_review_context(args: argparse.Namespace) -> dict[str, Any]:
+    _resume(args.run_dir)
+    attempt = args.attempt or _active_attempt(args.run_dir)
+    return portable.create_review_context(args.run_dir, attempt, rubric=REVIEW_RUBRIC)
+
+
+def _command_record_review(args: argparse.Namespace) -> dict[str, Any]:
+    _resume(args.run_dir)
+    attempt = args.attempt or _active_attempt(args.run_dir)
+    review = json.loads(args.review.read_text(encoding="utf-8"))
+    scores = review.get("dimension_scores")
+    if review.get("verdict") == "pass" and (
+        not isinstance(scores, dict)
+        or set(scores) != set(REVIEW_RUBRIC["dimensions"])
+        or any(
+            not isinstance(score, (int, float))
+            or isinstance(score, bool)
+            or score < REVIEW_RUBRIC["minimum_score"]
+            for score in scores.values()
+        )
+    ):
+        raise PptHarnessError(
+            "passing review requires every bound dimension score to be at least 4"
+        )
+    portable.record_semantic_review(args.run_dir, attempt, review)
+    return _resume(args.run_dir)
+
+
+def _command_finalize(args: argparse.Namespace) -> dict[str, Any]:
+    _resume(args.run_dir)
+    attempt = args.attempt or _active_attempt(args.run_dir)
+    manifest = portable.finalize_attempt(args.run_dir, attempt)
+    return {"delivery_manifest": manifest, "resume": _resume(args.run_dir)}
+
+
+def _command_resume(args: argparse.Namespace) -> dict[str, Any]:
+    return _resume(args.run_dir)
+
+
+def _command_doctor(args: argparse.Namespace) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "format_version": 1,
+        "python": sys.version.split()[0],
+        "pdf_tools": {
+            name: bool(shutil.which(name)) for name in ("pdfinfo", "pdftoppm", "pdftotext", "pdfimages")
+        },
+        "office_renderer": shutil.which("soffice") or shutil.which("libreoffice"),
+    }
+    try:
+        browser = browser_setup.ensure_browser_runtime(
+            cache_root=args.browser_cache,
+            allow_install=not args.offline,
+        )
+        result["browser_runtime"] = {"ready": True, "cache_dir": str(browser.cache_dir)}
+    except Exception as error:
+        result["browser_runtime"] = {"ready": False, "error": str(error)}
+    try:
+        ppt = ppt_setup.ensure_ppt_runtime(cache_root=args.ppt_cache, allow_install=not args.offline)
+        result["ppt_runtime"] = {"ready": True, "cache_dir": str(ppt.cache_dir)}
+    except Exception as error:
+        result["ppt_runtime"] = {"ready": False, "error": str(error)}
+    result["passed"] = (
+        all(result["pdf_tools"].values())
+        and result["browser_runtime"]["ready"]
+        and result["ppt_runtime"]["ready"]
+    )
+    return result
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest="command", required=True)
+    initialize = commands.add_parser("init")
+    initialize.add_argument("--run-dir", type=Path, required=True)
+    initialize.add_argument("--source", type=Path, required=True)
+    initialize.add_argument("--extra-asset", type=Path, action="append", default=[])
+    initialize.add_argument("--reference-image", type=Path, action="append", default=[])
+    initialize.add_argument("--archive-sha256")
+    initialize.set_defaults(handler=_command_init)
+    plan = commands.add_parser("plan")
+    plan.add_argument("--run-dir", type=Path, required=True)
+    plan.add_argument("--brief", required=True)
+    plan.add_argument("--slide-count", type=int)
+    plan.add_argument("--visual-allocations", type=Path)
+    plan.set_defaults(handler=_command_plan)
+    evidence = commands.add_parser("evidence")
+    evidence.add_argument("--run-dir", type=Path, required=True)
+    evidence.add_argument("--query", required=True)
+    evidence.add_argument("--limit", type=int, default=8)
+    evidence.set_defaults(handler=_command_evidence)
+    visuals = commands.add_parser("visuals")
+    visuals.add_argument("--run-dir", type=Path, required=True)
+    visuals.set_defaults(handler=_command_visuals)
+    bind = commands.add_parser("bind-visuals")
+    bind.add_argument("--run-dir", type=Path, required=True)
+    bind.add_argument("--review", type=Path, required=True)
+    bind.set_defaults(handler=_command_bind_visuals)
+    begin = commands.add_parser("begin")
+    begin.add_argument("--run-dir", type=Path, required=True)
+    begin.set_defaults(handler=_command_begin)
+    stage = commands.add_parser("stage-visual")
+    stage.add_argument("--run-dir", type=Path, required=True)
+    stage.add_argument("--attempt")
+    stage.add_argument("--visual-id", required=True)
+    stage.set_defaults(handler=_command_stage_visual)
+    validate = commands.add_parser("validate")
+    validate.add_argument("--run-dir", type=Path, required=True)
+    validate.add_argument("--attempt")
+    validate.add_argument("--browser-cache", type=Path)
+    validate.add_argument("--ppt-cache", type=Path)
+    validate.add_argument("--offline-browser", action="store_true")
+    validate.add_argument("--offline-ppt", action="store_true")
+    validate.set_defaults(handler=_command_validate)
+    context = commands.add_parser("review-context")
+    context.add_argument("--run-dir", type=Path, required=True)
+    context.add_argument("--attempt")
+    context.set_defaults(handler=_command_review_context)
+    record = commands.add_parser("record-review")
+    record.add_argument("--run-dir", type=Path, required=True)
+    record.add_argument("--attempt")
+    record.add_argument("--review", type=Path, required=True)
+    record.set_defaults(handler=_command_record_review)
+    finalize = commands.add_parser("finalize")
+    finalize.add_argument("--run-dir", type=Path, required=True)
+    finalize.add_argument("--attempt")
+    finalize.set_defaults(handler=_command_finalize)
+    resume = commands.add_parser("resume")
+    resume.add_argument("--run-dir", type=Path, required=True)
+    resume.set_defaults(handler=_command_resume)
+    doctor = commands.add_parser("doctor")
+    doctor.add_argument("--browser-cache", type=Path)
+    doctor.add_argument("--ppt-cache", type=Path)
+    doctor.add_argument("--offline", action="store_true")
+    doctor.set_defaults(handler=_command_doctor)
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = _parser().parse_args(argv)
+    try:
+        payload = args.handler(args)
+        print(json.dumps(portable.redact_secrets(payload), ensure_ascii=True, indent=2, sort_keys=True))
+        return 0 if payload.get("passed", True) is not False else 2
+    except (
+        OSError,
+        UnicodeError,
+        ValueError,
+        json.JSONDecodeError,
+        subprocess.SubprocessError,
+        portable.PortableError,
+        PptHarnessError,
+    ) as error:
+        print(f"ERROR: {portable.redact_secrets(str(error))}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
