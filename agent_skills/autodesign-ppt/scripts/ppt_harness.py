@@ -877,8 +877,9 @@ def _structure_precedes_number(gap: str, *, cardinality_term: bool) -> bool:
         return False
     return re.fullmatch(
         (
-            r"\s*(?:(?:count|number|of)\s*)?"
-            r"(?:(?:is|are|was|were|equals?|equal\s+to|has|had)\s*)?"
+            r"\s*(?:(?:(?:count|number|value)(?:\s+of)?|of)\s*)?"
+            r"(?:(?:(?:is|are|was|were)\s+equal\s+to|equals?|equal\s+to|"
+            r"is|are|was|were|has|had)\s*)?"
             r"(?:[:=：]\s*)?"
         ),
         gap,

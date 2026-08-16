@@ -65,13 +65,13 @@ of `<PYTHON3>` below. Run
    two-clause comparison. Both sides of that pair must contain a value and share
    a measured metric (or an explicit percentage scale). When a metric is named,
    its value must be locally bound to it. Token-attached architecture values
-   such as `2 heads`, `2-stage`, `depth: 4`, or `head count is 4` remain
-   structure counts and do not become outcomes merely because `accuracy`
-   appears elsewhere. Conversely, a distant structure phrase cannot steal a
-   value explicitly bound to a metric, as in `accuracy for the 2-stage
+   such as `2 heads`, `2-stage`, `depth: 4`, `head count of 4`, or `depth value
+   equals 4` remain structure counts and do not become outcomes merely because
+   `accuracy` appears elsewhere. Conversely, a distant structure phrase cannot
+   steal a value explicitly bound to a metric, as in `accuracy for the 2-stage
    configuration is 79.4%` or `accuracy is 79.4% across two stages`. A fully
-   unlabeled two-percentage pair may infer the common outcome only when neither side
-   contains token-bound structure counts. Architecture counts are not outcomes.
+   unlabeled two-percentage pair may infer the common outcome only when neither
+   side contains token-bound structure counts. Architecture counts are not outcomes.
    That fallback needs
    role-distinctive evidence with a unique winning margin; ambiguous or generic
    overlap stops and requests `--story-plan`. Paper decks default to exactly 18
