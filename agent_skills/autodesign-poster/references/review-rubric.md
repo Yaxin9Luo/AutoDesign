@@ -2,7 +2,8 @@
 
 Perform this review only after deterministic validation passes. The reviewer
 must be a fresh host VLM or fresh subagent that did not author the attempt. It
-must inspect every preview listed by `review-context`, read the relevant source
+must inspect both the screen preview and PDF-raster preview listed by
+`review-context`, read the relevant source
 map and evidence, and judge the rendered poster rather than nominal HTML/CSS.
 No external judge API is required.
 
@@ -68,8 +69,11 @@ keys.
   "attempt_id": "01",
   "review_context_sha256": "COPY_CONTEXT_SHA256",
   "artifact_hashes": {},
-  "preview_hashes": {},
-  "reviewed_frame_ids": ["poster_full"],
+  "preview_hashes": {
+    "poster_pdf": "COPY_PDF_PREVIEW_SHA256",
+    "poster_screen": "COPY_SCREEN_PREVIEW_SHA256"
+  },
+  "reviewed_frame_ids": ["poster_pdf", "poster_screen"],
   "source_manifest_sha256": "COPY_SOURCE_MANIFEST_SHA256",
   "source_map_sha256": "COPY_SOURCE_MAP_SHA256",
   "rubric_sha256": "COPY_RUBRIC_SHA256",

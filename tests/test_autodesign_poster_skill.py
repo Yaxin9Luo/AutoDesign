@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -24,7 +26,12 @@ def _load_harness():
         raise AssertionError("poster harness could not be loaded")
     module = importlib.util.module_from_spec(spec)
     sys.modules[module_name] = module
-    spec.loader.exec_module(module)
+    previous = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.dont_write_bytecode = previous
     return module
 
 
@@ -121,26 +128,26 @@ img {{ display: block; width: 100%; max-height: 390px; object-fit: contain; }}
     <p data-identity="institutions" data-source-ids="ev-001">Example University</p>
   </header>
   <div class="body">
-    <section data-section-role="problem" data-claim-id="c-problem" data-source-ids="ev-001">
+    <section data-section-role="problem" data-source-ids="ev-001">
       <h2>Problem</h2>
-      <p>The grounded poster source reports 85% accuracy.</p>
+      <p data-claim-id="c-problem" data-source-ids="ev-001">The grounded poster source reports 85% accuracy.</p>
       <p>Research posters must preserve the paper's actual question and scope.</p>
     </section>
-    <section data-section-role="method" data-claim-id="c-method" data-source-ids="ev-001">
+    <section data-section-role="method" data-source-ids="ev-001">
       <h2>Method</h2>
-      <p>The source uses two-stage routing.</p>
+      <p data-claim-id="c-method" data-source-ids="ev-001">The source uses two-stage routing.</p>
       {visual}
       <ul><li>Stage one selects evidence.</li><li>Stage two composes the result.</li></ul>
     </section>
-    <section data-section-role="evidence" data-claim-id="c-evidence" data-source-ids="ev-001">
+    <section data-section-role="evidence" data-source-ids="ev-001">
       <h2>Evidence</h2>
-      <p>Accuracy reaches 85%.</p>
+      <p data-claim-id="c-evidence" data-source-ids="ev-001">Accuracy reaches 85%.</p>
       <table><thead><tr><th>Measure</th><th>Value</th></tr></thead>
       <tbody><tr><td>Accuracy</td><td>85%</td></tr></tbody></table>
     </section>
-    <section data-section-role="takeaway" data-claim-id="c-takeaway" data-source-ids="ev-001">
+    <section data-section-role="takeaway" data-source-ids="ev-001">
       <h2>Takeaway</h2>
-      <p>The grounded poster retains accuracy.</p>
+      <p data-claim-id="c-takeaway" data-source-ids="ev-001">The grounded poster retains accuracy.</p>
       <p>Keep the conclusion bounded by the supplied evidence.</p>
     </section>
   </div>
@@ -184,6 +191,40 @@ class AutoDesignPosterSkillTests(unittest.TestCase):
         ):
             self.assertIn(command, completed.stdout)
 
+    def test_cli_help_does_not_write_bytecode_into_a_read_only_style_install(self) -> None:
+        installed = self.root / "installed" / "autodesign-poster"
+        shutil.copytree(SKILL_ROOT, installed)
+        for generated in installed.rglob("__pycache__"):
+            shutil.rmtree(generated)
+        before = {
+            path.relative_to(installed).as_posix(): path.read_bytes()
+            for path in installed.rglob("*")
+            if path.is_file()
+        }
+        environment = dict(os.environ)
+        environment.pop("PYTHONDONTWRITEBYTECODE", None)
+        completed = subprocess.run(
+            [sys.executable, str(installed / "scripts" / "poster_harness.py"), "--help"],
+            cwd=self.root,
+            env=environment,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+        after = {
+            path.relative_to(installed).as_posix(): path.read_bytes()
+            for path in installed.rglob("*")
+            if path.is_file()
+        }
+        self.assertEqual(after, before)
+
+    def test_importing_harness_does_not_write_bytecode_into_skill_package(self) -> None:
+        for generated in SKILL_ROOT.rglob("__pycache__"):
+            shutil.rmtree(generated)
+        _load_harness()
+        self.assertFalse(list(SKILL_ROOT.rglob("__pycache__")))
+
     def test_plan_defaults_to_fixed_cvpr_landscape_contract(self) -> None:
         harness = _load_harness()
         normalized = harness.normalize_plan(
@@ -214,11 +255,21 @@ class AutoDesignPosterSkillTests(unittest.TestCase):
     def test_static_lint_accepts_editable_grounded_poster_contract(self) -> None:
         harness = _load_harness()
         artifact, html = self._write_fixture(image=True)
+        plan = _plan()
+        plan["visual_allocations"] = [{"visual_id": "vis-001", "role": "method"}]
         result = harness.lint_poster_html(
             html,
             artifact_root=artifact,
-            plan=_plan(),
+            plan=plan,
             claims=_claims(),
+            visual_catalog=[
+                {
+                    "id": "vis-001",
+                    "path": "assets/source.png",
+                    "sha256": harness.core.sha256_file(artifact / "assets" / "vis-001.png"),
+                    "eligibility": "eligible",
+                }
+            ],
         )
         self.assertTrue(result["passed"], result)
         self.assertEqual(
@@ -319,6 +370,25 @@ class AutoDesignPosterSkillTests(unittest.TestCase):
         local = next(check for check in result["checks"] if check["id"] == "local_assets")
         self.assertFalse(local["passed"])
 
+    def test_static_lint_rejects_unallocated_css_background_images(self) -> None:
+        harness = _load_harness()
+        artifact, html = self._write_fixture()
+        (artifact / "assets").mkdir()
+        (artifact / "assets" / "fabricated.png").write_bytes(b"fabricated-image")
+        html.write_text(
+            html.read_text(encoding="utf-8").replace(
+                "section {",
+                "section { background-image:url(assets/fabricated.png);",
+            ),
+            encoding="utf-8",
+        )
+        result = harness.lint_poster_html(
+            html, artifact_root=artifact, plan=_plan(), claims=_claims()
+        )
+        self.assertFalse(result["passed"], result)
+        local = next(check for check in result["checks"] if check["id"] == "local_assets")
+        self.assertIn("CSS image", local["detail"])
+
     def test_static_lint_rejects_unreferenced_artifact_files(self) -> None:
         harness = _load_harness()
         artifact, html = self._write_fixture()
@@ -329,6 +399,97 @@ class AutoDesignPosterSkillTests(unittest.TestCase):
         local = next(check for check in result["checks"] if check["id"] == "local_assets")
         self.assertFalse(local["passed"])
         self.assertIn("unreferenced", local["detail"])
+
+    def test_static_lint_rejects_unallocated_or_hash_mismatched_source_images(self) -> None:
+        harness = _load_harness()
+        artifact, html = self._write_fixture(image=True)
+        result = harness.lint_poster_html(
+            html,
+            artifact_root=artifact,
+            plan=_plan(),
+            claims=_claims(),
+            visual_catalog=[],
+        )
+        binding = next(check for check in result["checks"] if check["id"] == "source_bindings")
+        self.assertFalse(binding["passed"], binding)
+        self.assertIn("not allocated", binding["detail"])
+
+        plan = _plan()
+        plan["visual_allocations"] = [{"visual_id": "vis-001", "role": "method"}]
+        result = harness.lint_poster_html(
+            html,
+            artifact_root=artifact,
+            plan=plan,
+            claims=_claims(),
+            visual_catalog=[
+                {
+                    "id": "vis-001",
+                    "path": "assets/source.png",
+                    "sha256": "0" * 64,
+                    "eligibility": "eligible",
+                }
+            ],
+        )
+        binding = next(check for check in result["checks"] if check["id"] == "source_bindings")
+        self.assertFalse(binding["passed"], binding)
+        self.assertIn("hash", binding["detail"])
+
+    def test_static_lint_rejects_executable_or_unsupported_sidecar_assets(self) -> None:
+        harness = _load_harness()
+        artifact, html = self._write_fixture()
+        sidecar = artifact / "assets" / "extra.html"
+        sidecar.parent.mkdir()
+        sidecar.write_text("<script>fetch('https://example.com')</script>", encoding="utf-8")
+        html.write_text(
+            html.read_text(encoding="utf-8").replace(
+                "<h2>Method</h2>", '<h2>Method</h2><a href="assets/extra.html">Details</a>',
+            ),
+            encoding="utf-8",
+        )
+        result = harness.lint_poster_html(
+            html, artifact_root=artifact, plan=_plan(), claims=_claims()
+        )
+        local = next(check for check in result["checks"] if check["id"] == "local_assets")
+        self.assertFalse(local["passed"], local)
+        self.assertIn("unsupported artifact dependency", local["detail"])
+
+    def test_svg_validator_rejects_dtd_before_parsing_the_document(self) -> None:
+        harness = _load_harness()
+        svg = self.root / "hostile.svg"
+        svg.write_text(
+            '<!DOCTYPE svg [<!ENTITY payload "x">]><svg>&payload;</svg>',
+            encoding="utf-8",
+        )
+        with mock.patch.object(
+            harness.ET,
+            "fromstring",
+            side_effect=AssertionError("DTD-bearing SVG must not reach the XML parser"),
+        ):
+            errors = harness._validate_svg_sidecar(svg, "assets/hostile.svg")
+        self.assertTrue(any("document type or entity" in error for error in errors), errors)
+
+    def test_static_lint_rejects_svg_sidecar_with_remote_css_dependency(self) -> None:
+        harness = _load_harness()
+        artifact, html = self._write_fixture()
+        sidecar = artifact / "assets" / "extra.svg"
+        sidecar.parent.mkdir()
+        sidecar.write_text(
+            '<svg xmlns="http://www.w3.org/2000/svg"><style>'
+            '@import url(https://example.com/leak.css);</style><rect width="10" height="10"/></svg>',
+            encoding="utf-8",
+        )
+        html.write_text(
+            html.read_text(encoding="utf-8").replace(
+                "<h2>Method</h2>", '<h2>Method</h2><a href="assets/extra.svg">Details</a>',
+            ),
+            encoding="utf-8",
+        )
+        result = harness.lint_poster_html(
+            html, artifact_root=artifact, plan=_plan(), claims=_claims()
+        )
+        self.assertFalse(result["passed"], result)
+        local = next(check for check in result["checks"] if check["id"] == "local_assets")
+        self.assertIn("SVG dependency contains unsafe CSS", local["detail"])
 
     def test_plan_rejects_content_assets_the_poster_cannot_render(self) -> None:
         harness = _load_harness()
@@ -384,6 +545,26 @@ class AutoDesignPosterSkillTests(unittest.TestCase):
         self.assertFalse(binding["passed"])
         self.assertIn("unknown-claim", binding["detail"])
 
+    def test_static_lint_rejects_claim_binding_wrapped_around_extra_text(self) -> None:
+        harness = _load_harness()
+        artifact, html = self._write_fixture()
+        text = html.read_text(encoding="utf-8")
+        text = text.replace(
+            '<section data-section-role="method" data-source-ids="ev-001">',
+            '<section data-section-role="method" data-claim-id="c-method" '
+            'data-source-ids="ev-001">',
+        ).replace(
+            '<p data-claim-id="c-method" data-source-ids="ev-001">',
+            '<p data-source-ids="ev-001">',
+        )
+        html.write_text(text, encoding="utf-8")
+        result = harness.lint_poster_html(
+            html, artifact_root=artifact, plan=_plan(), claims=_claims()
+        )
+        binding = next(check for check in result["checks"] if check["id"] == "source_bindings")
+        self.assertFalse(binding["passed"], binding)
+        self.assertIn("exactly match", binding["detail"])
+
     def test_static_lint_rejects_scripts_handlers_and_incomplete_research_arc(self) -> None:
         harness = _load_harness()
         artifact, html = self._write_fixture()
@@ -394,6 +575,96 @@ class AutoDesignPosterSkillTests(unittest.TestCase):
         result = harness.lint_poster_html(html, artifact_root=artifact, plan=_plan(), claims=_claims())
         failed = {check["id"] for check in result["checks"] if not check["passed"]}
         self.assertTrue({"document_contract", "narrative_arc"}.issubset(failed))
+
+    def test_static_lint_rejects_delayed_meta_refresh_navigation(self) -> None:
+        harness = _load_harness()
+        artifact, html = self._write_fixture()
+        html.write_text(
+            html.read_text(encoding="utf-8").replace(
+                '<meta charset="utf-8">',
+                '<meta charset="utf-8"><meta http-equiv="refresh" '
+                'content="60;url=https://example.com/leak">',
+            ),
+            encoding="utf-8",
+        )
+        result = harness.lint_poster_html(
+            html, artifact_root=artifact, plan=_plan(), claims=_claims()
+        )
+        document = next(check for check in result["checks"] if check["id"] == "document_contract")
+        self.assertFalse(document["passed"], document)
+        self.assertIn("meta refresh", document["detail"])
+
+    def test_static_lint_rejects_duplicate_attributes_before_browser_parsing(self) -> None:
+        harness = _load_harness()
+        artifact, html = self._write_fixture()
+        html.write_text(
+            html.read_text(encoding="utf-8").replace(
+                '<meta charset="utf-8">',
+                '<meta charset="utf-8"><meta http-equiv="refresh" '
+                'http-equiv="x-safe" content="60;url=https://example.com/leak">',
+            ),
+            encoding="utf-8",
+        )
+        result = harness.lint_poster_html(
+            html, artifact_root=artifact, plan=_plan(), claims=_claims()
+        )
+        document = next(check for check in result["checks"] if check["id"] == "document_contract")
+        self.assertFalse(document["passed"], document)
+        self.assertIn("duplicate attribute", document["detail"])
+
+    def test_static_lint_rejects_visible_css_generated_content(self) -> None:
+        harness = _load_harness()
+        artifact, html = self._write_fixture()
+        html.write_text(
+            html.read_text(encoding="utf-8").replace(
+                "</style>",
+                'section[data-section-role="method"]::after {'
+                'content:"Fabricated accuracy 999%";display:block;font-size:24px}'
+                "</style>",
+            ),
+            encoding="utf-8",
+        )
+        result = harness.lint_poster_html(
+            html, artifact_root=artifact, plan=_plan(), claims=_claims()
+        )
+        document = next(check for check in result["checks"] if check["id"] == "document_contract")
+        self.assertFalse(document["passed"], document)
+        self.assertIn("generated content", document["detail"])
+
+    def test_static_lint_rejects_form_control_value_text(self) -> None:
+        harness = _load_harness()
+        artifact, html = self._write_fixture()
+        html.write_text(
+            html.read_text(encoding="utf-8").replace(
+                "<h2>Method</h2>",
+                '<h2>Method</h2><input value="Fabricated accuracy 999%" '
+                'style="font-size:24px">',
+            ),
+            encoding="utf-8",
+        )
+        result = harness.lint_poster_html(
+            html, artifact_root=artifact, plan=_plan(), claims=_claims()
+        )
+        document = next(check for check in result["checks"] if check["id"] == "document_contract")
+        self.assertFalse(document["passed"], document)
+        self.assertIn("unsafe tag: input", document["detail"])
+
+    def test_static_lint_rejects_unmapped_visible_numbers(self) -> None:
+        harness = _load_harness()
+        artifact, html = self._write_fixture()
+        html.write_text(
+            html.read_text(encoding="utf-8").replace(
+                "<h2>Method</h2>",
+                "<h2>Method</h2><p>Fabricated accuracy reaches 999%.</p>",
+            ),
+            encoding="utf-8",
+        )
+        result = harness.lint_poster_html(
+            html, artifact_root=artifact, plan=_plan(), claims=_claims()
+        )
+        binding = next(check for check in result["checks"] if check["id"] == "source_bindings")
+        self.assertFalse(binding["passed"], binding)
+        self.assertIn("unsupported visible numbers", binding["detail"])
 
     def test_pdfinfo_gate_requires_one_page_and_exact_physical_size(self) -> None:
         harness = _load_harness()
@@ -480,7 +751,9 @@ class AutoDesignPosterSkillTests(unittest.TestCase):
         def fake_render(*, attempt_root: Path, **_kwargs: object) -> dict[str, object]:
             preview = attempt_root / "qa" / "previews" / "poster.png"
             preview.write_bytes(b"png-preview")
-            (attempt_root / "artifact" / "preview.png").write_bytes(b"png-preview")
+            print_preview = attempt_root / "qa" / "previews" / "poster-print.png"
+            print_preview.write_bytes(b"pdf-png-preview")
+            (attempt_root / "artifact" / "preview.png").write_bytes(b"pdf-png-preview")
             (attempt_root / "artifact" / "poster.pdf").write_bytes(b"%PDF-fixture")
             return {
                 "passed": True,
@@ -488,7 +761,10 @@ class AutoDesignPosterSkillTests(unittest.TestCase):
                     {"id": "browser_geometry", "passed": True, "detail": "passed"},
                     {"id": "single_page_pdf", "passed": True, "detail": "passed"},
                 ],
-                "preview_path": "qa/previews/poster.png",
+                "preview_paths": {
+                    "poster_pdf": "qa/previews/poster-print.png",
+                    "poster_screen": "qa/previews/poster.png",
+                },
             }
 
         with mock.patch.object(harness, "_render_poster_outputs", side_effect=fake_render):
@@ -531,12 +807,100 @@ class AutoDesignPosterSkillTests(unittest.TestCase):
             "complete",
         )
 
+    def test_validation_recovers_after_hard_interrupt_left_generated_outputs(self) -> None:
+        harness = _load_harness()
+        run = self.root / "interrupted-render-run"
+        source = self.root / "paper.txt"
+        source.write_text(
+            "Grounded poster source reports 85% accuracy and uses two-stage routing. "
+            "The grounded poster retains accuracy.",
+            encoding="utf-8",
+        )
+        harness.initialize_poster_run(run, source)
+        harness.save_poster_plan(run, _plan())
+        attempt_info = harness.begin_poster_attempt(run)
+        attempt_id = attempt_info["attempt_id"]
+        Path(attempt_info["poster_path"]).write_text(_poster_html(), encoding="utf-8")
+        source_map = self.root / "interrupted-source-map.json"
+        source_map.write_text(json.dumps({"claims": _claims()}), encoding="utf-8")
+
+        def interrupted_render(*, attempt_root: Path, **_kwargs: object) -> dict[str, object]:
+            preview = attempt_root / "qa" / "previews" / "poster.png"
+            preview.parent.mkdir(parents=True, exist_ok=True)
+            preview.write_bytes(b"stale-qa-preview")
+            (attempt_root / "artifact" / "preview.png").write_bytes(b"stale-preview")
+            (attempt_root / "artifact" / "poster.pdf").write_bytes(b"stale-pdf")
+            raise KeyboardInterrupt("simulated hard interruption")
+
+        with mock.patch.object(harness, "_render_poster_outputs", side_effect=interrupted_render):
+            with self.assertRaisesRegex(KeyboardInterrupt, "hard interruption"):
+                harness.validate_poster_attempt(
+                    run,
+                    attempt_id,
+                    source_map_path=source_map,
+                    allow_browser_install=False,
+                )
+
+        stale_atomic_output = run / "attempts" / attempt_id / "artifact" / ".poster.pdf.tmp-deadbeef"
+        stale_atomic_output.write_bytes(b"partial-pdf")
+
+        def fresh_render(*, attempt_root: Path, **_kwargs: object) -> dict[str, object]:
+            preview = attempt_root / "qa" / "previews" / "poster.png"
+            preview.parent.mkdir(parents=True, exist_ok=True)
+            preview.write_bytes(b"fresh-qa-preview")
+            print_preview = attempt_root / "qa" / "previews" / "poster-print.png"
+            print_preview.write_bytes(b"fresh-print-preview")
+            (attempt_root / "artifact" / "preview.png").write_bytes(b"fresh-print-preview")
+            (attempt_root / "artifact" / "poster.pdf").write_bytes(b"fresh-pdf")
+            return {
+                "passed": True,
+                "checks": [
+                    {"id": "browser_geometry", "passed": True, "detail": "passed"},
+                    {"id": "computed_typography", "passed": True, "detail": "passed"},
+                    {"id": "single_page_pdf", "passed": True, "detail": "passed"},
+                ],
+                "preview_paths": {
+                    "poster_pdf": "qa/previews/poster-print.png",
+                    "poster_screen": "qa/previews/poster.png",
+                },
+            }
+
+        with mock.patch.object(harness, "_render_poster_outputs", side_effect=fresh_render):
+            deterministic = harness.validate_poster_attempt(
+                run,
+                attempt_id,
+                source_map_path=source_map,
+                allow_browser_install=False,
+            )
+        self.assertTrue(deterministic["passed"], deterministic)
+        attempt = run / "attempts" / attempt_id
+        self.assertEqual(
+            (attempt / "artifact" / "preview.png").read_bytes(), b"fresh-print-preview"
+        )
+        self.assertEqual((attempt / "artifact" / "poster.pdf").read_bytes(), b"fresh-pdf")
+        self.assertFalse(stale_atomic_output.exists())
+
+    def test_interrupted_output_cleanup_rejects_symlinked_parent_without_deleting_outside(self) -> None:
+        harness = _load_harness()
+        attempt = self.root / "attempt"
+        (attempt / "artifact").mkdir(parents=True)
+        outside = self.root / "outside"
+        (outside / "previews").mkdir(parents=True)
+        marker = outside / "previews" / "KEEP.txt"
+        marker.write_text("keep", encoding="utf-8")
+        (attempt / "qa").symlink_to(outside, target_is_directory=True)
+        with self.assertRaisesRegex(harness.core.PathSafetyError, "symlink"):
+            harness._clear_generated_attempt_outputs(attempt)
+        self.assertEqual(marker.read_text(encoding="utf-8"), "keep")
+
     @unittest.skipUnless(
         __import__("os").environ.get("AUTODESIGN_SKILL_REAL_BROWSER") == "1",
         "set AUTODESIGN_SKILL_REAL_BROWSER=1 for pinned Chromium/PDF integration",
     )
     def test_real_browser_renders_preview_and_exact_one_page_pdf(self) -> None:
         harness = _load_harness()
+        for generated in SKILL_ROOT.rglob("__pycache__"):
+            shutil.rmtree(generated)
         run = self.root / "real-browser-run"
         source = self.root / "paper.txt"
         source.write_text(
@@ -563,6 +927,289 @@ class AutoDesignPosterSkillTests(unittest.TestCase):
         self.assertGreater((attempt_root / "artifact" / "preview.png").stat().st_size, 1000)
         pdf_check = next(check for check in result["checks"] if check["id"] == "single_page_pdf")
         self.assertEqual(pdf_check["pages"], 1)
+        self.assertFalse(list(SKILL_ROOT.rglob("__pycache__")))
+
+    @unittest.skipUnless(
+        __import__("os").environ.get("AUTODESIGN_SKILL_REAL_BROWSER") == "1",
+        "set AUTODESIGN_SKILL_REAL_BROWSER=1 for pinned Chromium/PDF integration",
+    )
+    def test_real_browser_rejects_late_computed_typography_override(self) -> None:
+        harness = _load_harness()
+        run = self.root / "computed-typography-run"
+        source = self.root / "paper.txt"
+        source.write_text(
+            "Grounded poster source reports 85% accuracy and uses two-stage routing. "
+            "The grounded poster retains accuracy.",
+            encoding="utf-8",
+        )
+        harness.initialize_poster_run(run, source)
+        harness.save_poster_plan(run, _plan())
+        attempt = harness.begin_poster_attempt(run)
+        html = _poster_html().replace(
+            "</style>",
+            """
+[data-identity="title"], [data-identity="authors"],
+[data-identity="institutions"], h2, p, li, th, td {
+  font-size: 8px !important;
+}
+</style>""",
+        )
+        Path(attempt["poster_path"]).write_text(html, encoding="utf-8")
+        source_map = self.root / "computed-typography-source-map.json"
+        source_map.write_text(json.dumps({"claims": _claims()}), encoding="utf-8")
+        result = harness.validate_poster_attempt(
+            run,
+            attempt["attempt_id"],
+            source_map_path=source_map,
+            cache_root=Path(__import__("os").environ["AUTODESIGN_SKILL_BROWSER_CACHE"]),
+            allow_browser_install=False,
+        )
+        self.assertFalse(result["passed"], result)
+        typography = next(
+            check for check in result["checks"] if check["id"] == "computed_typography"
+        )
+        self.assertFalse(typography["passed"], typography)
+
+    @unittest.skipUnless(
+        __import__("os").environ.get("AUTODESIGN_SKILL_REAL_BROWSER") == "1",
+        "set AUTODESIGN_SKILL_REAL_BROWSER=1 for pinned Chromium/PDF integration",
+    )
+    def test_real_browser_rejects_nested_text_typography_override(self) -> None:
+        harness = _load_harness()
+        run = self.root / "nested-typography-run"
+        source = self.root / "paper.txt"
+        source.write_text(
+            "Grounded poster source reports 85% accuracy and uses two-stage routing. ",
+            encoding="utf-8",
+        )
+        harness.initialize_poster_run(run, source)
+        harness.save_poster_plan(run, _plan())
+        attempt = harness.begin_poster_attempt(run)
+        html = _poster_html().replace(
+            "Grounded Poster Study",
+            '<span style="font-size:8px!important">Grounded Poster Study</span>',
+            1,
+        )
+        Path(attempt["poster_path"]).write_text(html, encoding="utf-8")
+        source_map = self.root / "nested-typography-source-map.json"
+        source_map.write_text(json.dumps({"claims": _claims()}), encoding="utf-8")
+        result = harness.validate_poster_attempt(
+            run,
+            attempt["attempt_id"],
+            source_map_path=source_map,
+            cache_root=Path(os.environ["AUTODESIGN_SKILL_BROWSER_CACHE"]),
+            allow_browser_install=False,
+        )
+        self.assertFalse(result["passed"], result)
+        typography = next(
+            check for check in result["checks"] if check["id"] == "computed_typography"
+        )
+        self.assertFalse(typography["passed"], typography)
+
+    @unittest.skipUnless(
+        __import__("os").environ.get("AUTODESIGN_SKILL_REAL_BROWSER") == "1",
+        "set AUTODESIGN_SKILL_REAL_BROWSER=1 for pinned Chromium/PDF integration",
+    )
+    def test_real_browser_rejects_small_text_in_nonsemantic_body_element(self) -> None:
+        harness = _load_harness()
+        run = self.root / "div-typography-run"
+        source = self.root / "paper.txt"
+        source.write_text(
+            "Grounded poster source reports 85% accuracy and uses two-stage routing. ",
+            encoding="utf-8",
+        )
+        harness.initialize_poster_run(run, source)
+        harness.save_poster_plan(run, _plan())
+        attempt = harness.begin_poster_attempt(run)
+        html = _poster_html().replace(
+            '<p data-claim-id="c-problem" data-source-ids="ev-001">'
+            "The grounded poster source reports 85% accuracy.</p>",
+            '<div data-claim-id="c-problem" data-source-ids="ev-001" '
+            'style="font-size:8px!important">'
+            "The grounded poster source reports 85% accuracy.</div>",
+            1,
+        )
+        Path(attempt["poster_path"]).write_text(html, encoding="utf-8")
+        source_map = self.root / "div-typography-source-map.json"
+        source_map.write_text(json.dumps({"claims": _claims()}), encoding="utf-8")
+        result = harness.validate_poster_attempt(
+            run,
+            attempt["attempt_id"],
+            source_map_path=source_map,
+            cache_root=Path(os.environ["AUTODESIGN_SKILL_BROWSER_CACHE"]),
+            allow_browser_install=False,
+        )
+        self.assertFalse(result["passed"], result)
+        typography = next(
+            check for check in result["checks"] if check["id"] == "computed_typography"
+        )
+        self.assertFalse(typography["passed"], typography)
+
+    @unittest.skipUnless(
+        __import__("os").environ.get("AUTODESIGN_SKILL_REAL_BROWSER") == "1",
+        "set AUTODESIGN_SKILL_REAL_BROWSER=1 for pinned Chromium/PDF integration",
+    )
+    def test_real_browser_rejects_obfuscated_css_generated_text(self) -> None:
+        harness = _load_harness()
+        for index, declaration in enumerate(
+            (
+                'content/**/:"Fabricated accuracy 999%"',
+                'c\\6f ntent:"Fabricated accuracy 999%"',
+            ),
+            start=1,
+        ):
+            with self.subTest(declaration=declaration):
+                run = self.root / f"generated-content-run-{index}"
+                source = self.root / f"paper-{index}.txt"
+                source.write_text(
+                    "Grounded poster source reports 85% accuracy and uses two-stage routing. ",
+                    encoding="utf-8",
+                )
+                harness.initialize_poster_run(run, source)
+                harness.save_poster_plan(run, _plan())
+                attempt = harness.begin_poster_attempt(run)
+                html = _poster_html().replace(
+                    "</style>",
+                    'section[data-section-role="method"]::after {'
+                    f"{declaration};display:block;font-size:24px" + "}</style>",
+                )
+                Path(attempt["poster_path"]).write_text(html, encoding="utf-8")
+                source_map = self.root / f"generated-content-source-map-{index}.json"
+                source_map.write_text(json.dumps({"claims": _claims()}), encoding="utf-8")
+                result = harness.validate_poster_attempt(
+                    run,
+                    attempt["attempt_id"],
+                    source_map_path=source_map,
+                    cache_root=Path(os.environ["AUTODESIGN_SKILL_BROWSER_CACHE"]),
+                    allow_browser_install=False,
+                )
+                self.assertFalse(result["passed"], result)
+                typography = next(
+                    check
+                    for check in result["checks"]
+                    if check["id"] == "computed_typography"
+                )
+                self.assertFalse(typography["passed"], typography)
+                self.assertIn("generated content", typography["detail"])
+
+    @unittest.skipUnless(
+        __import__("os").environ.get("AUTODESIGN_SKILL_REAL_BROWSER") == "1",
+        "set AUTODESIGN_SKILL_REAL_BROWSER=1 for pinned Chromium/PDF integration",
+    )
+    def test_real_browser_rejects_obfuscated_list_marker_text(self) -> None:
+        harness = _load_harness()
+        run = self.root / "generated-marker-run"
+        source = self.root / "paper.txt"
+        source.write_text(
+            "Grounded poster source reports 85% accuracy and uses two-stage routing. ",
+            encoding="utf-8",
+        )
+        harness.initialize_poster_run(run, source)
+        harness.save_poster_plan(run, _plan())
+        attempt = harness.begin_poster_attempt(run)
+        html = _poster_html().replace(
+            "</style>",
+            'li::marker { c\\6f ntent:"Fabricated accuracy 999% "; }</style>',
+        )
+        Path(attempt["poster_path"]).write_text(html, encoding="utf-8")
+        source_map = self.root / "generated-marker-source-map.json"
+        source_map.write_text(json.dumps({"claims": _claims()}), encoding="utf-8")
+        result = harness.validate_poster_attempt(
+            run,
+            attempt["attempt_id"],
+            source_map_path=source_map,
+            cache_root=Path(os.environ["AUTODESIGN_SKILL_BROWSER_CACHE"]),
+            allow_browser_install=False,
+        )
+        self.assertFalse(result["passed"], result)
+        typography = next(
+            check for check in result["checks"] if check["id"] == "computed_typography"
+        )
+        self.assertFalse(typography["passed"], typography)
+        self.assertIn("generated content", typography["detail"])
+
+    @unittest.skipUnless(
+        __import__("os").environ.get("AUTODESIGN_SKILL_REAL_BROWSER") == "1",
+        "set AUTODESIGN_SKILL_REAL_BROWSER=1 for pinned Chromium/PDF integration",
+    )
+    def test_real_browser_rejects_screen_only_typography_override(self) -> None:
+        harness = _load_harness()
+        run = self.root / "screen-typography-run"
+        source = self.root / "paper.txt"
+        source.write_text(
+            "Grounded poster source reports 85% accuracy and uses two-stage routing. ",
+            encoding="utf-8",
+        )
+        harness.initialize_poster_run(run, source)
+        harness.save_poster_plan(run, _plan())
+        attempt = harness.begin_poster_attempt(run)
+        html = _poster_html().replace(
+            "</style>",
+            """
+@media screen {
+  [data-identity="title"], [data-identity="authors"],
+  [data-identity="institutions"], h2, p, li, th, td {
+    font-size: 8px !important;
+  }
+}
+</style>""",
+        )
+        Path(attempt["poster_path"]).write_text(html, encoding="utf-8")
+        source_map = self.root / "screen-typography-source-map.json"
+        source_map.write_text(json.dumps({"claims": _claims()}), encoding="utf-8")
+        result = harness.validate_poster_attempt(
+            run,
+            attempt["attempt_id"],
+            source_map_path=source_map,
+            cache_root=Path(os.environ["AUTODESIGN_SKILL_BROWSER_CACHE"]),
+            allow_browser_install=False,
+        )
+        self.assertFalse(result["passed"], result)
+        typography = next(
+            check for check in result["checks"] if check["id"] == "computed_typography"
+        )
+        self.assertFalse(typography["passed"], typography)
+
+    @unittest.skipUnless(
+        __import__("os").environ.get("AUTODESIGN_SKILL_REAL_BROWSER") == "1",
+        "set AUTODESIGN_SKILL_REAL_BROWSER=1 for pinned Chromium/PDF integration",
+    )
+    def test_review_context_binds_pdf_raster_when_print_layout_differs(self) -> None:
+        harness = _load_harness()
+        run = self.root / "print-preview-run"
+        source = self.root / "paper.txt"
+        source.write_text(
+            "Grounded poster source reports 85% accuracy and uses two-stage routing. ",
+            encoding="utf-8",
+        )
+        harness.initialize_poster_run(run, source)
+        harness.save_poster_plan(run, _plan())
+        attempt = harness.begin_poster_attempt(run)
+        html = _poster_html().replace(
+            "@media print {",
+            "@media print { .paper-poster { transform: scale(.5); transform-origin: top left; }",
+        )
+        Path(attempt["poster_path"]).write_text(html, encoding="utf-8")
+        source_map = self.root / "print-preview-source-map.json"
+        source_map.write_text(json.dumps({"claims": _claims()}), encoding="utf-8")
+        result = harness.validate_poster_attempt(
+            run,
+            attempt["attempt_id"],
+            source_map_path=source_map,
+            cache_root=Path(os.environ["AUTODESIGN_SKILL_BROWSER_CACHE"]),
+            allow_browser_install=False,
+        )
+        self.assertTrue(result["passed"], result)
+        context = harness.create_poster_review_context(run, attempt["attempt_id"])
+        self.assertEqual(set(context["preview_hashes"]), {"poster_pdf", "poster_screen"})
+        attempt_root = run / "attempts" / attempt["attempt_id"]
+        print_preview = attempt_root / "qa" / "previews" / "poster-print.png"
+        screen_preview = attempt_root / "qa" / "previews" / "poster.png"
+        self.assertNotEqual(print_preview.read_bytes(), screen_preview.read_bytes())
+        self.assertEqual(
+            (attempt_root / "artifact" / "preview.png").read_bytes(),
+            print_preview.read_bytes(),
+        )
 
 
 if __name__ == "__main__":

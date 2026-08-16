@@ -3,13 +3,18 @@
 
 from __future__ import annotations
 
+import sys
+
+sys.dont_write_bytecode = True
+
 import argparse
 import json
 import math
 import re
 import shutil
 import subprocess
-import sys
+import uuid
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
 from pathlib import Path
@@ -32,6 +37,13 @@ RELEASE_VERSION = "0.1.0"
 DEFAULT_PRESET = "cvpr-landscape"
 DEFAULT_MAX_ATTEMPTS = 4
 SUPPORTED_IMAGE_SUFFIXES = {".gif", ".jpeg", ".jpg", ".png", ".svg", ".webp"}
+SUPPORTED_SIDECAR_SUFFIXES = SUPPORTED_IMAGE_SUFFIXES | {
+    ".otf",
+    ".ttf",
+    ".woff",
+    ".woff2",
+}
+SUPPORTED_FONT_SUFFIXES = SUPPORTED_SIDECAR_SUFFIXES - SUPPORTED_IMAGE_SUFFIXES
 PRESETS: dict[str, dict[str, dict[str, float | int]]] = {
     "cvpr-landscape": {
         "canvas": {"width_px": 3072, "height_px": 1536},
@@ -86,10 +98,26 @@ _ARC_GROUPS = {
     "evidence": {"analysis", "evidence", "evaluation", "results"},
     "takeaway": {"conclusion", "discussion", "limitations", "takeaway"},
 }
-_UNSAFE_TAGS = {"base", "canvas", "embed", "iframe", "link", "object", "script"}
+_UNSAFE_TAGS = {
+    "base",
+    "button",
+    "canvas",
+    "dialog",
+    "embed",
+    "form",
+    "iframe",
+    "input",
+    "link",
+    "object",
+    "option",
+    "script",
+    "select",
+    "textarea",
+}
 _VOID_TAGS = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track", "wbr"}
 _URL_ATTRS = {"action", "formaction", "href", "poster", "src"}
 _CSS_URL_RE = re.compile(r"(?is)url\(\s*(['\"]?)(.*?)\1\s*\)")
+_CSS_CONTENT_RE = re.compile(r"(?is)(?:^|[;{])\s*content\s*:\s*([^;}]+)")
 _PAGE_SIZE_RE = re.compile(
     r"(?is)@page\s*\{[^{}]*?\bsize\s*:\s*"
     r"(?P<width>[0-9]+(?:\.[0-9]+)?)mm\s+"
@@ -102,6 +130,76 @@ _PDF_SIZE_RE = re.compile(
     r"(?im)^Page size:\s*([0-9]+(?:\.[0-9]+)?)\s+x\s+"
     r"([0-9]+(?:\.[0-9]+)?)\s+pts\b"
 )
+_COMPUTED_TYPOGRAPHY_SCRIPT = r"""
+() => {
+  const root = document.querySelector('main.paper-poster[data-autodesign-artifact="poster"]');
+  const violations = [];
+  const measurements = {title: [], identity: [], "section heading": [], body: []};
+  if (!root) return {passed: false, violations: ["poster root is missing"], measurements};
+  for (const element of [root, ...root.querySelectorAll("*")]) {
+    for (const pseudo of ["::before", "::after", "::marker"]) {
+      const content = (getComputedStyle(element, pseudo).content || "").trim();
+      if (!["", "none", "normal", '""', "''"].includes(content)) {
+        violations.push(`generated content is forbidden: ${element.tagName.toLowerCase()}${pseudo}`);
+      }
+    }
+  }
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  let textIndex = 0;
+  for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+    if (!(node.nodeValue || "").trim()) continue;
+    const owner = node.parentElement;
+    if (!owner || owner.closest("style, script, template, noscript")) continue;
+    const identity = owner.closest("[data-identity]")?.getAttribute("data-identity");
+    let label = "body";
+    let minimum = 24;
+    if (identity === "title") {
+      label = "title";
+      minimum = 56;
+    } else if (identity === "authors" || identity === "institutions") {
+      label = "identity";
+      minimum = 28;
+    } else if (owner.closest("h2, h3")) {
+      label = "section heading";
+      minimum = 36;
+    }
+    const style = getComputedStyle(owner);
+    const range = document.createRange();
+    range.selectNodeContents(node);
+    const rect = range.getBoundingClientRect();
+    const size = Number.parseFloat(style.fontSize);
+    let visiblyStyled = true;
+    for (let element = owner; element; element = element.parentElement) {
+      const ancestorStyle = getComputedStyle(element);
+      if (
+        ancestorStyle.display === "none" ||
+        ancestorStyle.visibility === "hidden" ||
+        Number.parseFloat(ancestorStyle.opacity || "1") <= 0
+      ) {
+        visiblyStyled = false;
+        break;
+      }
+      if (element === root) break;
+    }
+    const visible = visiblyStyled && rect.width > 0 && rect.height > 0;
+    measurements[label].push({
+      text_index: textIndex,
+      font_size_px: Number.isFinite(size) ? size : null,
+      visible,
+    });
+    if (!visible) {
+      violations.push(`${label}[${textIndex}]: not visibly rendered`);
+    } else if (!Number.isFinite(size) || size + 0.01 < minimum) {
+      violations.push(
+        `${label}[${textIndex}]: ${Number.isFinite(size) ? size : "invalid"}px < ${minimum}px`,
+      );
+    }
+    textIndex += 1;
+  }
+  if (!textIndex) violations.push("poster contains no rendered text");
+  return {passed: violations.length === 0, violations, measurements};
+}
+"""
 
 
 class PosterContractError(core.ContractError):
@@ -131,7 +229,13 @@ class _PosterParser(HTMLParser):
         self.declarations.append(decl.strip().lower())
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        normalized = {str(key).lower(): str(value or "") for key, value in attrs}
+        normalized: dict[str, str] = {}
+        for key, value in attrs:
+            name = str(key).lower()
+            if name in normalized:
+                self.parse_errors.append(f"duplicate attribute on {tag.lower()}: {name}")
+                continue
+            normalized[name] = str(value or "")
         parent = self.stack[-1] if self.stack else None
         self.elements.append(_Element(tag.lower(), normalized, parent))
         index = len(self.elements) - 1
@@ -469,6 +573,53 @@ def _validate_local_url(raw: str, *, html_path: Path, artifact_root: Path) -> st
     return None
 
 
+def _validate_svg_sidecar(path: Path, relative: str) -> list[str]:
+    """Reject executable or externally dependent SVG sidecars."""
+
+    if path.stat().st_size > 8 * 1024 * 1024:
+        return [f"SVG dependency exceeds the 8 MiB limit: {relative}"]
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except UnicodeError:
+        return [f"SVG dependency is not UTF-8: {relative}"]
+    if re.search(r"(?is)<!doctype|<!entity", raw):
+        return [f"SVG dependency contains a document type or entity: {relative}"]
+    errors: list[str] = []
+    try:
+        root = ET.fromstring(raw)
+    except ET.ParseError:
+        return [*errors, f"SVG dependency is malformed: {relative}"]
+    if root.tag.rsplit("}", 1)[-1].lower() != "svg":
+        errors.append(f"SVG dependency has a non-SVG root: {relative}")
+    forbidden_tags = {"foreignobject", "iframe", "object", "script"}
+    for element in root.iter():
+        tag = element.tag.rsplit("}", 1)[-1].lower()
+        if tag in forbidden_tags:
+            errors.append(f"SVG dependency contains forbidden {tag}: {relative}")
+        for raw_name, value in element.attrib.items():
+            name = raw_name.rsplit("}", 1)[-1].lower()
+            lowered = value.strip().lower()
+            if name.startswith("on"):
+                errors.append(f"SVG dependency contains an event handler: {relative}")
+            if name in {"href", "src"} and value.strip() and not value.strip().startswith("#"):
+                errors.append(f"SVG dependency contains an external reference: {relative}")
+            if "javascript:" in lowered or re.search(r"(?i)url\(\s*(?!['\"]?#)", value):
+                errors.append(f"SVG dependency contains an unsafe URL: {relative}")
+        css_fragments = []
+        if tag == "style" and element.text:
+            css_fragments.append(element.text)
+        if element.attrib.get("style"):
+            css_fragments.append(element.attrib["style"])
+        for css_fragment in css_fragments:
+            if re.search(r"(?i)@import|expression\s*\(|javascript:", css_fragment):
+                errors.append(f"SVG dependency contains unsafe CSS: {relative}")
+            for match in _CSS_URL_RE.finditer(css_fragment):
+                target = match.group(2).strip()
+                if target and not target.startswith("#"):
+                    errors.append(f"SVG dependency contains unsafe CSS: {relative}")
+    return list(dict.fromkeys(errors))
+
+
 def lint_poster_html(
     html_path: Path | str,
     *,
@@ -476,6 +627,7 @@ def lint_poster_html(
     plan: Mapping[str, Any],
     claims: Sequence[Mapping[str, Any]],
     evidence_ids: Sequence[str] = (),
+    visual_catalog: Sequence[Mapping[str, Any]] = (),
 ) -> dict[str, Any]:
     """Run deterministic static gates before browser execution."""
 
@@ -504,6 +656,11 @@ def lint_poster_html(
     for element in parser.elements:
         if element.tag in _UNSAFE_TAGS:
             unsafe.append(f"unsafe tag: {element.tag}")
+        if (
+            element.tag == "meta"
+            and element.attrs.get("http-equiv", "").strip().lower() == "refresh"
+        ):
+            unsafe.append("meta refresh navigation is forbidden")
         for name, value in element.attrs.items():
             if name.startswith("on"):
                 unsafe.append(f"event handler attribute: {name}")
@@ -515,6 +672,12 @@ def lint_poster_html(
     css = "\n".join(element.visible_text() for element in parser.elements if element.tag == "style")
     if re.search(r"(?i)@import|expression\s*\(|javascript:", css):
         unsafe.append("unsafe CSS import or expression")
+    for match in _CSS_CONTENT_RE.finditer(css):
+        value = re.sub(r"(?i)\s*!important\s*$", "", match.group(1)).strip()
+        if value.lower() not in {"none", "normal", '""', "''"} and not re.fullmatch(
+            r'(?:"\s*"|\'\s*\')', value
+        ):
+            unsafe.append("visible CSS generated content is forbidden")
     checks.append(_check("document_contract", not unsafe, "; ".join(unsafe) or "safe standalone HTML"))
 
     roots = [
@@ -641,14 +804,50 @@ def lint_poster_html(
         for source_id in claim.get("source_ids", [])
         if isinstance(claim.get("source_ids"), list)
     }
+    allocations = [dict(item) for item in normalized_plan["visual_allocations"]]
+    allocated_ids = [str(item["visual_id"]) for item in allocations]
+    visuals_by_id = {
+        str(item.get("id") or ""): dict(item)
+        for item in visual_catalog
+        if isinstance(item, Mapping) and item.get("id")
+    }
+    used_visual_ids: list[str] = []
     for element in parser.elements:
         claim_id = element.attrs.get("data-claim-id")
         if claim_id:
             claimed_elements.setdefault(claim_id, []).append(element)
         if element.tag in {"section", "article"} and not _split_ids(element.attrs.get("data-source-ids", "")):
             binding_errors.append(f"{element.tag} is missing data-source-ids")
-        if element.tag == "img" and not element.attrs.get("data-source-id"):
-            binding_errors.append("source image is missing data-source-id")
+        if element.tag == "img":
+            visual_id = element.attrs.get("data-source-id", "").strip()
+            if not visual_id:
+                binding_errors.append("source image is missing data-source-id")
+                continue
+            used_visual_ids.append(visual_id)
+            if visual_id not in allocated_ids:
+                binding_errors.append(f"source image is not allocated: {visual_id}")
+                continue
+            visual = visuals_by_id.get(visual_id)
+            if visual is None or visual.get("eligibility") != "eligible":
+                binding_errors.append(f"source image is absent or ineligible: {visual_id}")
+                continue
+            catalog_path = str(visual.get("path") or "")
+            suffix = Path(catalog_path).suffix.lower()
+            expected_src = f"assets/{visual_id}{suffix}"
+            actual_src = unquote(urlsplit(element.attrs.get("src", "")).path)
+            if actual_src != expected_src:
+                binding_errors.append(
+                    f"source image path does not match its staged allocation: {visual_id}"
+                )
+                continue
+            try:
+                staged = core.safe_path(artifact, expected_src, must_exist=True)
+                staged_hash = core.sha256_file(staged)
+            except core.PortableError:
+                binding_errors.append(f"source image staged path is unsafe: {visual_id}")
+                continue
+            if staged_hash != visual.get("sha256"):
+                binding_errors.append(f"source image hash does not match its catalog: {visual_id}")
     for claim_id, elements in claimed_elements.items():
         claim = by_claim.get(claim_id)
         if claim is None:
@@ -662,8 +861,12 @@ def lint_poster_html(
         actual_ids = set(_split_ids(element.attrs.get("data-source-ids", "")))
         if actual_ids != expected_ids:
             binding_errors.append(f"claim source IDs do not match: {claim_id}")
-        if _normalize_space(str(claim.get("text") or "")).lower() not in element.visible_text().lower():
-            binding_errors.append(f"visible claim text does not match source map: {claim_id}")
+        expected_text = _normalize_space(str(claim.get("text") or "")).casefold()
+        actual_text = element.visible_text().casefold()
+        if actual_text != expected_text:
+            binding_errors.append(
+                f"visible claim text must exactly match its source map: {claim_id}"
+            )
     missing_claims = sorted(set(by_claim) - set(claimed_elements))
     if missing_claims:
         binding_errors.append(f"claims missing from poster: {', '.join(missing_claims)}")
@@ -672,12 +875,32 @@ def lint_poster_html(
         unknown_ids = sorted(set(source_ids) - known_evidence_ids)
         if unknown_ids:
             binding_errors.append(f"unknown evidence IDs in HTML: {', '.join(unknown_ids)}")
+    mapped_numbers: set[str] = set()
+    for claim in claim_values:
+        mapped_numbers.update(core._numbers(str(claim.get("text") or "")))
+    visible_body_numbers: set[str] = set()
+    for element in parser.elements:
+        if element.tag in {"article", "section"}:
+            visible_body_numbers.update(core._numbers(element.visible_text()))
+    unsupported_numbers = sorted(visible_body_numbers - mapped_numbers)
+    if unsupported_numbers:
+        binding_errors.append(
+            f"unsupported visible numbers outside the source map: {', '.join(unsupported_numbers)}"
+        )
+    missing_visuals = sorted(set(allocated_ids) - set(used_visual_ids))
+    if missing_visuals:
+        binding_errors.append(f"allocated source images are missing: {', '.join(missing_visuals)}")
+    repeated_visuals = sorted(
+        visual_id for visual_id in set(used_visual_ids) if used_visual_ids.count(visual_id) > allocated_ids.count(visual_id)
+    )
+    if repeated_visuals:
+        binding_errors.append(f"source images exceed planned reuse: {', '.join(repeated_visuals)}")
     checks.append(_check("source_bindings", not binding_errors, "; ".join(dict.fromkeys(binding_errors)) or "visible claims and source IDs are bound"))
 
     local_errors: list[str] = []
     referenced_files: set[str] = set()
 
-    def record_local_url(url: str) -> None:
+    def record_local_url(url: str, *, reference_kind: str) -> None:
         error = _validate_local_url(url, html_path=html, artifact_root=artifact)
         if error:
             local_errors.append(error)
@@ -687,7 +910,15 @@ def lint_poster_html(
             return
         relative = Path(urlsplit(value).path.replace("\\", "/"))
         resolved = (html.parent / relative).resolve(strict=True)
-        referenced_files.add(resolved.relative_to(artifact.resolve(strict=True)).as_posix())
+        resolved_relative = resolved.relative_to(artifact.resolve(strict=True)).as_posix()
+        suffix = resolved.suffix.lower()
+        if suffix in SUPPORTED_IMAGE_SUFFIXES and reference_kind != "img":
+            local_errors.append(
+                f"CSS image and non-img image references are forbidden; use an allocated img: {resolved_relative}"
+            )
+        elif suffix in SUPPORTED_FONT_SUFFIXES and reference_kind != "css":
+            local_errors.append(f"font dependencies must be referenced from CSS: {resolved_relative}")
+        referenced_files.add(resolved_relative)
 
     for element in parser.elements:
         for name, value in element.attrs.items():
@@ -696,19 +927,30 @@ def lint_poster_html(
                 values = [value]
             elif name == "srcset":
                 values = [part.strip().split()[0] for part in value.split(",") if part.strip()]
+                if values:
+                    local_errors.append("poster images must not use srcset; use one allocated img src")
             for url in values:
-                record_local_url(url)
+                record_local_url(
+                    url,
+                    reference_kind="img" if element.tag == "img" and name == "src" else "html",
+                )
     for match in _CSS_URL_RE.finditer(css):
-        record_local_url(match.group(2))
+        record_local_url(match.group(2), reference_kind="css")
     for element in parser.elements:
         for match in _CSS_URL_RE.finditer(element.attrs.get("style", "")):
-            record_local_url(match.group(2))
+            record_local_url(match.group(2), reference_kind="css")
     actual_files: set[str] = set()
     for path in artifact.rglob("*"):
         if path.is_symlink():
             local_errors.append(f"symlinked artifact file: {path.name}")
         elif path.is_file() and path != html:
-            actual_files.add(path.relative_to(artifact).as_posix())
+            relative = path.relative_to(artifact).as_posix()
+            actual_files.add(relative)
+            suffix = path.suffix.lower()
+            if suffix not in SUPPORTED_SIDECAR_SUFFIXES:
+                local_errors.append(f"unsupported artifact dependency: {relative}")
+            elif suffix == ".svg":
+                local_errors.extend(_validate_svg_sidecar(path, relative))
     unreferenced = sorted(actual_files - referenced_files)
     if unreferenced:
         local_errors.append(f"unreferenced artifact files: {', '.join(unreferenced)}")
@@ -792,6 +1034,31 @@ def _safe_worker_output(path: Path, root: Path) -> Path:
     return path
 
 
+def _clear_generated_attempt_outputs(attempt: Path) -> None:
+    """Remove only harness-owned outputs before a fresh deterministic pass."""
+
+    for relative in (
+        "artifact/poster.pdf",
+        "artifact/preview.png",
+        "qa/poster-output.json",
+        "qa/deterministic.json",
+        "qa/previews",
+    ):
+        target = core.safe_path(attempt, relative)
+        if target.is_dir():
+            shutil.rmtree(target)
+        elif target.exists():
+            target.unlink()
+    artifact = core.safe_path(attempt, "artifact", must_exist=True)
+    for pattern in (".poster.pdf.tmp-*", ".preview.png.tmp-*"):
+        for stale in artifact.glob(pattern):
+            target = core.safe_path(attempt, f"artifact/{stale.name}", must_exist=True)
+            if not target.is_file():
+                raise core.PathSafetyError(f"stale render output is not a regular file: {target}")
+            target.unlink()
+    core.safe_path(attempt, "qa/previews").mkdir(parents=True, exist_ok=True)
+
+
 def _browser_export_main(argv: Sequence[str]) -> int:
     """Pinned-runtime worker entry point; not a user-facing command."""
 
@@ -840,9 +1107,14 @@ def _browser_export_main(argv: Sequence[str]) -> int:
         page = context.new_page()
         try:
             page.goto(html.as_uri(), wait_until="load", timeout=30_000)
-            page.emulate_media(media="print", reduced_motion="reduce")
+            page.emulate_media(media="screen", reduced_motion="reduce")
+            page.evaluate("document.fonts ? document.fonts.ready : Promise.resolve()")
             if blocked:
                 raise PosterContractError("network or outside-artifact request was blocked during PDF export")
+            screen_typography = page.evaluate(_COMPUTED_TYPOGRAPHY_SCRIPT)
+            page.emulate_media(media="print", reduced_motion="reduce")
+            page.evaluate("document.fonts ? document.fonts.ready : Promise.resolve()")
+            print_typography = page.evaluate(_COMPUTED_TYPOGRAPHY_SCRIPT)
             pdf_bytes = page.pdf(
                 width=f"{args.width_mm:.4f}mm",
                 height=f"{args.height_mm:.4f}mm",
@@ -850,11 +1122,33 @@ def _browser_export_main(argv: Sequence[str]) -> int:
                 print_background=True,
                 prefer_css_page_size=True,
             )
+            if blocked:
+                raise PosterContractError("network or outside-artifact request was blocked during PDF export")
             core.atomic_write_bytes(output, pdf_bytes)
         finally:
             context.close()
             browser.close()
-    print(json.dumps({"status": "ok", "blocked_requests": blocked}, sort_keys=True))
+    print(
+        json.dumps(
+            {
+                "status": "ok",
+                "blocked_requests": blocked,
+                "computed_typography": {
+                    "passed": screen_typography.get("passed") is True
+                    and print_typography.get("passed") is True,
+                    "violations": [
+                        *[f"screen: {item}" for item in screen_typography.get("violations", [])],
+                        *[f"print: {item}" for item in print_typography.get("violations", [])],
+                    ],
+                    "measurements": {
+                        "screen": screen_typography.get("measurements", {}),
+                        "print": print_typography.get("measurements", {}),
+                    },
+                },
+            },
+            sort_keys=True,
+        )
+    )
     return 0
 
 
@@ -866,7 +1160,7 @@ def _export_pdf(
     pdf: Path,
     width_mm: float,
     height_mm: float,
-) -> None:
+) -> dict[str, Any]:
     bootstrap = (
         "import sys;"
         f"sys.path.insert(0,{str(SCRIPT_DIR)!r});"
@@ -876,6 +1170,7 @@ def _export_pdf(
     command = [
         str(runtime.python_executable),
         "-I",
+        "-B",
         "-c",
         bootstrap,
         "--html",
@@ -904,6 +1199,64 @@ def _export_pdf(
     if completed.returncode != 0:
         detail = core.redact_secrets((completed.stderr or completed.stdout).strip())
         raise PosterContractError(f"poster PDF export failed: {detail}")
+    try:
+        payload = json.loads(completed.stdout)
+    except json.JSONDecodeError as error:
+        raise PosterContractError("poster PDF export returned invalid diagnostics") from error
+    typography = payload.get("computed_typography") if isinstance(payload, dict) else None
+    if (
+        not isinstance(typography, dict)
+        or not isinstance(typography.get("passed"), bool)
+        or not isinstance(typography.get("violations"), list)
+    ):
+        raise PosterContractError("poster PDF export omitted computed typography diagnostics")
+    return payload
+
+
+def _rasterize_pdf_preview(
+    pdf: Path,
+    output: Path,
+    *,
+    width_px: int,
+    height_px: int,
+) -> None:
+    """Render the reviewed preview from the actual one-page PDF bytes."""
+
+    executable = shutil.which("pdftoppm")
+    if not executable:
+        raise PosterContractError("pdftoppm is required to review the exported poster PDF")
+    output = _safe_worker_output(output, output.parents[2])
+    output.parent.mkdir(parents=True, exist_ok=True)
+    prefix = output.with_name(f".{output.stem}.tmp-{uuid.uuid4().hex}")
+    temporary = Path(f"{prefix}.png")
+    try:
+        completed = subprocess.run(
+            [
+                executable,
+                "-png",
+                "-f",
+                "1",
+                "-l",
+                "1",
+                "-singlefile",
+                "-scale-to-x",
+                str(width_px),
+                "-scale-to-y",
+                str(height_px),
+                str(pdf),
+                str(prefix),
+            ],
+            text=True,
+            capture_output=True,
+            timeout=120,
+            check=False,
+        )
+        if completed.returncode != 0 or not temporary.is_file():
+            detail = core.redact_secrets((completed.stderr or completed.stdout).strip())
+            raise PosterContractError(f"poster PDF preview rendering failed: {detail}")
+        core.atomic_write_bytes(output, temporary.read_bytes())
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _render_poster_outputs(
@@ -940,16 +1293,23 @@ def _render_poster_outputs(
         else "pinned Chromium found overflow, clipping, blank render, missing assets, or runtime errors",
         report="qa/previews/audit.json",
     )
-    if preview.is_file():
-        core.atomic_write_bytes(artifact / "preview.png", preview.read_bytes())
     pdf = artifact / "poster.pdf"
-    _export_pdf(
+    export_report = _export_pdf(
         runtime,
         html=html,
         artifact_root=artifact,
         pdf=pdf,
         width_mm=plan["print"]["width_mm"],
         height_mm=plan["print"]["height_mm"],
+    )
+    typography = export_report["computed_typography"]
+    typography_check = _check(
+        "computed_typography",
+        typography["passed"] is True,
+        "rendered poster typography meets every minimum"
+        if typography["passed"] is True
+        else "; ".join(str(item) for item in typography["violations"]),
+        measurements=typography.get("measurements", {}),
     )
     pdfinfo = shutil.which("pdfinfo")
     if not pdfinfo:
@@ -968,12 +1328,23 @@ def _render_poster_outputs(
         expected_width_mm=plan["print"]["width_mm"],
         expected_height_mm=plan["print"]["height_mm"],
     )
-    checks = [browser_check, pdf_check]
+    print_preview = preview_dir / "poster-print.png"
+    _rasterize_pdf_preview(
+        pdf,
+        print_preview,
+        width_px=int(canvas["width_px"]),
+        height_px=int(canvas["height_px"]),
+    )
+    core.atomic_write_bytes(artifact / "preview.png", print_preview.read_bytes())
+    checks = [browser_check, typography_check, pdf_check]
     result = {
         "format_version": FORMAT_VERSION,
         "passed": all(check["passed"] for check in checks),
         "checks": checks,
-        "preview_path": "qa/previews/poster.png",
+        "preview_paths": {
+            "poster_pdf": "qa/previews/poster-print.png",
+            "poster_screen": "qa/previews/poster.png",
+        },
         "browser_report": browser_report,
     }
     core.atomic_write_json(attempt_root / "qa" / "poster-output.json", result)
@@ -1000,16 +1371,22 @@ def validate_poster_attempt(
     allow_browser_install: bool = True,
 ) -> dict[str, Any]:
     run = Path(run_dir).absolute()
+    core.resume_run(run, skill_root=SKILL_ROOT)
     state = _read_run(run)
     if state.get("state") != "authoring" or state.get("active_attempt") != attempt_id:
         raise PosterContractError("validation must target the active authoring attempt")
     plan = _load_plan(run)
     attempt = core.safe_path(run / "attempts", attempt_id, must_exist=True)
     artifact = attempt / "artifact"
+    _clear_generated_attempt_outputs(attempt)
     source_map_input = _read_json_object(source_map_path)
     if set(source_map_input) != {"claims"} or not isinstance(source_map_input["claims"], list):
         raise PosterContractError("source-map input must contain only a claims list")
     core.write_source_map(run, attempt_id, source_map_input["claims"])
+    visual_contract = _read_json_object(run / "evidence" / "source_visuals.json")
+    visual_catalog = visual_contract.get("visuals")
+    if not isinstance(visual_catalog, list):
+        raise PosterContractError("source visual catalog requires a visuals list")
     static = lint_poster_html(
         artifact / "poster.html",
         artifact_root=artifact,
@@ -1020,6 +1397,7 @@ def validate_poster_attempt(
             for item in core.load_evidence(run)
             if isinstance(item, Mapping) and item.get("id")
         ],
+        visual_catalog=visual_catalog,
     )
     checks = list(static["checks"])
     preview_paths: dict[str, str] = {}
@@ -1035,8 +1413,9 @@ def validate_poster_attempt(
             checks.append(_check("browser_and_pdf_delivery", False, str(core.redact_secrets(str(error)))))
         else:
             checks.extend(rendered["checks"])
-            if (attempt / rendered["preview_path"]).is_file():
-                preview_paths["poster_full"] = rendered["preview_path"]
+            for frame_id, relative in rendered.get("preview_paths", {}).items():
+                if (attempt / relative).is_file():
+                    preview_paths[str(frame_id)] = str(relative)
     passed = bool(checks) and all(check["passed"] for check in checks)
     required = {"artifact/poster.html", "artifact/poster.pdf", "artifact/preview.png"}
     artifact_paths = _attempt_artifact_paths(attempt)

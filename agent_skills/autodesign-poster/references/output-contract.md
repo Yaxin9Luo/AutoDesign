@@ -43,8 +43,10 @@ artifact.
 
 Create one standalone `artifact/poster.html` with:
 
-- `<!doctype html>` and no script, iframe, remote asset, hotlink, data URL,
-  event-handler attribute, CSS import, or symlinked dependency;
+- `<!doctype html>` and no script, iframe, form control, remote asset, hotlink,
+  data URL, event-handler attribute, CSS import, duplicate HTML attribute, or
+  symlinked dependency. CSS generated content must be empty; put every visible
+  word in native HTML text instead of `content` on a pseudo-element;
 - exactly one root
   `<main class="paper-poster" data-autodesign-artifact="poster">`;
 - root `data-canvas-width`, `data-canvas-height`, `data-print-width-mm`, and
@@ -64,7 +66,8 @@ Create one standalone `artifact/poster.html` with:
   identified with `data-source-id` and loaded from its staged local path;
 - an exact dependency closure: every non-HTML file in the attempt artifact
   directory is referenced by the HTML, and every referenced file is local,
-  present, non-symlinked, and contained in that directory;
+  present, non-symlinked, contained in that directory, and an approved image or
+  font sidecar. SVG images must be self-contained and non-executable;
 - substantial editable HTML text, at least one native HTML table with real
   cells, and SVG text kept as text. Never flatten the poster or a table into a
   screenshot;
@@ -110,13 +113,17 @@ arc, and typography. Only a static pass may launch pinned Chromium. Browser QA
 must show a nonblank canvas with no overflow, clipping, missing asset, console
 error, or blocked request. The harness then writes and probes
 `artifact/poster.pdf`; it must be exactly one page at the planned physical size.
+The harness rasterizes that exact PDF to `qa/previews/poster-print.png`.
+Fresh semantic review is bound to both the screen render and this PDF render, so
+print-only layout changes cannot bypass visual review. `artifact/preview.png`
+is the PDF-raster preview.
 
 The reviewed artifact set is exact and immutable:
 
 - `artifact/poster.html`
 - `artifact/poster.pdf`
 - `artifact/preview.png`
-- any staged files below `artifact/assets/`
+- every validated, HTML-referenced image or font below `artifact/assets/`
 
 Finalization atomically promotes a passing, independently reviewed attempt and
 adds `provenance/source-map.json`. A preview alone, HTML scaffold, fallback PDF,

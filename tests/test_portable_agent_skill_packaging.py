@@ -308,14 +308,9 @@ class PortableAgentSkillPackagingTests(unittest.TestCase):
             tampered = False
             with zipfile.ZipFile(archive, "w") as target:
                 for info, content in entries:
-                    if info.filename.endswith("/SKILL.md"):
-                        updated = content.replace(
-                            b"Create a conference poster",
-                            b"Create a polished conference poster",
-                            1,
-                        )
-                        tampered = tampered or updated != content
-                        content = updated
+                    if not tampered and info.filename.endswith("/SKILL.md"):
+                        content += b"\n# tampered archive\n"
+                        tampered = True
                     target.writestr(info, content)
             self.assertTrue(tampered)
 
