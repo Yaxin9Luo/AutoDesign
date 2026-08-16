@@ -11,6 +11,8 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SKILLS_ROOT = REPO_ROOT / "agent_skills"
+SKILLS_README = SKILLS_ROOT / "README.md"
+ROOT_README = REPO_ROOT / "README.md"
 APPROVED_SKILLS = (
     "autodesign-poster",
     "autodesign-ppt",
@@ -34,6 +36,31 @@ def _frontmatter(skill_file: Path) -> dict[str, str]:
 
 
 class PortableAgentSkillPackageTests(unittest.TestCase):
+    def test_public_docs_cover_agent_discovery_interpreters_and_prerequisites(self) -> None:
+        skills_documentation = SKILLS_README.read_text(encoding="utf-8")
+        root_documentation = ROOT_README.read_text(encoding="utf-8")
+
+        self.assertIn("Agent Skills", root_documentation)
+        self.assertIn("./agent_skills/README.md", root_documentation)
+        for destination in (
+            "~/.agents/skills",
+            "~/.codex/skills",
+            "~/.dsh/skills",
+            "~/.claude/skills",
+        ):
+            self.assertIn(destination, skills_documentation)
+        for interpreter in ("python3", "python", "py -3"):
+            self.assertIn(interpreter, skills_documentation)
+        for prerequisite in (
+            "Poppler",
+            "LibreOffice",
+            "Node.js 22+",
+            "ffmpeg",
+            "ffprobe",
+            "Python 3.10–3.12",
+        ):
+            self.assertIn(prerequisite, skills_documentation)
+
     def test_exact_approved_skill_packages_exist(self) -> None:
         package_names = sorted(
             path.name

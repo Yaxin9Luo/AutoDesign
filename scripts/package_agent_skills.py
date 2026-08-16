@@ -16,6 +16,11 @@ import tempfile
 import zipfile
 from pathlib import Path, PurePosixPath
 
+sys.dont_write_bytecode = True
+_SCRIPT_DIR = Path(__file__).resolve().parent
+if str(_SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPT_DIR))
+
 from validate_agent_skills import (
     APPROVED_SKILLS,
     validate_agent_skills,
@@ -28,6 +33,10 @@ _ZIP_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
 _FILE_MODE = 0o644
 _MAX_ARCHIVE_ENTRIES = 10_000
 _MAX_UNCOMPRESSED_BYTES = 256 * 1024 * 1024
+_RELEASE_TOOLS = (
+    "package_agent_skills.py",
+    "validate_agent_skills.py",
+)
 
 
 class PackageError(RuntimeError):
@@ -118,6 +127,16 @@ def build_release(source_root: Path, output_dir: Path, version: str) -> Path:
         tempfile.mkdtemp(prefix=f".{output_dir.name}.building-", dir=output_dir.parent)
     )
     try:
+        release_tools: dict[str, str] = {}
+        for name in _RELEASE_TOOLS:
+            source = _SCRIPT_DIR / name
+            if source.is_symlink() or not source.is_file():
+                raise PackageError(f"release tool is missing or unsafe: {source}")
+            destination = stage / name
+            destination.write_bytes(source.read_bytes())
+            destination.chmod(_FILE_MODE)
+            release_tools[name] = _sha256(destination)
+
         manifest_skills: dict[str, dict[str, object]] = {}
         for skill_name in APPROVED_SKILLS:
             archive_name = f"{skill_name}-{version}.zip"
@@ -137,6 +156,7 @@ def build_release(source_root: Path, output_dir: Path, version: str) -> Path:
 
         manifest = {
             "format_version": 1,
+            "release_tools": release_tools,
             "skills": manifest_skills,
             "version": version,
         }

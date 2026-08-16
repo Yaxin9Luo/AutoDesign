@@ -37,6 +37,7 @@
 
 <p align="center">
   <a href="#user-content-demos"><strong>Demos</strong></a> ·
+  <a href="#user-content-agent-skills">Agent Skills</a> ·
   <a href="#user-content-quickstart">Quickstart</a> ·
   <a href="#user-content-paper-suite">Paper Suite</a> ·
   <a href="#user-content-methodology">Methodology</a> ·
@@ -83,6 +84,17 @@ research webpage, and a six-minute 1080p conference video.
     </td>
   </tr>
 </table>
+
+<a id="agent-skills"></a>
+
+## <img src="./assets/readme/icons/blocks.svg" width="26" alt="" align="absmiddle"> Agent Skills · Use AutoDesign without the server
+
+Install the standalone Poster, PPT, Webpage, or Video Skill directly in Codex,
+Claude Code, or DeepSeek Harness. Each Skill carries its own lightweight local
+harness and keeps editable artifacts, evidence, attempts, and review state in
+your chosen output directory—no AutoDesign application server required.
+
+[Open the Agent Skills install guide →](./agent_skills/README.md)
 
 <a id="quickstart"></a>
 

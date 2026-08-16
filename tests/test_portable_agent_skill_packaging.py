@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
 import stat
 import subprocess
@@ -16,6 +17,10 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 SKILLS_ROOT = REPO_ROOT / "agent_skills"
 PACKAGER = REPO_ROOT / "scripts" / "package_agent_skills.py"
 VERSION = "0.1.0"
+RELEASE_TOOLS = (
+    "package_agent_skills.py",
+    "validate_agent_skills.py",
+)
 APPROVED_SKILLS = (
     "autodesign-poster",
     "autodesign-ppt",
@@ -55,7 +60,7 @@ class PortableAgentSkillPackagingTests(unittest.TestCase):
             self.assertEqual(first_result.returncode, 0, first_result.stdout + first_result.stderr)
             self.assertEqual(second_result.returncode, 0, second_result.stdout + second_result.stderr)
 
-            expected_files = {"manifest.json"}
+            expected_files = {"manifest.json", *RELEASE_TOOLS}
             for name in APPROVED_SKILLS:
                 expected_files.add(f"{name}-{VERSION}.zip")
                 expected_files.add(f"{name}-{VERSION}.zip.sha256")
@@ -69,6 +74,16 @@ class PortableAgentSkillPackagingTests(unittest.TestCase):
             manifest = json.loads((first / "manifest.json").read_text(encoding="utf-8"))
             self.assertEqual(manifest["version"], VERSION)
             self.assertEqual(sorted(manifest["skills"]), sorted(APPROVED_SKILLS))
+            self.assertEqual(sorted(manifest["release_tools"]), sorted(RELEASE_TOOLS))
+
+            for name in RELEASE_TOOLS:
+                first_tool = first / name
+                second_tool = second / name
+                self.assertEqual(first_tool.read_bytes(), second_tool.read_bytes())
+                self.assertEqual(
+                    manifest["release_tools"][name],
+                    hashlib.sha256(first_tool.read_bytes()).hexdigest(),
+                )
 
             for name in APPROVED_SKILLS:
                 archive_name = f"{name}-{VERSION}.zip"
@@ -95,6 +110,57 @@ class PortableAgentSkillPackagingTests(unittest.TestCase):
                         self.assertNotIn("..", Path(info.filename).parts)
                         self.assertEqual(info.date_time, (1980, 1, 1, 0, 0, 0))
                         self.assertEqual((info.external_attr >> 16) & 0o777, 0o644)
+
+    def test_release_local_installer_runs_outside_repo_without_mutating_release(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            temp = Path(temporary)
+            release = temp / "downloaded-release"
+            result = _build(release)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            archive = release / f"{APPROVED_SKILLS[0]}-{VERSION}.zip"
+            checksum = release / f"{archive.name}.sha256"
+            installer = release / "package_agent_skills.py"
+            self.assertTrue(installer.is_file(), "release must bundle its installer")
+            destination = temp / "host-home" / "skills"
+            outside = temp / "unrelated-working-directory"
+            outside.mkdir()
+            before = {
+                path.relative_to(release).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+                for path in release.rglob("*")
+                if path.is_file()
+            }
+            environment = os.environ.copy()
+            environment.pop("PYTHONHOME", None)
+            environment.pop("PYTHONPATH", None)
+
+            install = subprocess.run(
+                [
+                    sys.executable,
+                    "-I",
+                    str(installer),
+                    "install",
+                    "--archive",
+                    str(archive),
+                    "--checksum",
+                    str(checksum),
+                    "--destination",
+                    str(destination),
+                ],
+                cwd=outside,
+                env=environment,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(install.returncode, 0, install.stdout + install.stderr)
+            self.assertTrue((destination / APPROVED_SKILLS[0] / "SKILL.md").is_file())
+            after = {
+                path.relative_to(release).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+                for path in release.rglob("*")
+                if path.is_file()
+            }
+            self.assertEqual(after, before)
 
     def test_build_refuses_to_overwrite_an_existing_release(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
