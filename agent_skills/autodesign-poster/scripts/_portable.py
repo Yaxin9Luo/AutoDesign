@@ -36,23 +36,27 @@ MAIN_STATES = (
 SIDE_STATES = ("blocked", "failed", "needs_visual_review")
 _TRANSITIONS = dict(zip(MAIN_STATES, MAIN_STATES[1:]))
 _RUNTIME_TOP_LEVEL = {"SKILL.md", "scripts", "references"}
+_GENERATED_CACHE_DIRS = {"__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"}
+_GENERATED_CACHE_SUFFIXES = {".pyc", ".pyo"}
 _SECRET_KEY = re.compile(
     r"(?:api[_-]?key|authorization|cookie|credential|password|private[_-]?key|secret|token)",
     re.IGNORECASE,
 )
 _SECRET_ASSIGNMENT = re.compile(
-    r"(?i)\b(password|passwd|api[_-]?key|authorization|secret|token)\s*[:=]\s*([^\s,;]+)"
+    r"(?i)\b(?P<key>[A-Za-z_][A-Za-z0-9_-]*)\s*[:=]\s*"
+    r"(?P<value>\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\s,;]+)"
 )
 _BEARER = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+")
 _SK_TOKEN = re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b")
 _SENSITIVE_HEADER = re.compile(
-    r"(?im)\b(?P<name>Cookie|Set-Cookie|Authorization)\s*:\s*[^\r\n]*$"
+    r"(?im)\b(?P<name>Set-Cookie|Cookie|Authorization)\s*:\s*[^\r\n]*(?P<cr>\r?)$"
 )
 _WORD = re.compile(r"[A-Za-z][A-Za-z0-9_-]{1,}")
 _NUMBER = re.compile(
-    r"(?<![A-Za-z0-9_.])[-+]?(?:(?:\d{1,3}(?:,\d{3})+)|\d+)"
-    r"(?:\.\d+)?(?:[eE][-+]?\d+)?%?"
+    r"(?<![A-Za-z0-9_.])[-+]?(?:(?:\d{1,3}(?:,\d{3})+)(?:\.\d+)?|"
+    r"\d+(?:\.\d+)?|\.\d+)(?:[eE][-+]?\d+)?%?"
 )
+_NUMERIC_TRANSLATION = str.maketrans({"\u2212": "-", "\ufe63": "-", "\uff0d": "-"})
 _STOPWORDS = {
     "about", "after", "also", "among", "and", "are", "because", "been",
     "before", "being", "between", "both", "but", "can", "could", "does",
@@ -205,14 +209,19 @@ def redact_secrets(value: Any) -> Any:
         return [redact_secrets(item) for item in value]
     if isinstance(value, str):
         text = _SENSITIVE_HEADER.sub(
-            lambda match: f"{match.group('name')}: [REDACTED]", value
+            lambda match: f"{match.group('name')}: [REDACTED]{match.group('cr')}",
+            value,
         )
+
+        def redact_assignment(match: re.Match[str]) -> str:
+            if match.group("value") == "[REDACTED]" or not _SECRET_KEY.search(
+                match.group("key")
+            ):
+                return match.group(0)
+            return f"{match.group('key')}=[REDACTED]"
+
         text = _SECRET_ASSIGNMENT.sub(
-            lambda match: (
-                match.group(0)
-                if match.group(2) == "[REDACTED]"
-                else f"{match.group(1)}=[REDACTED]"
-            ),
+            redact_assignment,
             text,
         )
         text = _BEARER.sub("Bearer [REDACTED]", text)
@@ -257,6 +266,9 @@ def _runtime_files(skill_root: Path) -> list[Path]:
             path = current_path / directory
             if path.is_symlink():
                 raise PathSafetyError(f"symlink is not allowed: {path}")
+            if directory in _GENERATED_CACHE_DIRS:
+                directories.remove(directory)
+                continue
             top = (relative_dir / directory).parts[0]
             if top not in _RUNTIME_TOP_LEVEL:
                 directories.remove(directory)
@@ -264,6 +276,8 @@ def _runtime_files(skill_root: Path) -> list[Path]:
             path = current_path / name
             relative = path.relative_to(skill_root)
             if relative.parts[0] not in _RUNTIME_TOP_LEVEL:
+                continue
+            if path.suffix.lower() in _GENERATED_CACHE_SUFFIXES:
                 continue
             if path.is_symlink() or not path.is_file():
                 raise PathSafetyError(f"runtime file must be regular: {path}")
@@ -444,6 +458,8 @@ def mark_side_state(run_dir: Path | str, side_state: str, *, reason: str) -> dic
         raise StateError(f"unknown side state: {side_state}")
     run, state = _load_run(run_dir)
     previous = state.get("state")
+    if previous == "finalized" or (run / "final").exists():
+        raise StateError("finalized is a terminal state")
     resume_from = state.get("resume_from") if previous in SIDE_STATES else previous
     state.update({"state": side_state, "reason": redact_secrets(reason), "resume_from": resume_from})
     _write_run(run, state)
@@ -516,11 +532,41 @@ def _text_evidence(text: str, *, markdown: bool) -> list[dict[str, Any]]:
             match = re.match(r"^#{1,6}\s+(.+?)\s*$", line)
             if match:
                 headings.append((index, match.group(1).strip()))
-        for position, (line_number, heading) in enumerate(headings):
-            end = headings[position + 1][0] - 1 if position + 1 < len(headings) else len(lines)
-            body = "\n".join(lines[line_number:end]).strip()
-            if body:
-                segments.append((heading, line_number, end, body))
+        if headings:
+            preamble_end = headings[0][0] - 1
+            preamble_lines = lines[:preamble_end]
+            while preamble_lines and not preamble_lines[0].strip():
+                preamble_lines.pop(0)
+            while preamble_lines and not preamble_lines[-1].strip():
+                preamble_lines.pop()
+            if preamble_lines:
+                preamble_start = next(
+                    index
+                    for index, line in enumerate(lines[:preamble_end], start=1)
+                    if line.strip()
+                )
+                segments.append(
+                    (
+                        None,
+                        preamble_start,
+                        preamble_start + len(preamble_lines) - 1,
+                        "\n".join(preamble_lines),
+                    )
+                )
+            for position, (line_number, heading) in enumerate(headings):
+                end = (
+                    headings[position + 1][0] - 1
+                    if position + 1 < len(headings)
+                    else len(lines)
+                )
+                section_lines = lines[line_number - 1 : end]
+                while section_lines and not section_lines[-1].strip():
+                    section_lines.pop()
+                    end -= 1
+                if section_lines:
+                    segments.append(
+                        (heading, line_number, end, "\n".join(section_lines))
+                    )
     if not segments:
         start: int | None = None
         buffer: list[str] = []
@@ -657,17 +703,18 @@ def prepare_source(
     if source_type is None:
         raise ContractError(f"unsupported source type: {suffix or '<none>'}")
     input_name = f"source{suffix}"
-    atomic_write_bytes(run / "input" / input_name, source.read_bytes())
+    input_source = run / "input" / input_name
+    atomic_write_bytes(input_source, source.read_bytes())
     evidence: list[dict[str, Any]] = []
     visuals: list[dict[str, Any]] = []
     manifest: dict[str, Any] = {
         "format_version": FORMAT_VERSION, "status": "ready", "source_type": source_type,
-        "input_path": f"input/{input_name}", "source_sha256": sha256_file(source),
-        "source_size": source.stat().st_size, "tools": {},
+        "input_path": f"input/{input_name}", "source_sha256": sha256_file(input_source),
+        "source_size": input_source.stat().st_size, "tools": {},
     }
 
     if source_type in {"markdown", "text"}:
-        text = source.read_text(encoding="utf-8")
+        text = input_source.read_text(encoding="utf-8")
         atomic_write_bytes(run / "evidence" / "source.txt", text.encode("utf-8"))
         evidence = _text_evidence(text, markdown=source_type == "markdown")
     else:
@@ -691,23 +738,23 @@ def prepare_source(
         assert all(resolved.values())
         text_path = run / "evidence" / "source.txt"
         info = subprocess.run(
-            [resolved["pdfinfo"], str(source)], text=True, capture_output=True, check=False
+            [resolved["pdfinfo"], str(input_source)], text=True, capture_output=True, check=False
         )
         atomic_write_bytes(run / "evidence" / "pdfinfo.txt", info.stdout.encode("utf-8"))
         text_result = subprocess.run(
-            [resolved["pdftotext"], str(source), str(text_path)],
+            [resolved["pdftotext"], str(input_source), str(text_path)],
             text=True, capture_output=True, check=False,
         )
         page_result = subprocess.run(
-            [resolved["pdftoppm"], "-png", "-r", "144", str(source), str(run / "evidence" / "pages" / "page")],
+            [resolved["pdftoppm"], "-png", "-r", "144", str(input_source), str(run / "evidence" / "pages" / "page")],
             text=True, capture_output=True, check=False,
         )
         image_list = subprocess.run(
-            [resolved["pdfimages"], "-list", str(source)], text=True, capture_output=True, check=False
+            [resolved["pdfimages"], "-list", str(input_source)], text=True, capture_output=True, check=False
         )
         atomic_write_bytes(run / "evidence" / "pdfimages-list.txt", image_list.stdout.encode("utf-8"))
         image_result = subprocess.run(
-            [resolved["pdfimages"], "-png", str(source), str(run / "evidence" / "assets" / "pdf-image")],
+            [resolved["pdfimages"], "-png", str(input_source), str(run / "evidence" / "assets" / "pdf-image")],
             text=True, capture_output=True, check=False,
         )
         commands = {"pdfinfo": info, "pdftotext": text_result, "pdftoppm": page_result, "pdfimages_list": image_list, "pdfimages_extract": image_result}
@@ -882,6 +929,7 @@ def _verify_source_contract(run: Path, state: Mapping[str, Any]) -> dict[str, An
         path = safe_path(run / "evidence", relative, must_exist=True)
         if sha256_file(path) != visual.get("sha256"):
             raise IntegrityError(f"source visual hash mismatch: {visual.get('id')}")
+    _verify_vlm_history(run, manifest, visuals)
     return manifest
 
 
@@ -923,6 +971,26 @@ def _tokens(text: str) -> list[str]:
                 word = word[: -len(ending)]
                 break
         words.append(word)
+    unicode_run: list[str] = []
+
+    def flush_unicode_run() -> None:
+        if not unicode_run:
+            return
+        token = "".join(unicode_run)
+        if len(token) == 1:
+            words.append(token)
+        else:
+            words.extend(token[index : index + 2] for index in range(len(token) - 1))
+        unicode_run.clear()
+
+    for character in normalized:
+        if not character.isascii() and (
+            character.isalnum() or unicodedata.category(character).startswith("M")
+        ):
+            unicode_run.append(character)
+        else:
+            flush_unicode_run()
+    flush_unicode_run()
     return words
 
 
@@ -951,7 +1019,7 @@ def _normalized_text(text: str) -> str:
 
 def _numbers(text: str) -> set[str]:
     values: set[str] = set()
-    for token in _NUMBER.findall(unicodedata.normalize("NFKC", text)):
+    for token in _NUMBER.findall(_normalize_numeric_text(text)):
         try:
             values.add(_canonical_number(token))
         except InvalidOperation:
@@ -960,7 +1028,7 @@ def _numbers(text: str) -> set[str]:
 
 
 def _canonical_number(token: str) -> str:
-    normalized = unicodedata.normalize("NFKC", token).strip()
+    normalized = _normalize_numeric_text(token).strip()
     percent = normalized.endswith("%")
     numeric = normalized.removesuffix("%").replace(",", "")
     value = Decimal(numeric)
@@ -971,6 +1039,10 @@ def _canonical_number(token: str) -> str:
     else:
         result = format(value.normalize(), "f")
     return result + ("%" if percent else "")
+
+
+def _normalize_numeric_text(text: str) -> str:
+    return unicodedata.normalize("NFKC", text).translate(_NUMERIC_TRANSLATION)
 
 
 def _number_without_unit(value: str) -> str:
@@ -1005,7 +1077,7 @@ def _evaluate_arithmetic(expression: str) -> float:
 
 
 def _formula_is_correct(expression: str, result: str) -> bool:
-    parts = expression.split("=")
+    parts = _normalize_numeric_text(expression).split("=")
     if len(parts) not in {1, 2}:
         return False
     try:
@@ -1073,12 +1145,34 @@ def validate_grounding(
                     errors.append({"claim_id": claim_id, "code": "unsupported_formula_input"})
                 expression_numbers = _numbers(str(formula["expression"]))
                 expression_values = {_number_without_unit(value) for value in expression_numbers}
+                expression_parts = _normalize_numeric_text(
+                    str(formula["expression"])
+                ).split("=")
+                input_values = {_number_without_unit(value) for value in inputs}
+                left_values = (
+                    {
+                        _number_without_unit(value)
+                        for value in _numbers(expression_parts[0])
+                    }
+                    if len(expression_parts) in {1, 2}
+                    else set()
+                )
+                right_matches_result = True
+                if len(expression_parts) == 2:
+                    try:
+                        right_matches_result = _number_without_unit(
+                            _canonical_number(expression_parts[1].strip())
+                        ) == _number_without_unit(result)
+                    except InvalidOperation:
+                        right_matches_result = False
                 unit_signatures = {
                     value.endswith("%") for value in inputs | ({result} if result else set())
                 }
                 if (
                     not result
                     or len(unit_signatures) != 1
+                    or left_values != input_values
+                    or not right_matches_result
                     or _number_without_unit(result) not in expression_values
                     or not {
                         _number_without_unit(value) for value in inputs
@@ -1101,28 +1195,99 @@ def _load_visuals(run: Path) -> dict[str, Any]:
     return contract
 
 
+def _validate_vlm_review_batch(review: Mapping[str, Any]) -> dict[str, Any]:
+    required = {
+        "reviewer_mode", "source_manifest_sha256", "source_visuals_sha256", "matches"
+    }
+    batch = dict(review)
+    if set(batch) != required:
+        raise ContractError("visual review batch has an unknown or incomplete schema")
+    if batch.get("reviewer_mode") not in {"fresh_host_vlm", "fresh_subagent"}:
+        raise ContractError("visual review requires a fresh vision-capable reviewer")
+    if not isinstance(batch.get("source_manifest_sha256"), str) or not isinstance(
+        batch.get("source_visuals_sha256"), str
+    ):
+        raise ContractError("visual review requires source hash bindings")
+    matches = batch.get("matches")
+    if not isinstance(matches, list) or not matches:
+        raise ContractError("visual review requires matches")
+    match_fields = {
+        "visual_id", "visual_sha256", "caption_evidence_id",
+        "caption_evidence_sha256", "confidence", "allowed_content_roles",
+    }
+    for match in matches:
+        if not isinstance(match, Mapping) or set(match) != match_fields:
+            raise ContractError("visual review match has an unknown or incomplete schema")
+        confidence = match.get("confidence")
+        if (
+            not isinstance(confidence, (int, float))
+            or isinstance(confidence, bool)
+            or not math.isfinite(confidence)
+            or not 0.8 <= confidence <= 1
+        ):
+            raise ContractError("visual review confidence must be finite and in range")
+        roles = match.get("allowed_content_roles")
+        if (
+            not isinstance(roles, list)
+            or not roles
+            or any(role not in _DEFAULT_VISUAL_ROLES for role in roles)
+        ):
+            raise ContractError("visual review contains invalid content roles")
+    return batch
+
+
+def _validate_vlm_history_value(value: Mapping[str, Any]) -> list[dict[str, Any]]:
+    if set(value) != {"format_version", "batches"} or value.get(
+        "format_version"
+    ) != FORMAT_VERSION:
+        raise ContractError("visual review history has an unknown or incomplete schema")
+    batches = value.get("batches")
+    if not isinstance(batches, list) or not batches:
+        raise ContractError("visual review history requires at least one batch")
+    return [_validate_vlm_review_batch(batch) for batch in batches]
+
+
+def _verify_vlm_history(
+    run: Path, manifest: Mapping[str, Any], visuals: Mapping[str, Any]
+) -> None:
+    path = run / "evidence" / "host-vlm-visual-review.json"
+    manifest_hash = manifest.get("host_vlm_review_sha256")
+    visuals_hash = visuals.get("host_vlm_review_sha256")
+    if manifest_hash is None and visuals_hash is None and not path.exists():
+        return
+    if (
+        not isinstance(manifest_hash, str)
+        or visuals_hash != manifest_hash
+        or not path.is_file()
+        or path.is_symlink()
+        or sha256_file(path) != manifest_hash
+    ):
+        raise IntegrityError("host-VLM review history hash mismatch")
+    try:
+        _validate_vlm_history_value(_read_json(path))
+    except PortableError as error:
+        raise IntegrityError("invalid host-VLM review history") from error
+
+
 def bind_host_vlm_visuals(run_dir: Path | str, review: Mapping[str, Any]) -> dict[str, Any]:
     """Bind PDF visual candidates to caption evidence after host-VLM inspection."""
 
     run, state = _load_run(run_dir)
-    _verify_source_contract(run, state)
-    if review.get("reviewer_mode") not in {"fresh_host_vlm", "fresh_subagent"}:
-        raise ContractError("visual review requires a fresh vision-capable reviewer")
+    manifest = _verify_source_contract(run, state)
+    if state.get("state") != "initialized" or manifest.get("status") != "ready":
+        raise StateError("visual review binding requires an initialized ready source")
+    batch = _validate_vlm_review_batch(review)
     source_manifest_sha256 = sha256_file(run / "evidence" / "source_manifest.json")
     source_visuals_sha256 = sha256_file(run / "evidence" / "source_visuals.json")
-    if review.get("source_manifest_sha256") != source_manifest_sha256:
+    if batch.get("source_manifest_sha256") != source_manifest_sha256:
         raise ContractError("visual review is bound to a different source manifest")
-    if review.get("source_visuals_sha256") != source_visuals_sha256:
+    if batch.get("source_visuals_sha256") != source_visuals_sha256:
         raise ContractError("visual review is bound to a different visual catalog")
-    matches = review.get("matches")
-    if not isinstance(matches, list) or not matches:
-        raise ContractError("visual review requires matches")
+    matches = batch["matches"]
     evidence_by_id = {item["id"]: item for item in load_evidence(run)}
     contract = _load_visuals(run)
     by_id = {item.get("id"): item for item in contract["visuals"]}
     for match in matches:
-        if not isinstance(match, Mapping):
-            raise ContractError("invalid visual match")
         visual_id = match.get("visual_id")
         visual = by_id.get(visual_id)
         caption_id = match.get("caption_evidence_id")
@@ -1135,27 +1300,30 @@ def bind_host_vlm_visuals(run_dir: Path | str, review: Mapping[str, Any]) -> dic
             caption is None
             or match.get("visual_sha256") != visual.get("sha256")
             or match.get("caption_evidence_sha256") != caption.get("sha256")
-            or not isinstance(confidence, (int, float))
-            or isinstance(confidence, bool)
-            or not math.isfinite(confidence)
-            or not 0.8 <= confidence <= 1
         ):
             raise ContractError(f"insufficient visual-caption binding: {visual_id}")
-        if not isinstance(roles, list) or not roles or any(role not in _DEFAULT_VISUAL_ROLES for role in roles):
-            raise ContractError(f"invalid visual roles: {visual_id}")
         visual.update(
             {
                 "caption_evidence_id": caption_id,
-                "vlm_review": {"reviewer_mode": review["reviewer_mode"], "confidence": confidence},
+                "vlm_review": {"reviewer_mode": batch["reviewer_mode"], "confidence": confidence},
                 "eligibility": "eligible",
                 "allowed_content_roles": sorted(set(roles)),
             }
         )
-    sidecar = {"format_version": FORMAT_VERSION, **redact_secrets(dict(review))}
-    sidecar["source_visuals_sha256_before_binding"] = source_visuals_sha256
-    atomic_write_json(run / "evidence" / "host-vlm-visual-review.json", sidecar)
+    sidecar_path = run / "evidence" / "host-vlm-visual-review.json"
+    history: list[dict[str, Any]] = []
+    if sidecar_path.is_file():
+        history = _validate_vlm_history_value(_read_json(sidecar_path))
+    sidecar = {
+        "format_version": FORMAT_VERSION,
+        "batches": [*history, redact_secrets(batch)],
+    }
+    atomic_write_json(sidecar_path, sidecar)
+    review_history_sha256 = sha256_file(sidecar_path)
+    contract["host_vlm_review_sha256"] = review_history_sha256
     atomic_write_json(run / "evidence" / "source_visuals.json", contract)
     manifest = _read_json(run / "evidence" / "source_manifest.json")
+    manifest["host_vlm_review_sha256"] = review_history_sha256
     manifest["source_visuals_sha256"] = sha256_file(
         run / "evidence" / "source_visuals.json"
     )
@@ -1201,9 +1369,7 @@ def write_source_map(
     """Validate claim bindings and persist an attempt/source-manifest-bound map."""
 
     run, state = _load_run(run_dir)
-    if state.get("active_attempt") != attempt_id or state.get("state") not in {
-        "authoring", "deterministic_passed", "semantic_passed"
-    }:
+    if state.get("active_attempt") != attempt_id or state.get("state") != "authoring":
         raise StateError("source map must target the active attempt")
     _verify_source_contract(run, state)
     contract = {
@@ -1280,6 +1446,10 @@ def record_deterministic_result(
     if state.get("state") != "authoring" or state.get("active_attempt") != attempt_id:
         raise StateError("deterministic result does not match active authoring attempt")
     attempt = safe_path(run / "attempts", attempt_id, must_exist=True)
+    source_map = attempt / "provenance" / "source-map.json"
+    if not source_map.is_file():
+        raise StateError("deterministic QA requires a preexisting source map")
+    _validate_source_map_contract(run, attempt_id, _read_json(source_map))
     if not artifact_paths:
         raise ContractError("deterministic result requires artifact paths")
     artifacts = _hash_paths(attempt, artifact_paths)
@@ -1306,6 +1476,10 @@ def _validate_deterministic_report(
     run: Path, attempt_id: str, *, require_pass: bool = True
 ) -> dict[str, Any]:
     attempt = safe_path(run / "attempts", attempt_id, must_exist=True)
+    source_map = attempt / "provenance" / "source-map.json"
+    if not source_map.is_file():
+        raise IntegrityError("deterministic report has no source map")
+    _validate_source_map_contract(run, attempt_id, _read_json(source_map))
     report = _read_json(attempt / "qa" / "deterministic.json")
     if report.get("format_version") != FORMAT_VERSION or report.get("attempt_id") != attempt_id:
         raise IntegrityError("deterministic report attempt mismatch")
@@ -1317,7 +1491,16 @@ def _validate_deterministic_report(
     previews = report.get("previews")
     if not isinstance(artifacts, dict) or not artifacts or not isinstance(previews, dict):
         raise IntegrityError("incomplete deterministic report")
+    actual_artifacts = {
+        f"artifact/{path.relative_to(attempt / 'artifact').as_posix()}"
+        for path in (attempt / "artifact").rglob("*")
+        if path.is_file() and not path.is_symlink()
+    }
+    if actual_artifacts != set(artifacts):
+        raise IntegrityError("attempt artifact set differs from deterministic report")
     for relative, digest in artifacts.items():
+        if not relative.startswith("artifact/"):
+            raise IntegrityError(f"deterministic artifact is outside artifact directory: {relative}")
         if sha256_file(safe_path(attempt, relative, must_exist=True)) != digest:
             raise IntegrityError(f"stale artifact: {relative}")
     for frame_id, item in previews.items():
@@ -1339,7 +1522,10 @@ def create_review_context(
     report = _validate_deterministic_report(run, attempt_id)
     if not report["previews"]:
         raise ContractError("semantic review requires at least one rendered preview")
+    attempt = safe_path(run / "attempts", attempt_id, must_exist=True)
     source_manifest_path = run / "evidence" / "source_manifest.json"
+    source_map_path = attempt / "provenance" / "source-map.json"
+    _validate_source_map_contract(run, attempt_id, _read_json(source_map_path))
     context: dict[str, Any] = {
         "format_version": FORMAT_VERSION,
         "attempt_id": attempt_id,
@@ -1347,11 +1533,11 @@ def create_review_context(
         "preview_hashes": {frame_id: item["sha256"] for frame_id, item in report["previews"].items()},
         "preview_paths": {frame_id: item["path"] for frame_id, item in report["previews"].items()},
         "source_manifest_sha256": sha256_file(source_manifest_path),
+        "source_map_sha256": sha256_file(source_map_path),
         "rubric": dict(rubric),
         "rubric_sha256": _canonical_hash(dict(rubric)),
     }
     context["context_sha256"] = _canonical_hash(context)
-    attempt = safe_path(run / "attempts", attempt_id, must_exist=True)
     atomic_write_json(attempt / "qa" / "review-context.json", context)
     return context
 
@@ -1359,6 +1545,13 @@ def create_review_context(
 def _validate_review_context(run: Path, attempt_id: str) -> dict[str, Any]:
     attempt = safe_path(run / "attempts", attempt_id, must_exist=True)
     context = _read_json(attempt / "qa" / "review-context.json")
+    required = {
+        "format_version", "attempt_id", "artifact_hashes", "preview_hashes",
+        "preview_paths", "source_manifest_sha256", "source_map_sha256", "rubric",
+        "rubric_sha256", "context_sha256",
+    }
+    if set(context) != required or context.get("format_version") != FORMAT_VERSION:
+        raise IntegrityError("review context has an unknown or incomplete schema")
     context_hash = context.pop("context_sha256", None)
     if context_hash != _canonical_hash(context):
         raise IntegrityError("review context hash mismatch")
@@ -1372,6 +1565,10 @@ def _validate_review_context(run: Path, attempt_id: str) -> dict[str, Any]:
         raise IntegrityError("review context preview binding is stale")
     if context.get("source_manifest_sha256") != sha256_file(run / "evidence" / "source_manifest.json"):
         raise IntegrityError("review context source binding is stale")
+    source_map = attempt / "provenance" / "source-map.json"
+    _validate_source_map_contract(run, attempt_id, _read_json(source_map))
+    if context.get("source_map_sha256") != sha256_file(source_map):
+        raise IntegrityError("review context source-map binding is stale")
     if context.get("rubric_sha256") != _canonical_hash(context.get("rubric")):
         raise IntegrityError("review context rubric binding is stale")
     return context
@@ -1384,7 +1581,8 @@ def _validate_semantic_review_value(
     required = {
         "format_version", "attempt_id", "review_context_sha256", "artifact_hashes",
         "preview_hashes", "reviewed_frame_ids", "source_manifest_sha256", "rubric_sha256",
-        "reviewer_mode", "dimension_scores", "blockers", "localized_repairs", "verdict", "complete",
+        "source_map_sha256", "reviewer_mode", "dimension_scores", "blockers",
+        "localized_repairs", "verdict", "complete",
     }
     if set(value) != required or value.get("format_version") != FORMAT_VERSION or value.get("complete") is not True:
         raise ContractError("semantic review is partial or has an unknown schema")
@@ -1392,7 +1590,10 @@ def _validate_semantic_review_value(
         raise ContractError("semantic review targets the wrong attempt")
     if value.get("review_context_sha256") != context["context_sha256"]:
         raise ContractError("semantic review context hash is stale")
-    for field in ("artifact_hashes", "preview_hashes", "source_manifest_sha256", "rubric_sha256"):
+    for field in (
+        "artifact_hashes", "preview_hashes", "source_manifest_sha256",
+        "source_map_sha256", "rubric_sha256",
+    ):
         if value.get(field) != context[field]:
             raise ContractError(f"semantic review has stale {field}")
     if value.get("reviewed_frame_ids") != sorted(context["preview_hashes"]):
@@ -1525,8 +1726,59 @@ def _verify_delivery(directory: Path) -> dict[str, Any]:
     return manifest
 
 
-def _verify_final(run: Path) -> dict[str, Any]:
-    return _verify_delivery(run / "final")
+def _validate_attempt_for_finalization(
+    run: Path, state: Mapping[str, Any], attempt_id: str
+) -> tuple[str, dict[str, Any], Path]:
+    if state.get("active_attempt") != attempt_id or state.get("state") not in {
+        "semantic_passed", "needs_visual_review", "finalized"
+    }:
+        raise StateError("finalization requires the active reviewed attempt")
+    report = _validate_deterministic_report(run, attempt_id)
+    review = _read_validated_semantic_review(run, attempt_id)
+    if review.get("verdict") == "pass" and not review.get("blockers"):
+        status = "verified"
+        expected_state = "semantic_passed"
+    elif review.get("verdict") == "needs_visual_review":
+        status = "needs_visual_review"
+        expected_state = "needs_visual_review"
+    else:
+        raise IntegrityError("semantic review does not authorize finalization")
+    if state.get("state") not in {expected_state, "finalized"}:
+        raise IntegrityError("run state disagrees with semantic review verdict")
+    attempt = safe_path(run / "attempts", attempt_id, must_exist=True)
+    source_map = attempt / "provenance" / "source-map.json"
+    if not source_map.is_file():
+        raise IntegrityError("finalization requires the active attempt source map")
+    _validate_source_map_contract(run, attempt_id, _read_json(source_map))
+    return status, report, source_map
+
+
+def _verify_attempt_delivery(
+    run: Path,
+    state: Mapping[str, Any],
+    attempt_id: str,
+    directory: Path,
+) -> dict[str, Any]:
+    status, report, source_map = _validate_attempt_for_finalization(
+        run, state, attempt_id
+    )
+    manifest = _verify_delivery(directory)
+    expected_files = {
+        relative.removeprefix("artifact/"): digest
+        for relative, digest in report["artifact_hashes"].items()
+    }
+    expected_files["provenance/source-map.json"] = sha256_file(source_map)
+    if (
+        manifest.get("attempt_id") != attempt_id
+        or manifest.get("verification_status") != status
+        or manifest.get("files") != expected_files
+    ):
+        raise IntegrityError("delivery is not bound to the reviewed attempt")
+    delivered_source_map = directory / "provenance" / "source-map.json"
+    _validate_source_map_contract(run, attempt_id, _read_json(delivered_source_map))
+    if sha256_file(delivered_source_map) != sha256_file(source_map):
+        raise IntegrityError("delivery source map differs from the reviewed attempt")
+    return manifest
 
 
 def finalize_attempt(
@@ -1541,46 +1793,28 @@ def finalize_attempt(
     _verify_source_contract(run, state)
     final = run / "final"
     if final.exists() or final.is_symlink():
-        manifest = _verify_final(run)
-        if manifest.get("attempt_id") != attempt_id:
+        existing_manifest = _verify_delivery(final)
+        if existing_manifest.get("attempt_id") != attempt_id:
             raise IntegrityError("refusing to overwrite a final from another attempt")
+        manifest = _verify_attempt_delivery(run, state, attempt_id, final)
         if state.get("state") != "finalized":
             state["state"] = "finalized"
             _write_run(run, state)
         return manifest
-    if state.get("active_attempt") != attempt_id or state.get("state") not in {"semantic_passed", "needs_visual_review"}:
-        raise StateError("finalization requires the active reviewed attempt")
-    if state["state"] == "semantic_passed":
-        review = _read_validated_semantic_review(run, attempt_id)
-        if review.get("verdict") != "pass" or review.get("blockers"):
-            raise IntegrityError("semantic review is not passing")
-        status = "verified"
-    else:
-        review = _read_validated_semantic_review(run, attempt_id)
-        if review.get("verdict") != "needs_visual_review":
-            raise IntegrityError("visual-review delivery lacks the matching review verdict")
-        status = "needs_visual_review"
+    status, report, source_map = _validate_attempt_for_finalization(
+        run, state, attempt_id
+    )
     attempt = safe_path(run / "attempts", attempt_id, must_exist=True)
     stage = run / f".final.staging-{attempt_id}"
     if stage.exists() or stage.is_symlink():
         shutil.rmtree(stage)
     stage.mkdir()
     try:
-        for source in sorted((attempt / "artifact").rglob("*")):
-            if source.is_symlink():
-                raise PathSafetyError(f"artifact symlink is not allowed: {source}")
-            if source.is_file():
-                relative = source.relative_to(attempt / "artifact")
-                target = safe_path(stage, relative)
-                target.parent.mkdir(parents=True, exist_ok=True)
-                atomic_write_bytes(target, source.read_bytes())
-        source_map = safe_path(
-            run / "attempts" / attempt_id,
-            "provenance/source-map.json",
-        )
-        if not source_map.is_file():
-            raise IntegrityError("finalization requires the active attempt source map")
-        _validate_source_map_contract(run, attempt_id, _read_json(source_map))
+        for relative in sorted(report["artifact_hashes"]):
+            source = safe_path(attempt, relative, must_exist=True)
+            target = safe_path(stage, relative.removeprefix("artifact/"))
+            target.parent.mkdir(parents=True, exist_ok=True)
+            atomic_write_bytes(target, source.read_bytes())
         target = stage / "provenance" / "source-map.json"
         target.parent.mkdir(parents=True, exist_ok=True)
         atomic_write_bytes(target, source_map.read_bytes())
@@ -1588,6 +1822,7 @@ def finalize_attempt(
             raise SimulatedCrash("after final staging copy")
         manifest = _delivery_manifest(stage, attempt_id, status)
         atomic_write_json(stage / "delivery-manifest.json", manifest)
+        _verify_attempt_delivery(run, state, attempt_id, stage)
         if fail_at == "after_manifest":
             raise SimulatedCrash("after delivery manifest write")
         if final.exists():
@@ -1605,9 +1840,7 @@ def finalize_attempt(
     return manifest
 
 
-def resume_run(
-    run_dir: Path | str, *, skill_root: Path | str | None = None
-) -> dict[str, Any]:
+def resume_run(run_dir: Path | str, *, skill_root: Path | str) -> dict[str, Any]:
     """Verify durable contracts, recover completed writes, and name the next action."""
 
     run, state = _load_run(run_dir)
@@ -1619,9 +1852,10 @@ def resume_run(
             raise IntegrityError("reviewed state has no active attempt")
         _read_validated_semantic_review(run, active_review_attempt)
     if (run / "final").exists():
-        manifest = _verify_final(run)
-        if state.get("active_attempt") and manifest.get("attempt_id") != state.get("active_attempt"):
-            raise IntegrityError("final attempt does not match active attempt")
+        active_attempt = state.get("active_attempt")
+        if not isinstance(active_attempt, str):
+            raise IntegrityError("finalized run has no active attempt")
+        _verify_attempt_delivery(run, state, active_attempt, run / "final")
         if state.get("state") != "finalized":
             state["state"] = "finalized"
             _write_run(run, state)
@@ -1632,24 +1866,26 @@ def resume_run(
         stage = run / f".final.staging-{active_attempt}"
         stage_manifest = stage / "delivery-manifest.json"
         if stage_manifest.is_file():
-            manifest = _verify_delivery(stage)
-            if manifest.get("attempt_id") != active_attempt:
-                raise IntegrityError("staged delivery targets the wrong attempt")
             if state.get("state") not in {"semantic_passed", "needs_visual_review"}:
                 raise IntegrityError("complete staging exists in an invalid run state")
+            _verify_attempt_delivery(run, state, active_attempt, stage)
             stage.rename(run / "final")
             state["state"] = "finalized"
             _write_run(run, state)
             _event(run, "crash_recovered", boundary="delivery_manifest_write")
             return {**state, "next_action": "complete"}
     current = state.get("state")
+    if current == "finalized":
+        raise IntegrityError("finalized run is missing its final delivery")
     if current in SIDE_STATES:
         action = {
             "blocked": "resolve_blocker", "failed": "repair", "needs_visual_review": "visual_review_or_finalize",
         }[current]
         return {**state, "next_action": action}
     if current == "initialized":
-        return {**state, "next_action": "plan"}
+        source_manifest = _read_json(run / "evidence" / "source_manifest.json")
+        action = "prepare_source" if source_manifest.get("status") == "not_prepared" else "plan"
+        return {**state, "next_action": action}
     if current == "planned":
         return {**state, "next_action": "begin_attempt"}
     attempt_id = state.get("active_attempt")

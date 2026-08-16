@@ -101,6 +101,7 @@ class PortableSkillRunStateTests(unittest.TestCase):
             "preview_hashes": context["preview_hashes"],
             "reviewed_frame_ids": sorted(context["preview_hashes"]),
             "source_manifest_sha256": context["source_manifest_sha256"],
+            "source_map_sha256": context["source_map_sha256"],
             "rubric_sha256": context["rubric_sha256"],
             "reviewer_mode": "fresh_host_vlm",
             "dimension_scores": {"fidelity": 4, "legibility": 4},
@@ -260,6 +261,29 @@ elif name == "pdfimages":
             "visible: keep",
         )
 
+    def test_secret_redaction_covers_prefixed_variable_names_and_crlf_headers(self) -> None:
+        redacted = core.redact_secrets(
+            "OPENAI_API_KEY=one\n"
+            "ANTHROPIC_AUTH_TOKEN: two\n"
+            "AWS_SECRET_ACCESS_KEY=three\n"
+            "private_key=four\n"
+            "session_cookie=five\n"
+            "trace: > Authorization: Basic Zm9vOmJhcg==\r\n"
+            "trace: < Cookie: sid=secret; theme=dark\r\n"
+            "trace: < Set-Cookie: session=secret; HttpOnly\r\n"
+        )
+        self.assertEqual(
+            redacted,
+            "OPENAI_API_KEY=[REDACTED]\n"
+            "ANTHROPIC_AUTH_TOKEN=[REDACTED]\n"
+            "AWS_SECRET_ACCESS_KEY=[REDACTED]\n"
+            "private_key=[REDACTED]\n"
+            "session_cookie=[REDACTED]\n"
+            "trace: > Authorization: [REDACTED]\r\n"
+            "trace: < Cookie: [REDACTED]\r\n"
+            "trace: < Set-Cookie: [REDACTED]\r\n",
+        )
+
     def test_initialize_snapshots_all_runtime_files_without_writing_install(self) -> None:
         before = core.tree_hash(self.skill)
         state = self._initialize()
@@ -304,6 +328,32 @@ elif name == "pdfimages":
         extra.write_text("UNLISTED = True\n", encoding="utf-8")
         with self.assertRaises(core.IntegrityError):
             core.verify_skill_snapshot(self.run)
+
+    def test_runtime_snapshot_excludes_generated_python_caches(self) -> None:
+        cache = self.skill / "scripts" / "__pycache__"
+        cache.mkdir()
+        (cache / "tool.cpython-313.pyc").write_bytes(b"platform-specific")
+        (self.skill / "scripts" / "leftover.pyc").write_bytes(b"cache")
+        (self.skill / "scripts" / "leftover.pyo").write_bytes(b"optimized-cache")
+        (self.skill / "scripts" / ".pytest_cache").mkdir()
+        (self.skill / "scripts" / ".pytest_cache" / "state").write_text(
+            "generated", encoding="utf-8"
+        )
+
+        self._initialize()
+        manifest = json.loads(
+            (self.run / "skill_snapshot" / "manifest.json").read_text(encoding="utf-8")
+        )
+        paths = {entry["path"] for entry in manifest["files"]}
+        self.assertEqual(
+            paths,
+            {"SKILL.md", "scripts/tool.py", "references/grounding.md"},
+        )
+        (cache / "tool.cpython-313.pyc").write_bytes(b"changed-after-import")
+        self.assertEqual(
+            core.resume_run(self.run, skill_root=self.skill)["next_action"],
+            "prepare_source",
+        )
 
     def test_existing_run_rejects_release_version_and_archive_drift(self) -> None:
         self._initialize()
@@ -350,6 +400,37 @@ elif name == "pdfimages":
             manifest["source_sha256"], hashlib.sha256(source.read_bytes()).hexdigest()
         )
 
+    def test_markdown_evidence_preserves_preamble_headings_title_and_authors(self) -> None:
+        self._initialize()
+        source = self.root / "complete-paper.md"
+        source.write_text(
+            "Conference preamble\n"
+            "# Sparse Routing\n"
+            "Alice Example, Bob Example\n"
+            "## Method\n"
+            "We route tokens sparsely.\n",
+            encoding="utf-8",
+        )
+
+        core.prepare_source(self.run, source)
+        evidence = core.load_evidence(self.run)
+
+        self.assertEqual(
+            [item["text"] for item in evidence],
+            [
+                "Conference preamble",
+                "# Sparse Routing\nAlice Example, Bob Example",
+                "## Method\nWe route tokens sparsely.",
+            ],
+        )
+        self.assertEqual(
+            [
+                (item["anchor"]["line_start"], item["anchor"]["line_end"])
+                for item in evidence
+            ],
+            [(1, 1), (2, 3), (4, 5)],
+        )
+
     def test_resume_rejects_tampered_source_evidence(self) -> None:
         self._initialize()
         source = self.root / "paper.txt"
@@ -359,7 +440,7 @@ elif name == "pdfimages":
             '{"id":"ev-999","text":"tampered"}\n', encoding="utf-8"
         )
         with self.assertRaises(core.IntegrityError):
-            core.resume_run(self.run)
+            core.resume_run(self.run, skill_root=self.skill)
 
     def test_pdf_source_routes_all_poppler_tools_or_records_blocked_state(self) -> None:
         self._initialize()
@@ -431,6 +512,56 @@ elif name == "pdfimages":
         self.assertEqual(visuals[0]["origin"], "pdf_extracted")
         self.assertEqual(visuals[0]["eligibility"], "review_required")
         self.assertEqual(core.load_evidence(self.run)[0]["anchor"]["page"], 1)
+
+    def test_pdf_commands_read_immutable_copied_input_after_external_source_mutates(self) -> None:
+        self._initialize()
+        source = self.root / "mutable-paper.pdf"
+        source.write_bytes(b"SOURCE-A")
+        log_path = self.root / "immutable-input.log"
+        bin_dir = self.root / "mutating-poppler"
+        bin_dir.mkdir()
+        script = f'''#!/usr/bin/env python3
+import sys
+from pathlib import Path
+
+name = Path(sys.argv[0]).name
+if name in ("pdfinfo",) or (name == "pdfimages" and "-list" in sys.argv):
+    source_arg = Path(sys.argv[-1])
+else:
+    source_arg = Path(sys.argv[-2])
+with Path({str(log_path)!r}).open("a", encoding="utf-8") as handle:
+    handle.write(name + "|" + str(source_arg) + "\\n")
+if name == "pdfinfo":
+    Path({str(source)!r}).write_bytes(b"SOURCE-B-MUTATED")
+    print("Pages: 1")
+elif name == "pdftotext":
+    Path(sys.argv[-1]).write_text(source_arg.read_bytes().decode(), encoding="utf-8")
+elif name == "pdftoppm":
+    Path(sys.argv[-1] + "-1.png").write_bytes(b"page")
+elif name == "pdfimages" and "-list" in sys.argv:
+    print("page num type width height")
+elif name == "pdfimages":
+    pass
+'''
+        tools: dict[str, Path] = {}
+        for name in ("pdftotext", "pdfinfo", "pdftoppm", "pdfimages"):
+            executable = bin_dir / name
+            executable.write_text(script, encoding="utf-8")
+            executable.chmod(0o755)
+            tools[name] = executable
+
+        manifest = core.prepare_source(self.run, source, tool_paths=tools)
+
+        copied = self.run / "input" / "source.pdf"
+        self.assertEqual(source.read_bytes(), b"SOURCE-B-MUTATED")
+        self.assertEqual(copied.read_bytes(), b"SOURCE-A")
+        self.assertEqual(manifest["source_sha256"], hashlib.sha256(b"SOURCE-A").hexdigest())
+        self.assertEqual(manifest["source_size"], len(b"SOURCE-A"))
+        self.assertEqual(core.load_evidence(self.run)[0]["text"], "SOURCE-A")
+        self.assertEqual(
+            {line.split("|", 1)[1] for line in log_path.read_text().splitlines()},
+            {str(copied)},
+        )
 
     def test_pdf_retry_removes_stale_pages_and_extracted_images(self) -> None:
         self._initialize()
@@ -559,7 +690,7 @@ elif name == "pdfimages":
                 )
                 mutate(self.run / "evidence" / "pages")
                 with self.assertRaises(core.IntegrityError):
-                    core.resume_run(self.run)
+                    core.resume_run(self.run, skill_root=self.skill)
 
     def test_read_only_install_tree_remains_unchanged(self) -> None:
         before = core.tree_hash(self.skill)
@@ -733,6 +864,106 @@ elif name == "pdfimages":
                 with self.assertRaises(core.ContractError):
                     core.bind_host_vlm_visuals(self.run, review)
 
+    def test_host_vlm_binding_is_rejected_after_planning(self) -> None:
+        self._initialize()
+        self._prepare_pdf(
+            tools=self._fake_poppler(
+                "poppler-late-vlm", text="Figure caption.\n", image_rows=((1, 2),)
+            )
+        )
+        visual = json.loads(
+            (self.run / "evidence" / "source_visuals.json").read_text(encoding="utf-8")
+        )["visuals"][0]
+        evidence = core.load_evidence(self.run)[0]
+        review = {
+            "reviewer_mode": "fresh_host_vlm",
+            "source_manifest_sha256": core.sha256_file(
+                self.run / "evidence" / "source_manifest.json"
+            ),
+            "source_visuals_sha256": core.sha256_file(
+                self.run / "evidence" / "source_visuals.json"
+            ),
+            "matches": [
+                {
+                    "visual_id": visual["id"],
+                    "visual_sha256": visual["sha256"],
+                    "caption_evidence_id": evidence["id"],
+                    "caption_evidence_sha256": evidence["sha256"],
+                    "confidence": 0.9,
+                    "allowed_content_roles": ["method"],
+                }
+            ],
+        }
+        core.save_plan(self.run, {"artifact_type": "poster"})
+
+        with self.assertRaises(core.StateError):
+            core.bind_host_vlm_visuals(self.run, review)
+
+    def test_repeated_host_vlm_batches_preserve_hash_bound_authorization_history(self) -> None:
+        self._initialize()
+        self._prepare_pdf(
+            tools=self._fake_poppler(
+                "poppler-vlm-history", text="Figure caption.\n", image_rows=((1, 2),)
+            )
+        )
+
+        def review_for_current_source(confidence: float) -> dict[str, object]:
+            visual = json.loads(
+                (self.run / "evidence" / "source_visuals.json").read_text(
+                    encoding="utf-8"
+                )
+            )["visuals"][0]
+            evidence = core.load_evidence(self.run)[0]
+            return {
+                "reviewer_mode": "fresh_host_vlm",
+                "source_manifest_sha256": core.sha256_file(
+                    self.run / "evidence" / "source_manifest.json"
+                ),
+                "source_visuals_sha256": core.sha256_file(
+                    self.run / "evidence" / "source_visuals.json"
+                ),
+                "matches": [
+                    {
+                        "visual_id": visual["id"],
+                        "visual_sha256": visual["sha256"],
+                        "caption_evidence_id": evidence["id"],
+                        "caption_evidence_sha256": evidence["sha256"],
+                        "confidence": confidence,
+                        "allowed_content_roles": ["method"],
+                    }
+                ],
+            }
+
+        first = review_for_current_source(0.9)
+        core.bind_host_vlm_visuals(self.run, first)
+        second = review_for_current_source(0.95)
+        core.bind_host_vlm_visuals(self.run, second)
+
+        sidecar_path = self.run / "evidence" / "host-vlm-visual-review.json"
+        sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+        self.assertEqual(sidecar, {"format_version": 1, "batches": [first, second]})
+        sidecar_sha256 = core.sha256_file(sidecar_path)
+        visuals = json.loads(
+            (self.run / "evidence" / "source_visuals.json").read_text(encoding="utf-8")
+        )
+        manifest = json.loads(
+            (self.run / "evidence" / "source_manifest.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(visuals["host_vlm_review_sha256"], sidecar_sha256)
+        self.assertEqual(manifest["host_vlm_review_sha256"], sidecar_sha256)
+
+        original = sidecar_path.read_bytes()
+        sidecar["batches"].pop(0)
+        core.atomic_write_json(sidecar_path, sidecar)
+        with self.assertRaises(core.IntegrityError):
+            core.resume_run(self.run, skill_root=self.skill)
+        core.atomic_write_bytes(sidecar_path, original)
+        sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+        sidecar["batches"][0]["matches"][0]["confidence"] = 0.99
+        core.atomic_write_json(sidecar_path, sidecar)
+        with self.assertRaises(core.IntegrityError):
+            core.resume_run(self.run, skill_root=self.skill)
+
     def test_reference_images_are_separate_and_style_only(self) -> None:
         self._initialize()
         source = self.root / "paper.txt"
@@ -900,6 +1131,97 @@ elif name == "pdfimages":
             "invalid_derived_formula", {error["code"] for error in result["errors"]}
         )
 
+    def test_unicode_cjk_claims_require_deterministic_lexical_overlap(self) -> None:
+        evidence_text = "稀疏路由提高模型准确率。"
+        evidence = [
+            {
+                "id": "ev-001",
+                "kind": "text",
+                "text": evidence_text,
+                "safe_to_quote": True,
+                "anchor": {"line_start": 1, "line_end": 1},
+                "sha256": hashlib.sha256(evidence_text.encode()).hexdigest(),
+            }
+        ]
+        related = core.validate_grounding(
+            [{"id": "related", "text": "稀疏路由提升准确率。", "source_ids": ["ev-001"]}],
+            evidence,
+        )
+        unrelated = core.validate_grounding(
+            [{"id": "unrelated", "text": "视频编码降低延迟。", "source_ids": ["ev-001"]}],
+            evidence,
+        )
+
+        self.assertTrue(related["valid"], related)
+        self.assertFalse(unrelated["valid"])
+        self.assertIn(
+            "insufficient_lexical_overlap",
+            {error["code"] for error in unrelated["errors"]},
+        )
+
+    def test_numeric_grounding_supports_leading_decimals_and_unicode_minus(self) -> None:
+        evidence_text = "The signed change is −.5 and the threshold is .25."
+        evidence = [
+            {
+                "id": "ev-001",
+                "kind": "text",
+                "text": evidence_text,
+                "safe_to_quote": True,
+                "anchor": {"line_start": 1, "line_end": 1},
+                "sha256": hashlib.sha256(evidence_text.encode()).hexdigest(),
+            }
+        ]
+        result = core.validate_grounding(
+            [
+                {"id": "negative", "text": "The change is -0.5.", "source_ids": ["ev-001"]},
+                {"id": "leading", "text": "The threshold is 0.25.", "source_ids": ["ev-001"]},
+                {
+                    "id": "formula",
+                    "text": "The combined change is −0.75.",
+                    "source_ids": ["ev-001"],
+                    "derived_formula": {
+                        "expression": "−.5 - .25 = −.75",
+                        "inputs": ["−.5", ".25"],
+                        "result": "−.75",
+                    },
+                },
+            ],
+            evidence,
+        )
+        self.assertTrue(result["valid"], result)
+
+    def test_derived_formula_rejects_hidden_numeric_operands(self) -> None:
+        evidence_text = "Accuracy improves from 80% to 85%."
+        evidence = [
+            {
+                "id": "ev-001",
+                "kind": "text",
+                "text": evidence_text,
+                "safe_to_quote": True,
+                "anchor": {"line_start": 1, "line_end": 1},
+                "sha256": hashlib.sha256(evidence_text.encode()).hexdigest(),
+            }
+        ]
+        result = core.validate_grounding(
+            [
+                {
+                    "id": "hidden-constant",
+                    "text": "The adjusted improvement is 6%.",
+                    "source_ids": ["ev-001"],
+                    "derived_formula": {
+                        "expression": "85 - 80 + 1 = 6",
+                        "inputs": ["85%", "80%"],
+                        "result": "6%",
+                    },
+                }
+            ],
+            evidence,
+        )
+        self.assertFalse(result["valid"])
+        self.assertIn(
+            "invalid_derived_formula", {error["code"] for error in result["errors"]}
+        )
+
     def test_visual_role_and_reuse_limits_are_enforced(self) -> None:
         self._initialize()
         source = self.root / "paper.txt"
@@ -942,6 +1264,71 @@ elif name == "pdfimages":
                 attempt,
                 [{"id": "claim-002", "text": "Accuracy reaches 99%.", "source_ids": ["ev-001"]}],
             )
+
+    def test_deterministic_result_requires_a_preexisting_source_map(self) -> None:
+        self._initialize()
+        source = self.root / "map-before-qa.txt"
+        source.write_text("Grounded accuracy is 85%.\n", encoding="utf-8")
+        core.prepare_source(self.run, source)
+        core.save_plan(self.run, {"artifact_type": "poster"})
+        attempt = core.begin_attempt(self.run)
+        attempt_root = self.run / "attempts" / attempt
+        core.atomic_write_bytes(attempt_root / "artifact" / "poster.html", b"artifact")
+        core.atomic_write_bytes(attempt_root / "qa" / "previews" / "poster.png", b"preview")
+
+        with self.assertRaises(core.StateError):
+            core.record_deterministic_result(
+                self.run,
+                attempt,
+                passed=True,
+                checks=[],
+                artifact_paths=["artifact/poster.html"],
+                preview_paths={"poster": "qa/previews/poster.png"},
+            )
+
+    def test_first_source_map_cannot_be_written_after_authoring(self) -> None:
+        self._initialize()
+        source = self.root / "late-map.txt"
+        source.write_text("Grounded accuracy is 85%.\n", encoding="utf-8")
+        core.prepare_source(self.run, source)
+        core.save_plan(self.run, {"artifact_type": "poster"})
+        attempt = core.begin_attempt(self.run)
+        core.transition_state(self.run, "deterministic_passed")
+
+        with self.assertRaises(core.StateError):
+            core.write_source_map(
+                self.run,
+                attempt,
+                [{"id": "late", "text": "Accuracy is 85%.", "source_ids": ["ev-001"]}],
+            )
+
+    def test_review_context_and_semantic_review_echo_source_map_hash(self) -> None:
+        attempt, _report = self._deterministic_attempt()
+        source_map = self.run / "attempts" / attempt / "provenance" / "source-map.json"
+        context = core.create_review_context(
+            self.run, attempt, rubric={"format_version": 1, "dimensions": ["fidelity"]}
+        )
+        self.assertEqual(context.get("source_map_sha256"), core.sha256_file(source_map))
+        review = {
+            "format_version": 1,
+            "attempt_id": attempt,
+            "review_context_sha256": context["context_sha256"],
+            "artifact_hashes": context["artifact_hashes"],
+            "preview_hashes": context["preview_hashes"],
+            "reviewed_frame_ids": sorted(context["preview_hashes"]),
+            "source_manifest_sha256": context["source_manifest_sha256"],
+            "source_map_sha256": context.get("source_map_sha256"),
+            "rubric_sha256": context["rubric_sha256"],
+            "reviewer_mode": "fresh_subagent",
+            "dimension_scores": {"fidelity": 4},
+            "blockers": [],
+            "localized_repairs": [],
+            "verdict": "pass",
+            "complete": True,
+        }
+        review["source_map_sha256"] = "0" * 64
+        with self.assertRaises(core.ContractError):
+            core.record_semantic_review(self.run, attempt, review)
 
     def test_finalize_revalidates_persisted_source_map_schema_and_grounding(self) -> None:
         for mutation in ("unknown_field", "regrounded_tampered_claim"):
@@ -1028,6 +1415,7 @@ elif name == "pdfimages":
                 "preview_hashes": context["preview_hashes"],
                 "reviewed_frame_ids": sorted(context["preview_hashes"]),
                 "source_manifest_sha256": context["source_manifest_sha256"],
+                "source_map_sha256": context["source_map_sha256"],
                 "rubric_sha256": context["rubric_sha256"],
                 "reviewer_mode": "fresh_subagent",
                 "dimension_scores": {"fidelity": 4},
@@ -1071,6 +1459,11 @@ elif name == "pdfimages":
         core.prepare_source(self.run, source)
         core.save_plan(self.run, {"artifact_type": "poster"})
         attempt = core.begin_attempt(self.run)
+        core.write_source_map(
+            self.run,
+            attempt,
+            [{"id": "c1", "text": "Accuracy is 85%.", "source_ids": ["ev-001"]}],
+        )
         attempt_root = self.run / "attempts" / attempt
         core.atomic_write_bytes(attempt_root / "artifact" / "poster.html", b"artifact")
         core.atomic_write_bytes(attempt_root / "qa" / "previews" / "poster.png", b"preview")
@@ -1093,6 +1486,7 @@ elif name == "pdfimages":
             "preview_hashes": context["preview_hashes"],
             "reviewed_frame_ids": sorted(context["preview_hashes"]),
             "source_manifest_sha256": context["source_manifest_sha256"],
+            "source_map_sha256": context["source_map_sha256"],
             "rubric_sha256": context["rubric_sha256"],
             "reviewer_mode": "fresh_subagent",
             "dimension_scores": {"fidelity": 4},
@@ -1119,7 +1513,9 @@ elif name == "pdfimages":
 
         attempt_root = self.run / "attempts" / attempt
         core.atomic_write_bytes(attempt_root / "artifact" / "poster.html", b"artifact")
-        self.assertEqual(core.resume_run(self.run)["next_action"], "validate")
+        self.assertEqual(
+            core.resume_run(self.run, skill_root=self.skill)["next_action"], "validate"
+        )
 
         with self.assertRaises(core.SimulatedCrash):
             core.record_deterministic_result(
@@ -1131,7 +1527,7 @@ elif name == "pdfimages":
                 preview_paths={},
                 fail_after_write=True,
             )
-        recovered = core.resume_run(self.run)
+        recovered = core.resume_run(self.run, skill_root=self.skill)
         self.assertEqual(recovered["state"], "deterministic_passed")
         self.assertEqual(recovered["next_action"], "semantic_review")
 
@@ -1149,7 +1545,7 @@ elif name == "pdfimages":
                 preview_paths={},
                 fail_after_write=True,
             )
-        status = core.resume_run(self.run)
+        status = core.resume_run(self.run, skill_root=self.skill)
         self.assertEqual(status["state"], "failed")
         self.assertEqual(status["next_action"], "repair")
 
@@ -1168,7 +1564,7 @@ elif name == "pdfimages":
     def test_side_states_are_explicit_and_resume_reports_them(self) -> None:
         self._initialize()
         core.mark_side_state(self.run, "blocked", reason="missing pdftotext")
-        status = core.resume_run(self.run)
+        status = core.resume_run(self.run, skill_root=self.skill)
         self.assertEqual(status["state"], "blocked")
         self.assertEqual(status["next_action"], "resolve_blocker")
         self.assertEqual(status["reason"], "missing pdftotext")
@@ -1179,7 +1575,7 @@ elif name == "pdfimages":
         source = self.root / "paper.txt"
         source.write_text("Recovered source.\n", encoding="utf-8")
         core.prepare_source(self.run, source)
-        status = core.resume_run(self.run)
+        status = core.resume_run(self.run, skill_root=self.skill)
         self.assertEqual(status["state"], "initialized")
         self.assertEqual(status["next_action"], "plan")
 
@@ -1196,6 +1592,7 @@ elif name == "pdfimages":
             "preview_hashes": context["preview_hashes"],
             "reviewed_frame_ids": sorted(context["preview_hashes"]),
             "source_manifest_sha256": context["source_manifest_sha256"],
+            "source_map_sha256": context["source_map_sha256"],
             "rubric_sha256": context["rubric_sha256"],
             "reviewer_mode": "fresh_subagent",
             "dimension_scores": {"fidelity": 2},
@@ -1208,7 +1605,9 @@ elif name == "pdfimages":
         repaired = core.begin_attempt(self.run)
         self.assertEqual(repaired, "02")
         self.assertTrue((self.run / "attempts" / "01" / "qa" / "semantic-review.json").is_file())
-        self.assertEqual(core.resume_run(self.run)["next_action"], "author")
+        self.assertEqual(
+            core.resume_run(self.run, skill_root=self.skill)["next_action"], "author"
+        )
 
     def test_review_is_hash_bound_and_rejects_wrong_partial_stale_or_incomplete_input(self) -> None:
         attempt, _ = self._deterministic_attempt()
@@ -1223,6 +1622,7 @@ elif name == "pdfimages":
             "preview_hashes": context["preview_hashes"],
             "reviewed_frame_ids": sorted(context["preview_hashes"]),
             "source_manifest_sha256": context["source_manifest_sha256"],
+            "source_map_sha256": context["source_map_sha256"],
             "rubric_sha256": context["rubric_sha256"],
             "reviewer_mode": "fresh_subagent",
             "dimension_scores": {"fidelity": 4},
@@ -1281,6 +1681,7 @@ elif name == "pdfimages":
             "preview_hashes": context["preview_hashes"],
             "reviewed_frame_ids": sorted(context["preview_hashes"]),
             "source_manifest_sha256": context["source_manifest_sha256"],
+            "source_map_sha256": context["source_map_sha256"],
             "rubric_sha256": context["rubric_sha256"],
             "reviewer_mode": "fresh_subagent",
             "dimension_scores": {"fidelity": 4},
@@ -1293,7 +1694,7 @@ elif name == "pdfimages":
             core.record_semantic_review(
                 self.run, attempt, review, fail_after_write=True
             )
-        status = core.resume_run(self.run)
+        status = core.resume_run(self.run, skill_root=self.skill)
         self.assertEqual(status["state"], "semantic_passed")
         self.assertEqual(status["next_action"], "finalize")
 
@@ -1313,7 +1714,7 @@ elif name == "pdfimages":
                 review.update(mutation)
                 core.atomic_write_json(review_path, review)
                 with self.assertRaises(core.ContractError):
-                    core.resume_run(self.run)
+                    core.resume_run(self.run, skill_root=self.skill)
                 with self.assertRaises(core.ContractError):
                     core.finalize_attempt(self.run, attempt)
 
@@ -1322,7 +1723,7 @@ elif name == "pdfimages":
         with self.assertRaises(core.SimulatedCrash):
             core.finalize_attempt(self.run, attempt, fail_at="after_rename")
         self.assertTrue((self.run / "final" / "delivery-manifest.json").is_file())
-        recovered = core.resume_run(self.run)
+        recovered = core.resume_run(self.run, skill_root=self.skill)
         self.assertEqual(recovered["state"], "finalized")
         self.assertEqual(recovered["next_action"], "complete")
 
@@ -1350,12 +1751,118 @@ elif name == "pdfimages":
         with self.assertRaises(core.IntegrityError):
             core.finalize_attempt(self.run, attempt)
 
+    def test_finalization_rejects_artifacts_added_after_deterministic_review(self) -> None:
+        attempt, _review = self._semantic_attempt()
+        core.atomic_write_bytes(
+            self.run / "attempts" / attempt / "artifact" / "unreviewed.txt",
+            b"late artifact",
+        )
+        with self.assertRaises(core.IntegrityError):
+            core.finalize_attempt(self.run, attempt)
+
+    def test_finalized_state_is_terminal_for_side_states_and_attempts(self) -> None:
+        attempt, _review = self._semantic_attempt()
+        core.finalize_attempt(self.run, attempt)
+
+        with self.assertRaises(core.StateError):
+            core.mark_side_state(self.run, "failed", reason="must stay finalized")
+        with self.assertRaises(core.StateError):
+            core.begin_attempt(self.run)
+
+    def test_promoted_final_is_terminal_before_state_recovery(self) -> None:
+        attempt, _review = self._semantic_attempt()
+        with self.assertRaises(core.SimulatedCrash):
+            core.finalize_attempt(self.run, attempt, fail_at="after_rename")
+
+        with self.assertRaises(core.StateError):
+            core.mark_side_state(self.run, "failed", reason="must recover final first")
+
+    def test_finalize_retry_after_rename_revalidates_every_attempt_contract(self) -> None:
+        mutations = (
+            "deterministic",
+            "semantic_review",
+            "attempt_source_map",
+            "extra_artifact",
+            "final_provenance",
+        )
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                self.run = self.root / "workspace" / f"retry-final-{mutation}"
+                attempt, _review = self._semantic_attempt()
+                with self.assertRaises(core.SimulatedCrash):
+                    core.finalize_attempt(self.run, attempt, fail_at="after_rename")
+                attempt_root = self.run / "attempts" / attempt
+                if mutation == "deterministic":
+                    path = attempt_root / "qa" / "deterministic.json"
+                    value = json.loads(path.read_text(encoding="utf-8"))
+                    value["artifact_hashes"]["artifact/poster.html"] = "0" * 64
+                    core.atomic_write_json(path, value)
+                elif mutation == "semantic_review":
+                    path = attempt_root / "qa" / "semantic-review.json"
+                    value = json.loads(path.read_text(encoding="utf-8"))
+                    value["unexpected"] = True
+                    core.atomic_write_json(path, value)
+                elif mutation == "attempt_source_map":
+                    path = attempt_root / "provenance" / "source-map.json"
+                    value = json.loads(path.read_text(encoding="utf-8"))
+                    value["unexpected"] = True
+                    core.atomic_write_json(path, value)
+                elif mutation == "extra_artifact":
+                    core.atomic_write_bytes(
+                        attempt_root / "artifact" / "late.txt", b"unreviewed"
+                    )
+                else:
+                    path = self.run / "final" / "provenance" / "source-map.json"
+                    value = json.loads(path.read_text(encoding="utf-8"))
+                    value["unexpected"] = True
+                    core.atomic_write_json(path, value)
+                    delivery_path = self.run / "final" / "delivery-manifest.json"
+                    delivery = json.loads(delivery_path.read_text(encoding="utf-8"))
+                    delivery["files"]["provenance/source-map.json"] = core.sha256_file(path)
+                    core.atomic_write_json(delivery_path, delivery)
+
+                with self.assertRaises(core.PortableError):
+                    core.finalize_attempt(self.run, attempt)
+
+    def test_finalized_resume_rejects_current_source_manifest_provenance_mismatch(self) -> None:
+        attempt, _review = self._semantic_attempt()
+        core.finalize_attempt(self.run, attempt)
+        source_manifest_path = self.run / "evidence" / "source_manifest.json"
+        source_manifest = json.loads(source_manifest_path.read_text(encoding="utf-8"))
+        source_manifest["post_finalize_tamper"] = True
+        core.atomic_write_json(source_manifest_path, source_manifest)
+        run_path = self.run / "run.json"
+        run = json.loads(run_path.read_text(encoding="utf-8"))
+        run["source_manifest_sha256"] = core.sha256_file(source_manifest_path)
+        core.atomic_write_json(run_path, run)
+
+        with self.assertRaises(core.PortableError):
+            core.resume_run(self.run, skill_root=self.skill)
+
+    def test_resume_requires_installed_skill_root(self) -> None:
+        self._initialize()
+        with self.assertRaises(TypeError):
+            core.resume_run(self.run)
+
+    def test_unprepared_resume_requests_source_preparation(self) -> None:
+        self._initialize()
+        self.assertEqual(
+            core.resume_run(self.run, skill_root=self.skill)["next_action"],
+            "prepare_source",
+        )
+
+    def test_resume_checks_installed_skill_drift(self) -> None:
+        self._initialize()
+        (self.skill / "scripts" / "tool.py").write_text("VALUE = 9\n", encoding="utf-8")
+        with self.assertRaises(core.IntegrityError):
+            core.resume_run(self.run, skill_root=self.skill)
+
     def test_incomplete_final_staging_is_never_promoted(self) -> None:
         attempt, _ = self._semantic_attempt()
         with self.assertRaises(core.SimulatedCrash):
             core.finalize_attempt(self.run, attempt, fail_at="after_copy")
         self.assertFalse((self.run / "final").exists())
-        status = core.resume_run(self.run)
+        status = core.resume_run(self.run, skill_root=self.skill)
         self.assertEqual(status["next_action"], "finalize")
         self.assertFalse((self.run / "final").exists())
 
@@ -1367,7 +1874,7 @@ elif name == "pdfimages":
         self.assertTrue(
             (self.run / f".final.staging-{attempt}" / "delivery-manifest.json").is_file()
         )
-        status = core.resume_run(self.run)
+        status = core.resume_run(self.run, skill_root=self.skill)
         self.assertEqual(status["state"], "finalized")
         self.assertEqual(status["next_action"], "complete")
         self.assertTrue((self.run / "final" / "poster.html").is_file())
@@ -1377,7 +1884,7 @@ elif name == "pdfimages":
         core.finalize_attempt(self.run, attempt)
         (self.run / "final" / "unlisted.txt").write_text("extra", encoding="utf-8")
         with self.assertRaises(core.IntegrityError):
-            core.resume_run(self.run)
+            core.resume_run(self.run, skill_root=self.skill)
 
         self.run = self.root / "workspace" / "stage-extra"
         attempt, _ = self._semantic_attempt()
@@ -1385,7 +1892,7 @@ elif name == "pdfimages":
             core.finalize_attempt(self.run, attempt, fail_at="after_manifest")
         (self.run / f".final.staging-{attempt}" / "empty-extra").mkdir()
         with self.assertRaises(core.IntegrityError):
-            core.resume_run(self.run)
+            core.resume_run(self.run, skill_root=self.skill)
 
     def test_sync_script_keeps_all_four_vendored_copies_byte_identical(self) -> None:
         completed = subprocess.run(
