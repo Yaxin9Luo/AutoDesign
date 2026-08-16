@@ -835,6 +835,13 @@ def native_object_contract(deck: DeckModel) -> dict[str, Any]:
 
     slides: list[dict[str, Any]] = []
     for slide in deck.slides:
+        shape_types = [
+            element.attrs.get("data-shape", "rect").strip().lower()
+            for element in slide.elements
+            if element.kind == "shape"
+        ]
+        if any(kind not in {"rect", "ellipse", "line"} for kind in shape_types):
+            raise PptContractError("native PPTX object contract has an unknown shape type")
         slides.append(
             {
                 "slide_id": slide.slide_id,
@@ -848,6 +855,8 @@ def native_object_contract(deck: DeckModel) -> dict[str, Any]:
                 "image_shapes": sum(
                     element.kind == "image" for element in slide.elements
                 ),
+                "shape_count": len(shape_types),
+                "shape_types": shape_types,
                 "speaker_notes": slide.attrs.get("data-speaker-notes", "").strip(),
             }
         )
@@ -868,12 +877,24 @@ def _validate_native_contract(
     if [slide.get("slide_id") for slide in slides] != expected_ids:
         raise PptContractError("native PPTX object contract slide order is invalid")
     for slide in slides:
-        for field_name in ("text_shapes", "table_shapes", "image_shapes"):
+        for field_name in (
+            "text_shapes",
+            "table_shapes",
+            "image_shapes",
+            "shape_count",
+        ):
             value = slide.get(field_name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise PptContractError(
                     f"native PPTX object contract has invalid {field_name}"
                 )
+        shape_types = slide.get("shape_types")
+        if (
+            not isinstance(shape_types, list)
+            or len(shape_types) != slide["shape_count"]
+            or any(kind not in {"rect", "ellipse", "line"} for kind in shape_types)
+        ):
+            raise PptContractError("native PPTX object contract has invalid shape types")
         if not isinstance(slide.get("speaker_notes"), str):
             raise PptContractError("native PPTX object contract has invalid speaker notes")
     return slides
@@ -886,7 +907,7 @@ def inspect_pptx(
     native_contract: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     from pptx import Presentation
-    from pptx.enum.shapes import MSO_SHAPE_TYPE
+    from pptx.enum.shapes import MSO_AUTO_SHAPE_TYPE, MSO_SHAPE_TYPE
 
     target = Path(path).resolve(strict=True)
     presentation = Presentation(str(target))
@@ -913,6 +934,7 @@ def inspect_pptx(
         slide_text = 0
         slide_tables = 0
         slide_images = 0
+        slide_shape_types: list[str] = []
         notes = slide.notes_slide.notes_text_frame.text.strip()
         if notes:
             notes_count += 1
@@ -935,6 +957,17 @@ def inspect_pptx(
                 slide_text += 1
             else:
                 editable_shapes += 1
+                if shape.shape_type == MSO_SHAPE_TYPE.LINE:
+                    slide_shape_types.append("line")
+                elif shape.shape_type == MSO_SHAPE_TYPE.AUTO_SHAPE:
+                    if shape.auto_shape_type == MSO_AUTO_SHAPE_TYPE.RECTANGLE:
+                        slide_shape_types.append("rect")
+                    elif shape.auto_shape_type == MSO_AUTO_SHAPE_TYPE.OVAL:
+                        slide_shape_types.append("ellipse")
+                    else:
+                        slide_shape_types.append("unknown-auto-shape")
+                else:
+                    slide_shape_types.append(f"unknown-{shape.shape_type}")
         if slide_text == 0:
             issues.append(_issue("pptx_missing_editable_text", "slide has no editable text overlay", slide_id=slide_id))
         observed = {
@@ -942,6 +975,8 @@ def inspect_pptx(
             "text_shapes": slide_text,
             "table_shapes": slide_tables,
             "image_shapes": slide_images,
+            "shape_count": len(slide_shape_types),
+            "shape_types": slide_shape_types,
             "speaker_notes": notes,
         }
         observed_native.append(observed)
@@ -960,6 +995,17 @@ def inspect_pptx(
                             slide_id=slide_id,
                         )
                     )
+            if (
+                observed["shape_count"] != expected["shape_count"]
+                or observed["shape_types"] != expected["shape_types"]
+            ):
+                issues.append(
+                    _issue(
+                        "pptx_native_shape",
+                        "native shape count or types differ from the canonical deck contract",
+                        slide_id=slide_id,
+                    )
+                )
             if observed["speaker_notes"] != expected["speaker_notes"].strip():
                 issues.append(
                     _issue(

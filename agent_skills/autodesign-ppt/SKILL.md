@@ -32,11 +32,17 @@ Run `python "$SKILL_ROOT/scripts/ppt_harness.py" --help` for exact flags.
    conclusions. A fresh host VLM or subagent must inspect PDF visual candidates
    against their captions before using them; bind the complete hash-matched JSON
    with `bind-visuals`. Uncertain candidates stay unused.
-3. Run `plan --brief "..."`. Paper decks default to exactly 18 slides. An
-   explicit user slide count overrides the default in both standalone Deck and
-   One-Paper-to-All use. Build one research argument, not 18 disconnected
-   summary cards. Pass an explicit visual-allocation JSON to `plan`; keep each
-   visual within its permitted role and reuse limit.
+3. After the evidence queries, write a complete role/evidence story-plan JSON
+   and run `plan --brief "..." --story-plan "$STORY_PLAN"`. It has exactly one
+   entry per slide with `slide_id`, the required academic `role`, and one or more
+   real `evidence_refs`; the harness validates it before the immutable hash is
+   written. If the story plan is omitted, deterministic semantic role scoring
+   selects evidence and never assigns by extraction order. Paper decks default
+   to exactly 18 slides. A true deck-target count, including Chinese numerals
+   through sixty, overrides the default; source metadata such as “12-page
+   paper” does not. Build one research argument, not disconnected summary
+   cards. Pass an explicit visual-allocation JSON to `plan`; keep each visual
+   within its permitted role and reuse limit.
 4. Run `begin`. Author the returned `artifact/deck.html` yourself. The HTML is
    canonical and the immutable plan is snapshotted under artifact provenance.
    Match every slide's ordered role, section, assertion, and evidence refs to
@@ -54,7 +60,8 @@ Run `python "$SKILL_ROOT/scripts/ppt_harness.py" --help` for exact flags.
    roots actually compute to 1920x1080 before any audit isolation CSS, makes a
    contact sheet,
    verifies an exact-page-count PDF, exports `deck.pptx`, reopens its required
-   native text/table/image counts and exact notes, and, when LibreOffice is
+   native text/table/image counts, native rect/ellipse/line counts and types,
+   and exact notes, and, when LibreOffice is
    available, renders and compares
    the PowerPoint with the canonical HTML. A screenshot-only deck does not pass.
 6. Run `review-context`. Give the contact sheet and every individual preview to

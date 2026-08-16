@@ -16,6 +16,7 @@ import os
 import re
 import shutil
 import subprocess
+import unicodedata
 import uuid
 from collections import Counter
 from pathlib import Path
@@ -61,14 +62,53 @@ ppt_setup = _load_sibling("autodesign_ppt_runtime_setup", "setup_ppt.py")
 exporter = _load_sibling("autodesign_ppt_exporter", "export_pptx.py")
 
 
+_COUNT_TOKEN = r"(?:[1-5]?\d|60|[零〇一二两三四五六七八九十]{1,3})"
+_COUNT_LEFT_BOUNDARY = r"(?<![0-9零〇一二两三四五六七八九十百])"
 _EXPLICIT_COUNT_PATTERNS = (
     re.compile(
-        r"(?<!\d)([1-5]?\d|60)\s*-?\s*(?:slides?|pages?|页|张\s*(?:幻灯片|ppt)|幻灯片|ppt)(?![A-Za-z0-9_])",
+        rf"{_COUNT_LEFT_BOUNDARY}(?P<count>{_COUNT_TOKEN})\s*(?:张\s*)?(?:幻灯片|ppt)(?![A-Za-z0-9_])",
         re.IGNORECASE,
     ),
-    re.compile(r"(?:slides?|pages?)\s*(?:count|total)?\s*[:=]?\s*([1-5]?\d|60)(?!\d)", re.IGNORECASE),
-    re.compile(r"(?:生成|做成|制作|需要|想要|要|做|共)\s*([1-5]?\d|60)\s*页"),
+    re.compile(
+        rf"{_COUNT_LEFT_BOUNDARY}(?P<count>{_COUNT_TOKEN})\s*页\s*(?:的\s*)?(?:幻灯片|ppt|演示文稿|deck|presentation)(?![A-Za-z0-9_])",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"(?<!\d)(?P<count>[1-5]?\d|60)\s*-?\s*slides?(?![A-Za-z0-9_])",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"(?<!\d)(?P<count>[1-5]?\d|60)\s*-?\s*pages?\s+(?:conference\s+)?(?:deck|slides?|presentation|ppt)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"(?:make|create|generate|prepare|need|want)(?:\s+\w+){0,4}\s+(?P<count>[1-5]?\d|60)\s*-?\s*pages?(?!\s+paper\b)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rf"(?:请\s*)?(?:生成|做成|制作|需要|想要|要|做|共)\s*(?P<count>{_COUNT_TOKEN})\s*页(?!\s*(?:论文|paper))",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"(?:slides?|pages?)\s*(?:count|total)?\s*[:=]?\s*(?P<count>[1-5]?\d|60)(?!\d)",
+        re.IGNORECASE,
+    ),
 )
+
+_CHINESE_DIGITS = {
+    "零": 0,
+    "〇": 0,
+    "一": 1,
+    "二": 2,
+    "两": 2,
+    "三": 3,
+    "四": 4,
+    "五": 5,
+    "六": 6,
+    "七": 7,
+    "八": 8,
+    "九": 9,
+}
 
 _ACADEMIC_ARC = (
     ("cover", "Opening", "State the paper identity and central thesis"),
@@ -92,12 +132,61 @@ _ACADEMIC_ARC = (
 )
 
 
+_ROLE_EVIDENCE_QUERIES = {
+    "cover": "paper title authors affiliation abstract thesis 论文 标题 作者 摘要 主旨",
+    "outline": "abstract overview roadmap contribution method result conclusion 摘要 概览 贡献 方法 结果 结论",
+    "problem": "problem challenge task failure unresolved need 问题 挑战 任务 痛点",
+    "motivation": "motivation importance impact need problem significance 动机 重要 意义 需求 问题",
+    "prior-gap": "related work prior baseline limitation gap existing however 相关工作 现有 局限 差距",
+    "contributions": "contribution propose introduce present method result 贡献 提出 方法 结果",
+    "method-overview": "method approach framework architecture pipeline overview 方法 框架 架构 流程",
+    "mechanism": "mechanism module component process algorithm method 机制 模块 组件 算法 方法",
+    "objective": "objective loss equation theorem optimization training algorithm architecture 目标 损失 公式 优化 算法 架构",
+    "setup": "experiment dataset benchmark metric baseline implementation evaluation 实验 数据集 基准 指标 基线 评测",
+    "primary-results": "result performance improvement score accuracy comparison baseline 结果 性能 提升 分数 对比 基线",
+    "robustness": "robustness generalization sensitivity variance result evaluation baseline 鲁棒 泛化 敏感 结果 评测",
+    "ablation": "ablation component variant remove method result 消融 组件 变体 方法 结果",
+    "qualitative": "qualitative case example visualization figure result 定性 案例 可视化 图 结果",
+    "limitations": "limitation failure caveat uncertainty future work 局限 失败 不足 未来工作",
+    "implications": "implication application impact practice result 应用 启示 影响 结果",
+    "takeaways": "conclusion takeaway summary finding result method 总结 结论 要点 发现 结果 方法",
+    "closing": "conclusion discussion future thesis result 结论 讨论 未来 主旨 结果",
+}
+_SUMMARY_EVIDENCE_QUERY = (
+    "paper problem method contribution result limitation conclusion "
+    "论文 问题 方法 贡献 结果 局限 结论"
+)
+_SUMMARY_ROLES = {"cover", "outline", "takeaways", "closing"}
+
+
+def _parse_slide_count_token(token: str) -> int | None:
+    if token.isascii() and token.isdigit():
+        value = int(token)
+        return value if 1 <= value <= 60 else None
+    if "十" in token:
+        if token.count("十") != 1:
+            return None
+        tens, ones = token.split("十", 1)
+        if len(tens) > 1 or len(ones) > 1:
+            return None
+        tens_value = 1 if not tens else _CHINESE_DIGITS.get(tens)
+        ones_value = 0 if not ones else _CHINESE_DIGITS.get(ones)
+        if tens_value is None or ones_value is None or tens_value == 0:
+            return None
+        value = tens_value * 10 + ones_value
+    elif len(token) == 1:
+        value = _CHINESE_DIGITS.get(token, 0)
+    else:
+        return None
+    return value if 1 <= value <= 60 else None
+
+
 def _explicit_slide_count(brief: str) -> int | None:
     for pattern in _EXPLICIT_COUNT_PATTERNS:
         match = pattern.search(brief)
         if match:
-            value = int(match.group(1))
-            if 1 <= value <= 60:
+            value = _parse_slide_count_token(match.group("count"))
+            if value is not None:
                 return value
     return None
 
@@ -129,12 +218,137 @@ def _arc_for_count(count: int) -> list[tuple[str, str, str]]:
     return result
 
 
+def _grapheme_clusters(text: str) -> list[str]:
+    clusters: list[str] = []
+    for character in text:
+        is_modifier = unicodedata.category(character).startswith("M") or (
+            "\ufe00" <= character <= "\ufe0f"
+        )
+        if clusters and (
+            is_modifier
+            or character == "\u200d"
+            or clusters[-1].endswith("\u200d")
+        ):
+            clusters[-1] += character
+        else:
+            clusters.append(character)
+    return clusters
+
+
+def _bounded_source_anchor(text: str) -> str:
+    normalized = " ".join(
+        unicodedata.normalize("NFKC", text).lstrip("# ").split()
+    )
+    if not normalized:
+        return ""
+    words = normalized.split()
+    word_bounded = " ".join(words[:12])
+    word_truncated = len(words) > 12
+    clusters = _grapheme_clusters(word_bounded)
+    limit = min(len(clusters), 72)
+    sentence_end: int | None = None
+    for index, cluster in enumerate(clusters[:limit]):
+        final = cluster[-1]
+        if final in "。！？；":
+            sentence_end = index + 1
+            break
+        if final in ".!?;" and (
+            index + 1 == len(clusters) or clusters[index + 1].isspace()
+        ):
+            sentence_end = index + 1
+            break
+    end = sentence_end if sentence_end is not None else limit
+    anchor = "".join(clusters[:end]).strip()
+    truncated = word_truncated or end < len(clusters)
+    if truncated and sentence_end is None:
+        anchor = anchor.rstrip(".,;:，；：") + "…"
+    elif sentence_end is not None:
+        anchor = anchor.rstrip("。！？；.!?;")
+    return anchor
+
+
+def _semantic_evidence_ref(
+    role: str,
+    title: str,
+    communication_job: str,
+    evidence: Sequence[Mapping[str, Any]],
+) -> str:
+    query = " ".join(
+        (
+            role.replace("-", " "),
+            title,
+            communication_job,
+            _ROLE_EVIDENCE_QUERIES.get(
+                role,
+                "evidence analysis result method 证据 分析 结果 方法",
+            ),
+        )
+    )
+    ranked = portable.lexical_retrieve(evidence, query, limit=1)
+    if ranked:
+        return str(ranked[0]["id"])
+    if role in _SUMMARY_ROLES:
+        summary_ranked = portable.lexical_retrieve(
+            evidence,
+            _SUMMARY_EVIDENCE_QUERY,
+            limit=1,
+        )
+        if summary_ranked:
+            return str(summary_ranked[0]["id"])
+    if len(evidence) == 1:
+        return str(evidence[0]["id"])
+    raise PptHarnessError(
+        f"could not semantically assign evidence for role {role}; provide --story-plan"
+    )
+
+
+def _host_story_evidence_refs(
+    story_plan: Mapping[str, Any],
+    arc: Sequence[tuple[str, str, str]],
+    evidence_ids: set[str],
+) -> list[list[str]]:
+    if set(story_plan) != {"format_version", "slides"} or story_plan.get(
+        "format_version"
+    ) != 1:
+        raise PptHarnessError("story plan must use the exact version-1 schema")
+    slides = story_plan.get("slides")
+    if not isinstance(slides, list) or len(slides) != len(arc):
+        raise PptHarnessError("story plan slide count must match the requested deck")
+    assignments: list[list[str]] = []
+    for index, (entry, expected) in enumerate(zip(slides, arc), start=1):
+        if not isinstance(entry, Mapping) or set(entry) != {
+            "slide_id",
+            "role",
+            "evidence_refs",
+        }:
+            raise PptHarnessError("story plan slides must use the exact role/evidence schema")
+        expected_id = f"slide-{index:02d}"
+        if entry.get("slide_id") != expected_id or entry.get("role") != expected[0]:
+            raise PptHarnessError("story plan slide IDs and roles must match the academic arc")
+        refs = entry.get("evidence_refs")
+        if (
+            not isinstance(refs, list)
+            or not refs
+            or any(not isinstance(ref, str) for ref in refs)
+            or len(refs) != len(set(refs))
+        ):
+            raise PptHarnessError("story plan evidence refs must be a non-empty unique list")
+        unknown = sorted(set(refs) - evidence_ids)
+        if unknown:
+            raise PptHarnessError(
+                f"story plan cites unknown evidence: {', '.join(unknown)}"
+            )
+        assignments.append(list(refs))
+    return assignments
+
+
 def build_deck_plan(
     brief: str,
     evidence_ids: Sequence[str],
     *,
     slide_count: int | None = None,
     evidence_texts: Mapping[str, str] | None = None,
+    story_plan: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Return the shared paper-deck plan: 18 by default, explicit requests win."""
 
@@ -145,11 +359,39 @@ def build_deck_plan(
     sources = [item for item in dict.fromkeys(evidence_ids) if re.fullmatch(r"ev-\d{3,}", item)]
     if not sources:
         raise PptHarnessError("deck planning requires at least one evidence ID")
+    arc = _arc_for_count(count)
+    evidence = [
+        {"id": source_id, "text": str((evidence_texts or {}).get(source_id, ""))}
+        for source_id in sources
+    ]
+    if story_plan is not None:
+        evidence_assignments = _host_story_evidence_refs(
+            story_plan,
+            arc,
+            set(sources),
+        )
+        assignment_source = "host_story_plan"
+    else:
+        evidence_assignments = [
+            [
+                _semantic_evidence_ref(
+                    role,
+                    title,
+                    communication_job,
+                    evidence,
+                )
+            ]
+            for role, title, communication_job in arc
+        ]
+        assignment_source = "semantic_default"
     slides: list[dict[str, Any]] = []
-    for index, (role, title, communication_job) in enumerate(_arc_for_count(count), start=1):
-        source_id = sources[(index - 1) % len(sources)]
-        source_text = " ".join(str((evidence_texts or {}).get(source_id, "")).split())
-        source_anchor = " ".join(source_text.lstrip("# ").split()[:12]).rstrip(".,;:")
+    for index, (role, title, communication_job) in enumerate(arc, start=1):
+        planned_sources = evidence_assignments[index - 1]
+        source_text = "\n".join(
+            str((evidence_texts or {}).get(source_id, ""))
+            for source_id in planned_sources
+        )
+        source_anchor = _bounded_source_anchor(source_text)
         assertion_title = (
             f"{title}: {source_anchor}" if source_anchor else title
         )
@@ -164,8 +406,8 @@ def build_deck_plan(
                 "chapter": "paper-talk",
                 "communication_job": communication_job,
                 "assertion_title": assertion_title,
-                "evidence_refs": [source_id],
-                "speaker_note_intent": f"[Sources] {source_id} [Talk] {talk}.",
+                "evidence_refs": planned_sources,
+                "speaker_note_intent": f"[Sources] {', '.join(planned_sources)} [Talk] {talk}.",
                 "layout_family": "editorial-evidence",
             }
         )
@@ -176,6 +418,7 @@ def build_deck_plan(
         "slide_count": count,
         "count_source": "explicit_user" if requested is not None else "academic_default",
         "canvas": {"width": SLIDE_WIDTH, "height": SLIDE_HEIGHT},
+        "evidence_assignment_source": assignment_source,
         "visual_allocations": [],
         "slides": slides,
     }
@@ -1103,11 +1346,19 @@ def _command_init(args: argparse.Namespace) -> dict[str, Any]:
 def _command_plan(args: argparse.Namespace) -> dict[str, Any]:
     _resume(args.run_dir)
     evidence = portable.load_evidence(args.run_dir)
+    story_plan_path = getattr(args, "story_plan", None)
+    story_plan: Mapping[str, Any] | None = None
+    if story_plan_path is not None:
+        value = json.loads(story_plan_path.read_text(encoding="utf-8"))
+        if not isinstance(value, dict):
+            raise PptHarnessError("story plan must be a JSON object")
+        story_plan = value
     plan = build_deck_plan(
         args.brief,
         [item["id"] for item in evidence],
         slide_count=args.slide_count,
         evidence_texts={str(item["id"]): str(item.get("text", "")) for item in evidence},
+        story_plan=story_plan,
     )
     if args.visual_allocations is not None:
         allocations = json.loads(args.visual_allocations.read_text(encoding="utf-8"))
@@ -1411,6 +1662,7 @@ def _parser() -> argparse.ArgumentParser:
     plan.add_argument("--run-dir", type=Path, required=True)
     plan.add_argument("--brief", required=True)
     plan.add_argument("--slide-count", type=int)
+    plan.add_argument("--story-plan", type=Path)
     plan.add_argument("--visual-allocations", type=Path)
     plan.set_defaults(handler=_command_plan)
     evidence = commands.add_parser("evidence")

@@ -6,7 +6,9 @@ renders, exports, binds review evidence, and finalizes.
 ## Plan and narrative
 
 Paper decks default to exactly 18 slides unless the user explicitly requests a
-different count from 1 through 60. The default arc is:
+different deck or presentation count from 1 through 60. Arabic and common
+Chinese numerals are accepted. A source description such as “12-page paper” is
+not a deck count. The default arc is:
 
 1. cover;
 2. roadmap;
@@ -31,6 +33,20 @@ Combine adjacent roles when the user asks for fewer slides. Add evidence or
 mechanism deep dives before takeaways when the user asks for more. Do not pad
 with section dividers or split one sentence across multiple slides.
 
+After querying evidence, the host should pass `plan --story-plan PATH` with a
+version-1 JSON object containing exactly `format_version` and `slides`. `slides`
+contains exactly one object per requested slide, in order, with only:
+
+- `slide_id`: contiguous `slide-01` through `slide-N`;
+- `role`: the corresponding role in the academic arc;
+- `evidence_refs`: a non-empty, unique list of real evidence IDs.
+
+The harness rejects unknown evidence, wrong roles, wrong order, and count
+mismatches before hashing the immutable plan. If no host story plan is passed,
+the deterministic fallback scores evidence against each slide's semantic role;
+it does not rotate through extraction order. If a multi-source role has no
+semantic match, planning stops and requests an explicit story plan.
+
 If source visuals are needed, write a JSON list and pass it to
 `plan --visual-allocations`:
 
@@ -50,7 +66,9 @@ ordered ID, index, role, chapter, assertion title, and evidence refs. Validation
 and review bind that snapshot; repairs use a new attempt rather than rewriting
 it.
 
-The visible `h1` text equals the planned assertion title. Every visible native
+The visible `h1` text equals the planned assertion title. Source-derived title
+anchors stop at sentence punctuation and are bounded by words and grapheme
+clusters, so an unspaced CJK paragraph cannot become a giant heading. Every visible native
 text element and table cites exactly the slide's planned evidence refs, in plan
 order. Speaker notes equal the plan's complete note intent, not merely its
 `[Sources]` prefix. These native claims and notes are the canonical source-map
@@ -144,10 +162,11 @@ near-full-slide image without editable overlays is rejected.
 The exporter creates a text-free background from the canonical browser render
 only to preserve CSS decoration. It then lays native PowerPoint text, tables,
 images, and shapes over that background. The harness reopens the result and
-checks slide size, exact notes, per-slide native text/table/image counts, and
-OOXML integrity against a contract derived from the plan-bound canonical DOM.
-Deleting a required native object fails reopen validation even if a decorative
-background screenshot still looks correct.
+checks slide size, exact notes, per-slide native text/table/image counts, exact
+native rect/ellipse/line counts and types, and OOXML integrity against a
+contract derived from the plan-bound canonical DOM. Deleting a required native
+object, including a decorative native rectangle, fails reopen validation even
+if the text-free background screenshot still looks correct.
 
 ## Visual and content rules
 

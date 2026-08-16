@@ -211,6 +211,116 @@ class AutoDesignPptSkillTests(unittest.TestCase):
                 self.assertEqual(plan["count_source"], "explicit_user")
                 self.assertEqual(len(plan["slides"]), expected)
 
+    def test_chinese_numeral_count_requires_a_real_deck_target(self) -> None:
+        harness = self._require(self.harness, HARNESS_PATH)
+        for brief, expected in (
+            ("请做十二页幻灯片。", 12),
+            ("请制作二十五张PPT。", 25),
+            ("请生成六十页演示文稿。", 60),
+            ("请做三十页。", 30),
+            ("Make it 14 pages.", 14),
+        ):
+            with self.subTest(brief=brief):
+                chinese = harness.build_deck_plan(brief, ["ev-001"])
+                self.assertEqual(chinese["slide_count"], expected)
+                self.assertEqual(chinese["count_source"], "explicit_user")
+
+        source_metadata = harness.build_deck_plan(
+            "Turn this 12-page paper into a conference deck.",
+            ["ev-001"],
+        )
+        self.assertEqual(source_metadata["slide_count"], 18)
+        self.assertEqual(source_metadata["count_source"], "academic_default")
+
+    def test_default_planner_assigns_evidence_by_slide_role_not_extraction_order(self) -> None:
+        harness = self._require(self.harness, HARNESS_PATH)
+        evidence_texts = {
+            "ev-001": "Results show a 9.4 percent improvement over strong baselines.",
+            "ev-002": "Limitations include latency, missing modalities, and future work.",
+            "ev-003": "Our method uses a planner, refinement loop, and modular architecture.",
+            "ev-004": "The problem is that existing systems fail on long-horizon design tasks.",
+        }
+        plan = harness.build_deck_plan(
+            "Create a conference deck.",
+            ["ev-001", "ev-002", "ev-003", "ev-004"],
+            evidence_texts=evidence_texts,
+        )
+        refs_by_role = {
+            str(slide["role"]): slide["evidence_refs"] for slide in plan["slides"]
+        }
+        self.assertEqual(refs_by_role["problem"], ["ev-004"])
+        self.assertEqual(refs_by_role["method-overview"], ["ev-003"])
+        self.assertEqual(refs_by_role["primary-results"], ["ev-001"])
+        self.assertEqual(refs_by_role["limitations"], ["ev-002"])
+        self.assertEqual(plan["evidence_assignment_source"], "semantic_default")
+
+    def test_default_planner_requests_a_story_plan_instead_of_misassigning_evidence(self) -> None:
+        harness = self._require(self.harness, HARNESS_PATH)
+        with self.assertRaisesRegex(
+            harness.PptHarnessError,
+            "could not semantically assign evidence",
+        ):
+            harness.build_deck_plan(
+                "Create a conference deck.",
+                ["ev-001", "ev-002"],
+                evidence_texts={
+                    "ev-001": "Our method uses a modular architecture and planner.",
+                    "ev-002": "Results improve performance over the baseline.",
+                },
+            )
+
+    def test_host_story_plan_is_validated_before_becoming_immutable(self) -> None:
+        harness = self._require(self.harness, HARNESS_PATH)
+        roles = [
+            "cover", "outline", "problem", "motivation", "prior-gap",
+            "contributions", "method-overview", "mechanism", "objective", "setup",
+            "primary-results", "robustness", "ablation", "qualitative", "limitations",
+            "implications", "takeaways", "closing",
+        ]
+        host_slides = [
+            {
+                "slide_id": f"slide-{index:02d}",
+                "role": role,
+                "evidence_refs": ["ev-002" if role == "method-overview" else "ev-001"],
+            }
+            for index, role in enumerate(roles, start=1)
+        ]
+        story_plan = {"format_version": 1, "slides": host_slides}
+        plan = harness.build_deck_plan(
+            "Create a conference deck.",
+            ["ev-001", "ev-002"],
+            evidence_texts={
+                "ev-001": "The paper states its problem, results, and limitations.",
+                "ev-002": "The method uses a planner and iterative architecture.",
+            },
+            story_plan=story_plan,
+        )
+        self.assertEqual(plan["evidence_assignment_source"], "host_story_plan")
+        self.assertEqual(plan["slides"][6]["evidence_refs"], ["ev-002"])
+
+        invalid = json.loads(json.dumps(story_plan))
+        invalid["slides"][6]["evidence_refs"] = ["ev-999"]
+        with self.assertRaisesRegex(harness.PptHarnessError, "unknown evidence"):
+            harness.build_deck_plan(
+                "Create a conference deck.",
+                ["ev-001", "ev-002"],
+                evidence_texts={"ev-001": "Problem", "ev-002": "Method"},
+                story_plan=invalid,
+            )
+
+    def test_cjk_source_anchor_is_sentence_aware_and_display_bounded(self) -> None:
+        harness = self._require(self.harness, HARNESS_PATH)
+        source = "这是论文的核心方法，它通过规划器和迭代反馈提升设计质量。" + "后续细节" * 400
+        plan = harness.build_deck_plan(
+            "制作学术演示文稿。",
+            ["ev-001"],
+            evidence_texts={"ev-001": source},
+        )
+        title = str(plan["slides"][0]["assertion_title"])
+        self.assertIn("这是论文的核心方法", title)
+        self.assertNotIn("后续细节后续细节后续细节", title)
+        self.assertLessEqual(len(title), 100)
+
     def test_saved_plan_is_hash_bound_and_snapshotted_into_each_attempt(self) -> None:
         harness = self._require(self.harness, HARNESS_PATH)
         run = self._initialize_run()
@@ -478,7 +588,7 @@ class AutoDesignPptSkillTests(unittest.TestCase):
             self.assertIn(b"<a:tbl>", slide_xml)
             self.assertIn(b"The paper presents a grounded research finding.", slide_xml)
 
-    def test_pptx_reopen_enforces_native_table_image_text_and_notes_contract(self) -> None:
+    def test_pptx_reopen_enforces_native_table_image_text_shape_and_notes_contract(self) -> None:
         from pptx import Presentation
         from pptx.enum.shapes import MSO_SHAPE_TYPE
 
@@ -489,7 +599,7 @@ class AutoDesignPptSkillTests(unittest.TestCase):
         original = self.root / "native-contract.pptx"
         exporter.export_deck_to_pptx(html, original)
 
-        mutations = ("table", "image", "notes")
+        mutations = ("table", "image", "shape", "notes")
         for mutation in mutations:
             with self.subTest(mutation=mutation):
                 presentation = Presentation(str(original))
@@ -507,6 +617,8 @@ class AutoDesignPptSkillTests(unittest.TestCase):
                             mutation == "image"
                             and shape.shape_type == MSO_SHAPE_TYPE.PICTURE
                             and not name.startswith("background:")
+                        ) or (
+                            mutation == "shape" and ":shape:" in name
                         )
                         if selected:
                             shape._element.getparent().remove(shape._element)
