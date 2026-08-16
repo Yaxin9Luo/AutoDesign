@@ -27,7 +27,9 @@ in `py -3`) with `$SKILL_ROOT/scripts/video_harness.py --help` and
 `$SKILL_ROOT/scripts/setup_video.py --help` for exact flags.
 
 1. Run `doctor`. If it reports a missing runtime, run `setup`. Setup requires
-   Node 22+, npm, ffmpeg, ffprobe, and Python 3.10–3.12. It installs exact
+   Node 22+, npm, ffmpeg, ffprobe, Python 3.10–3.12, and the Poppler PDF-ingest
+   commands `pdftotext`, `pdfinfo`, `pdftoppm`, and `pdfimages`. Doctor reports
+   every missing command before a paper run. Setup installs exact
    `hyperframes@0.7.86`, its rendering browser, `kokoro-onnx==0.5.0`, and
    `soundfile==0.14.0` in an atomic versioned user cache. It prefetches and
    SHA-256 verifies the complete platform-aware Python lock, exact Kokoro model,

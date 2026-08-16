@@ -37,6 +37,7 @@ import setup_browser  # noqa: E402
 HYPERFRAMES_VERSION = "0.7.86"
 KOKORO_ONNX_VERSION = "0.5.0"
 SOUNDFILE_VERSION = "0.14.0"
+PDF_INGEST_TOOLS = ("pdftotext", "pdfinfo", "pdftoppm", "pdfimages")
 PYTHON_LOCK_PATH = SKILL_ROOT / "assets" / "video-runtime" / "requirements-kokoro.lock"
 PYTHON_LOCK_SHA256 = "f4ecd858f55479aa689578d66cae8e9e7d9568827b6292a016aba54a35b197b3"
 MIN_TTS_PYTHON = (3, 10)
@@ -672,24 +673,33 @@ def doctor_video_runtime(*, cache_root: Path | None = None) -> dict[str, object]
         spec = runtime_spec(cache_root=cache_root)
     except (OSError, VideoRuntimeError) as error:
         return {"ready": False, "status": "corrupt", "issues": [str(error)]}
-    missing: list[str] = []
+    runtime_missing: list[str] = []
     if spec.node_major is None or spec.node_major < 22:
-        missing.append("node>=22")
+        runtime_missing.append("node>=22")
     if spec.npm_binary is None:
-        missing.append("npm")
+        runtime_missing.append("npm")
     if spec.ffmpeg_binary is None:
-        missing.append("ffmpeg")
+        runtime_missing.append("ffmpeg")
     if spec.ffprobe_binary is None:
-        missing.append("ffprobe")
+        runtime_missing.append("ffprobe")
     if spec.python_binary is None:
-        missing.append("python3.10-3.12 for Kokoro")
+        runtime_missing.append("python3.10-3.12 for Kokoro")
+    pdf_missing = [name for name in PDF_INGEST_TOOLS if shutil.which(name) is None]
+    missing = [*runtime_missing, *pdf_missing]
     if missing:
+        issues: list[str] = []
+        if runtime_missing:
+            issues.append("missing video runtime prerequisites: " + ", ".join(runtime_missing))
+        if pdf_missing:
+            issues.append(
+                "missing PDF ingest prerequisites (Poppler): " + ", ".join(pdf_missing)
+            )
         return {
             "ready": False,
             "status": "missing",
             "cache_dir": str(spec.cache_dir),
             "missing": missing,
-            "issues": ["missing prerequisites: " + ", ".join(missing)],
+            "issues": issues,
         }
     return inspect_video_runtime(spec)
 
@@ -853,19 +863,27 @@ def ensure_video_runtime(
     lock_timeout_seconds: float = 2400,
 ) -> VideoRuntime:
     spec = runtime_spec(cache_root=cache_root)
-    missing = []
+    runtime_missing: list[str] = []
     if spec.node_major is None or spec.node_major < 22:
-        missing.append("Node.js 22+")
+        runtime_missing.append("Node.js 22+")
     if spec.npm_binary is None:
-        missing.append("npm")
+        runtime_missing.append("npm")
     if spec.ffmpeg_binary is None:
-        missing.append("ffmpeg")
+        runtime_missing.append("ffmpeg")
     if spec.ffprobe_binary is None:
-        missing.append("ffprobe")
+        runtime_missing.append("ffprobe")
     if spec.python_binary is None:
-        missing.append("Python 3.10-3.12 for Kokoro")
-    if missing:
-        raise VideoRuntimeError("Missing video runtime prerequisites: " + ", ".join(missing))
+        runtime_missing.append("Python 3.10-3.12 for Kokoro")
+    pdf_missing = [name for name in PDF_INGEST_TOOLS if shutil.which(name) is None]
+    if runtime_missing or pdf_missing:
+        messages: list[str] = []
+        if runtime_missing:
+            messages.append("missing video runtime prerequisites: " + ", ".join(runtime_missing))
+        if pdf_missing:
+            messages.append(
+                "missing PDF ingest prerequisites (Poppler): " + ", ".join(pdf_missing)
+            )
+        raise VideoRuntimeError("; ".join(messages))
     spec.cache_root.mkdir(parents=True, exist_ok=True)
     lock = spec.cache_root / f".{spec.cache_key}.lock"
     with setup_browser._cache_lock(lock, lock_timeout_seconds):

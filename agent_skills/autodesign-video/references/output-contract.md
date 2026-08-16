@@ -139,6 +139,12 @@ the authoring model. Never accept an older MP4 after a failed render. Runtime
 diagnostics persist in the active attempt until a successful delivery clears
 them; they are never published as final artifacts.
 
+PDF evidence preparation requires all four Poppler commands: `pdftotext`,
+`pdfinfo`, `pdftoppm`, and `pdfimages`. Doctor and setup fail closed with the
+complete missing-command list. If evidence preparation is blocked, the source
+manifest, run state, and event diagnostics remain on disk and the harness exits
+nonzero; a blocked run is never reported as successful.
+
 ## Required delivery closure
 
 The selected attempt retains and hash-binds:

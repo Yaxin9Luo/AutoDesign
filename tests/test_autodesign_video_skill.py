@@ -36,6 +36,24 @@ def _load_script(name: str, path: Path):
     return module
 
 
+def _write_release_path_without_poppler(root: Path) -> Path:
+    """Create the non-Poppler portion of the documented Video prerequisite PATH."""
+
+    root.mkdir(parents=True, exist_ok=True)
+    commands = {
+        "node": "if [ \"$1\" = \"--version\" ]; then echo v22.0.0; fi\n",
+        "npm": "exit 0\n",
+        "ffmpeg": "exit 0\n",
+        "ffprobe": "exit 0\n",
+        "python3.12": "if [ \"$1\" = \"-c\" ]; then echo 3.12; fi\n",
+    }
+    for name, body in commands.items():
+        path = root / name
+        path.write_text("#!/bin/sh\n" + body, encoding="utf-8")
+        path.chmod(0o755)
+    return root
+
+
 def _plan(*, scene_count: int = 12, duration_s: int = 360) -> dict[str, object]:
     base_duration = duration_s // scene_count
     remainder = duration_s - (base_duration * scene_count)
@@ -628,6 +646,130 @@ class AutoDesignVideoSkillTests(unittest.TestCase):
                 self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
                 self.assertEqual(fingerprint(installed), before)
                 self.assertFalse(any(installed.rglob("__pycache__")))
+
+    def test_release_doctor_reports_every_missing_poppler_pdf_tool(self) -> None:
+        installed = self.root / "installed-video"
+        shutil.copytree(SKILL_ROOT, installed)
+        release_path = _write_release_path_without_poppler(self.root / "release-bin")
+        child_env = dict(os.environ)
+        child_env["PATH"] = str(release_path)
+        child_env["AUTODESIGN_VIDEO_PYTHON"] = str(release_path / "python3.12")
+        cache_root = Path(tempfile.mkdtemp(prefix="adv-v-pop-", dir="/tmp"))
+        self.addCleanup(shutil.rmtree, cache_root, True)
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(installed / "scripts" / "setup_video.py"),
+                "doctor",
+                "--cache-root",
+                str(cache_root),
+            ],
+            cwd=self.root,
+            text=True,
+            capture_output=True,
+            check=False,
+            env=child_env,
+        )
+        self.assertEqual(completed.returncode, 2, completed.stdout + completed.stderr)
+        report = json.loads(completed.stdout)
+        self.assertEqual(report["status"], "missing")
+        self.assertEqual(
+            set(report["missing"]),
+            {"pdftotext", "pdfinfo", "pdftoppm", "pdfimages"},
+        )
+        self.assertIn("PDF ingest", " ".join(report["issues"]))
+
+    def test_release_evidence_blocker_is_nonzero_and_persists_diagnostics(self) -> None:
+        installed = self.root / "installed-video"
+        shutil.copytree(SKILL_ROOT, installed)
+        release_path = _write_release_path_without_poppler(self.root / "release-bin")
+        child_env = dict(os.environ)
+        child_env["PATH"] = str(release_path)
+        child_env["AUTODESIGN_VIDEO_PYTHON"] = str(release_path / "python3.12")
+        run = self.root / "run"
+        source = self.root / "paper.pdf"
+        source.write_bytes(b"%PDF-1.4\n% release prerequisite regression\n")
+        init = subprocess.run(
+            [
+                sys.executable,
+                str(installed / "scripts" / "video_harness.py"),
+                "init",
+                str(run),
+            ],
+            cwd=self.root,
+            text=True,
+            capture_output=True,
+            check=False,
+            env=child_env,
+        )
+        self.assertEqual(init.returncode, 0, init.stdout + init.stderr)
+        evidence = subprocess.run(
+            [
+                sys.executable,
+                str(installed / "scripts" / "video_harness.py"),
+                "evidence",
+                str(run),
+                str(source),
+            ],
+            cwd=self.root,
+            text=True,
+            capture_output=True,
+            check=False,
+            env=child_env,
+        )
+        self.assertEqual(evidence.returncode, 2, evidence.stdout + evidence.stderr)
+        report = json.loads(evidence.stdout)
+        self.assertEqual(report["status"], "blocked")
+        self.assertEqual(
+            set(report["missing_tools"]),
+            {"pdftotext", "pdfinfo", "pdftoppm", "pdfimages"},
+        )
+        persisted = json.loads(
+            (run / "evidence" / "source_manifest.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(persisted, report)
+        state = json.loads((run / "run.json").read_text(encoding="utf-8"))
+        self.assertEqual(state["state"], "blocked")
+        self.assertIn("missing required PDF tools", state["reason"])
+        events = [
+            json.loads(line)
+            for line in (run / "events.jsonl").read_text(encoding="utf-8").splitlines()
+        ]
+        self.assertEqual(events[-1]["event"], "side_state")
+        self.assertEqual(events[-1]["state"], "blocked")
+
+    def test_harness_exit_status_rejects_every_explicit_non_success_result(self) -> None:
+        harness = self._require(self.harness, HARNESS_PATH)
+        for status in (
+            "blocked",
+            "error",
+            "corrupt",
+            "missing",
+            "partial",
+            "failed",
+            "unexpected",
+        ):
+            with self.subTest(status=status):
+                self.assertEqual(harness._result_exit_code({"status": status}), 2)
+        for result in (
+            {"passed": False},
+            {"ready": False},
+            {"state": "blocked"},
+            {"state": "failed"},
+        ):
+            with self.subTest(result=result):
+                self.assertEqual(harness._result_exit_code(result), 2)
+        for result in (
+            {"status": "ready"},
+            {"status": "success"},
+            {"status": "completed"},
+            {"status": "verified"},
+            {"state": "initialized"},
+            {"passed": True},
+            {"ready": True},
+        ):
+            with self.subTest(result=result):
+                self.assertEqual(harness._result_exit_code(result), 0)
 
     def test_video_review_pass_requires_every_dimension_at_least_four(self) -> None:
         harness = self._require(self.harness, HARNESS_PATH)

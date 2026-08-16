@@ -2705,6 +2705,26 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+_SUCCESS_RESULT_STATUSES = {"ready", "success", "succeeded", "complete", "completed", "verified"}
+
+
+def _result_exit_code(result: object) -> int:
+    """Return success only for an explicit success signal or a non-terminal command result."""
+
+    if not isinstance(result, Mapping):
+        return 2
+    for key in ("passed", "ready"):
+        if key in result and result.get(key) is not True:
+            return 2
+    status = result.get("status")
+    if status is not None:
+        if not isinstance(status, str) or status.strip().lower() not in _SUCCESS_RESULT_STATUSES:
+            return 2
+    if result.get("state") in core.SIDE_STATES:
+        return 2
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
@@ -2778,11 +2798,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         else:
             result = resume_video_run(args.run)
         print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
-        if isinstance(result, Mapping) and result.get("passed") is False:
-            return 2
-        if isinstance(result, Mapping) and result.get("ready") is False:
-            return 2
-        return 0
+        return _result_exit_code(result)
     except (
         OSError, json.JSONDecodeError, VideoContractError, setup_video.VideoRuntimeError,
         core.PortableError,
