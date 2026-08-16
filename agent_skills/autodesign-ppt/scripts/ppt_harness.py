@@ -575,6 +575,9 @@ _MEASURED_OUTCOME_TERM_GROUPS = {
 _STRUCTURAL_COUNT_TERMS = (
     "stage",
     "attention head",
+    "head",
+    "block",
+    "depth",
     "layer",
     "parameter",
     "token",
@@ -851,9 +854,34 @@ def _measured_outcome_spans(
     return result
 
 
-def _locally_bound_outcome_labels(normalized_text: str) -> set[str]:
-    metric_spans = _measured_outcome_spans(normalized_text)
-    structural_spans = [
+def _numeric_value_spans(normalized_text: str) -> list[tuple[int, int]]:
+    spans: list[tuple[int, int]] = []
+    for number in re.finditer(_NUMERIC_VALUE_PATTERN, normalized_text):
+        value = number.group().rstrip()
+        spans.append((number.start(), number.start() + len(value)))
+    return spans
+
+
+def _number_precedes_structure(gap: str) -> bool:
+    return bool(
+        re.fullmatch(
+            r"\s*(?:[-\u2010-\u2015]\s*)?(?:[a-z]+\s+){0,2}",
+            gap,
+        )
+        or re.fullmatch(r"\s*(?:个)?\s*", gap)
+    )
+
+
+def _structure_precedes_number(gap: str) -> bool:
+    return re.fullmatch(
+        r"\s*(?:(?:count|number|of)\s*)?(?:[:=：]\s*)?",
+        gap,
+    ) is not None
+
+
+def _structurally_bound_number_spans(normalized_text: str) -> set[tuple[int, int]]:
+    numbers = _numeric_value_spans(normalized_text)
+    structures = [
         span
         for term in _STRUCTURAL_COUNT_TERMS
         for span in _term_spans(
@@ -862,10 +890,29 @@ def _locally_bound_outcome_labels(normalized_text: str) -> set[str]:
             allow_ascii_suffix=True,
         )
     ]
+    bound: set[tuple[int, int]] = set()
+    for number in numbers:
+        for structure in structures:
+            if number[1] <= structure[0] and _number_precedes_structure(
+                normalized_text[number[1] : structure[0]]
+            ):
+                bound.add(number)
+                break
+            if structure[1] <= number[0] and _structure_precedes_number(
+                normalized_text[structure[1] : number[0]]
+            ):
+                bound.add(number)
+                break
+    return bound
+
+
+def _locally_bound_outcome_labels(normalized_text: str) -> set[str]:
+    metric_spans = _measured_outcome_spans(normalized_text)
+    structural_numbers = _structurally_bound_number_spans(normalized_text)
     labels: set[str] = set()
-    for number in re.finditer(_NUMERIC_VALUE_PATTERN, normalized_text):
-        value = number.group().rstrip()
-        number_span = (number.start(), number.start() + len(value))
+    for number_span in _numeric_value_spans(normalized_text):
+        if number_span in structural_numbers:
+            continue
         metric_distances = [
             (_span_distance(number_span, span), label)
             for label, spans in metric_spans.items()
@@ -874,17 +921,7 @@ def _locally_bound_outcome_labels(normalized_text: str) -> set[str]:
         if not metric_distances:
             continue
         nearest_metric = min(distance for distance, _label in metric_distances)
-        nearest_structure = min(
-            (
-                _span_distance(number_span, span)
-                for span in structural_spans
-            ),
-            default=math.inf,
-        )
-        if (
-            nearest_metric > _LOCAL_OUTCOME_BINDING_MAX_GAP
-            or nearest_structure <= nearest_metric
-        ):
+        if nearest_metric > _LOCAL_OUTCOME_BINDING_MAX_GAP:
             continue
         labels.update(
             label
@@ -911,10 +948,9 @@ def _labeled_numeric_comparison_pairs(clauses: Sequence[str]) -> list[str]:
             any(value.rstrip().endswith("%") for value in first_values)
             and any(value.rstrip().endswith("%") for value in second_values)
         )
-        structural_count = any(
-            _semantic_term_present(fragment, term)
-            for fragment in (first, second)
-            for term in _STRUCTURAL_COUNT_TERMS
+        structural_count = bool(
+            _structurally_bound_number_spans(first)
+            or _structurally_bound_number_spans(second)
         )
         if first_metric_mentions and second_metric_mentions:
             measured_outcome = bool(first_bound_metrics & second_bound_metrics)

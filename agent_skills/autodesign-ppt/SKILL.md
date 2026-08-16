@@ -64,11 +64,14 @@ of `<PYTHON3>` below. Run
    another. The explicit `w/o`/`full` labeled numeric pair is the only supported
    two-clause comparison. Both sides of that pair must contain a value and share
    a measured metric (or an explicit percentage scale). When a metric is named,
-   its value must be locally bound to it; merely mentioning `accuracy` beside a
-   stage/head/layer count does not turn the count into an outcome. A fully
-   unlabeled two-percentage pair may infer the common outcome only when neither
-   side contains structure counts. Architecture counts are not outcomes. That
-   fallback needs
+   its value must be locally bound to it. Token-attached architecture values
+   such as `2 heads`, `2-stage`, or `depth: 4` remain structure counts and do
+   not become outcomes merely because `accuracy` appears elsewhere. Conversely,
+   a distant structure noun cannot steal a value explicitly bound to a metric,
+   as in `accuracy for the 2-stage configuration is 79.4%`. A fully unlabeled
+   two-percentage pair may infer the common outcome only when neither side
+   contains token-bound structure counts. Architecture counts are not outcomes.
+   That fallback needs
    role-distinctive evidence with a unique winning margin; ambiguous or generic
    overlap stops and requests `--story-plan`. Paper decks default to exactly 18
    slides. A count attached to the requested deck/slides/presentation, including

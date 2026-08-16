@@ -605,6 +605,10 @@ class AutoDesignPptSkillTests(unittest.TestCase):
                     "W/o routing module uses 2 stages and reports accuracy: 79.4%; "
                     "full model uses 4 stages and reports accuracy: 82.1%."
                 ),
+                (
+                    "W/o routing module accuracy for the 2-stage configuration is 79.4%; "
+                    "full model accuracy for the 4-stage configuration is 82.1%."
+                ),
                 "无监督方法的消融结果显示，准确率从82.1%下降到79.4%。",
                 "缺乏路由模块时，准确率从82.1%下降到79.4%。",
             ),
@@ -642,6 +646,18 @@ class AutoDesignPptSkillTests(unittest.TestCase):
             (
                 "W/o routing module uses 2 stages and reports accuracy; "
                 "full model uses 4 stages and reports accuracy."
+            ),
+            (
+                "W/o routing module uses 2 heads and reports accuracy; "
+                "full model uses 4 heads and reports accuracy."
+            ),
+            (
+                "W/o routing module uses 2 blocks and reports accuracy; "
+                "full model uses 4 blocks and reports accuracy."
+            ),
+            (
+                "W/o routing module has depth 2 and reports accuracy; "
+                "full model has depth 4 and reports accuracy."
             ),
         )
         for text in false_comparisons:
@@ -688,7 +704,8 @@ class AutoDesignPptSkillTests(unittest.TestCase):
             "On the shifted dataset, accuracy is 78.5% versus 79.0% in-domain."
         )
         evidence_texts["ev-013"] = (
-            "W/o routing module accuracy: 79.4%; full model accuracy: 82.1%."
+            "W/o routing module accuracy for the 2-stage configuration is 79.4%; "
+            "full model accuracy for the 4-stage configuration is 82.1%."
         )
         roles[11] = "robustness"
         roles[12] = "ablation"
@@ -712,6 +729,18 @@ class AutoDesignPptSkillTests(unittest.TestCase):
             (
                 "W/o routing module uses 2 stages and reports accuracy; "
                 "full model uses 4 stages and reports accuracy."
+            ),
+            (
+                "W/o routing module uses 2 heads and reports accuracy; "
+                "full model uses 4 heads and reports accuracy."
+            ),
+            (
+                "W/o routing module uses 2 blocks and reports accuracy; "
+                "full model uses 4 blocks and reports accuracy."
+            ),
+            (
+                "W/o routing module has depth 2 and reports accuracy; "
+                "full model has depth 4 and reports accuracy."
             ),
         )
         for text in false_comparisons:
@@ -906,6 +935,14 @@ class AutoDesignPptSkillTests(unittest.TestCase):
                 "ablation",
                 "W/o routing module accuracy: 79.4%; full model accuracy: 82.1%.",
             ),
+            (
+                12,
+                "ablation",
+                (
+                    "W/o routing module accuracy for the 2-stage configuration is 79.4%; "
+                    "full model accuracy for the 4-stage configuration is 82.1%."
+                ),
+            ),
         )
         for slot, role, text in cases:
             evidence_texts, roles, role_refs = self._conditioned_story_fixture()
@@ -940,6 +977,18 @@ class AutoDesignPptSkillTests(unittest.TestCase):
             (
                 "W/o routing module uses 2 stages and reports accuracy; "
                 "full model uses 4 stages and reports accuracy."
+            ),
+            (
+                "W/o routing module uses 2 heads and reports accuracy; "
+                "full model uses 4 heads and reports accuracy."
+            ),
+            (
+                "W/o routing module uses 2 blocks and reports accuracy; "
+                "full model uses 4 blocks and reports accuracy."
+            ),
+            (
+                "W/o routing module has depth 2 and reports accuracy; "
+                "full model has depth 4 and reports accuracy."
             ),
         )
         for text in false_comparisons:

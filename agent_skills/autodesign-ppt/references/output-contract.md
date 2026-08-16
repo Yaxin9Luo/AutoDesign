@@ -74,10 +74,13 @@ clause. One complete, non-negated positive clause may ground the role even when
 another clause describes additional future work. Signals from separate clauses
 are not joined; the sole exception is an adjacent, explicitly labeled `w/o`/`full`
 numeric pair with a value on each side and either the same measured metric or an
-explicit percentage scale. Each value must be locally bound to its metric;
-metric words elsewhere in the clause cannot relabel a nearby stage, head, layer,
-or other structure count as a measured outcome. When neither side names a metric,
-two percentages may infer the shared outcome only if no structure count appears.
+explicit percentage scale. Each value must be locally bound to its metric.
+Token-attached values such as `2 heads`, `2-stage`, or `depth: 4` remain
+structure counts; a metric word elsewhere cannot relabel them as outcomes. A
+distant structure noun cannot steal a separately metric-bound value, such as
+the `79.4%` in `accuracy for the 2-stage configuration is 79.4%`. When neither
+side names a metric, two percentages may infer the shared outcome only if no
+token-bound structure count appears.
 If no host story plan is passed, the deterministic fallback
 scores role-distinctive evidence concepts for each slide and applies the same
 conditional substitutions. A match must clear the minimum and beat the
