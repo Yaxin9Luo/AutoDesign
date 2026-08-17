@@ -1346,6 +1346,13 @@ def _plan_documents(
     clean_plan = redact_secrets(dict(plan))
     authorized = _plan_authorized_assets(clean_plan, curation["catalog.json"])
     plan_sha256 = sha256_bytes(_stored_json_bytes(clean_plan))
+    if (
+        parent_revision is not None
+        and state.get("pending_supersession_operation_id") is not None
+        and state.get("repair_route") == "content_replan"
+        and plan_sha256 == parent_sha256
+    ):
+        raise StateError("content replan must change canonical plan bytes")
     operation_id = _canonical_hash(
         {
             "operation": "save_plan_revision",
@@ -1479,13 +1486,47 @@ def _plan_event(run: Path, manifest: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _bound_event_present(
+    run: Path,
+    expected: Mapping[str, Any],
+    *,
+    identity_fields: Sequence[str],
+) -> bool:
+    event = dict(expected)
+    events = _read_event_log(run / "events.jsonl")
+    candidates = [
+        item
+        for item in events
+        if item.get("event") == event["event"]
+        and any(item.get(field) == event[field] for field in identity_fields)
+    ]
+    if any(item != event for item in candidates):
+        raise IntegrityError("bound commit event payload is conflicting")
+    count = candidates.count(event)
+    if count > 1:
+        raise IntegrityError("bound commit event is duplicated")
+    return count == 1
+
+
+def _ensure_bound_event(
+    run: Path,
+    expected: Mapping[str, Any],
+    *,
+    identity_fields: Sequence[str],
+) -> None:
+    if not _bound_event_present(
+        run, expected, identity_fields=identity_fields
+    ):
+        append_jsonl(run / "events.jsonl", dict(expected))
+
+
 def _plan_event_present(run: Path, manifest: Mapping[str, Any]) -> bool:
     expected = _plan_event(run, manifest)
-    events = _read_event_log(run / "events.jsonl")
-    count = events.count(expected)
-    if count > 1:
-        raise IntegrityError("plan revision commit event is duplicated")
-    return count == 1
+    return _bound_event_present(
+        run,
+        expected,
+        identity_fields=("operation_id", "revision"),
+    )
 
 
 def _plan_registry(
@@ -1845,11 +1886,11 @@ def _attempt_started_event(context: Mapping[str, Any]) -> dict[str, Any]:
 
 def _ensure_attempt_started_event(run: Path, context: Mapping[str, Any]) -> None:
     event = _attempt_started_event(context)
-    events = _read_event_log(run / "events.jsonl")
-    if events.count(event) > 1:
-        raise IntegrityError("attempt started event is duplicated")
-    if event not in events:
-        append_jsonl(run / "events.jsonl", event)
+    _ensure_bound_event(
+        run,
+        event,
+        identity_fields=("operation_id", "attempt_id"),
+    )
 
 
 def _begin_attempt_v2(
@@ -2071,7 +2112,7 @@ def load_attempt_plan(run_dir: Path | str, attempt_id: str) -> dict[str, Any]:
     if inspect_run_format(run_dir) != AGENT_FIRST_RUN_FORMAT_VERSION:
         raise StateError("version-1 runs do not support Agent-first attempt snapshots")
     run, _state = _load_agent_first_run(run_dir)
-    _validate_attempt_context(run, attempt_id)
+    _validate_attempt_load_lineage(run, attempt_id)
     return _read_json(run / "attempts" / attempt_id / "plan-snapshot.json")
 
 
@@ -2083,7 +2124,7 @@ def load_attempt_visual_catalog(
     if inspect_run_format(run_dir) != AGENT_FIRST_RUN_FORMAT_VERSION:
         raise StateError("version-1 runs do not support Agent-first attempt snapshots")
     run, _state = _load_agent_first_run(run_dir)
-    _validate_attempt_context(run, attempt_id)
+    _validate_attempt_load_lineage(run, attempt_id)
     return _read_json(run / "attempts" / attempt_id / "catalog-snapshot.json")
 
 
@@ -2102,13 +2143,11 @@ _SUPERSESSION_ENTRY_KEYS = {
 }
 
 
-def _load_supersession_entries(run: Path) -> list[dict[str, Any]]:
-    binding = _canonical_jsonl_binding(run, "provenance/supersessions.jsonl")
-    path = run / binding["path"]
+def _decode_supersession_entries(data: bytes) -> list[dict[str, Any]]:
     entries: list[dict[str, Any]] = []
     previous_hash: str | None = None
     operation_ids: set[str] = set()
-    for line in path.read_bytes().splitlines():
+    for line in data.splitlines():
         value = json.loads(line)
         if not isinstance(value, dict) or set(value) != _SUPERSESSION_ENTRY_KEYS:
             raise IntegrityError("supersession ledger entry schema is invalid")
@@ -2170,6 +2209,94 @@ def _load_supersession_entries(run: Path) -> list[dict[str, Any]]:
         operation_ids.add(entry["operation_id"])
         previous_hash = entry_hash
     return entries
+
+
+def _load_supersession_entries(run: Path) -> list[dict[str, Any]]:
+    binding = _canonical_jsonl_binding(run, "provenance/supersessions.jsonl")
+    return _decode_supersession_entries((run / binding["path"]).read_bytes())
+
+
+def _load_bound_supersession_entries(
+    run: Path, binding: Mapping[str, Any]
+) -> list[dict[str, Any]]:
+    if not _ledger_prefix_matches(run, binding):
+        raise IntegrityError("attempt supersession ledger prefix is stale")
+    path = run / str(binding["path"])
+    entries = _decode_supersession_entries(path.read_bytes()[: binding["size"]])
+    if len(entries) != binding["entry_count"]:
+        raise IntegrityError("attempt supersession ledger entry count is stale")
+    return entries
+
+
+def _validate_attempt_load_lineage(run: Path, attempt_id: str) -> None:
+    leaf = _validate_attempt_context(run, attempt_id)
+    catalog_revision = int(leaf["catalog_revision"])
+    plan_revision = int(leaf["plan_revision"])
+
+    previous_revision: int | None = None
+    previous_hash: str | None = None
+    for revision in range(1, catalog_revision + 1):
+        if not (run / "curations" / f"{revision:03d}").is_dir():
+            raise IntegrityError("attempt catalog ancestry is not contiguous")
+        values = _load_curation_revision(run, revision)
+        manifest = values["manifest.json"]
+        if (
+            manifest["parent_revision"] != previous_revision
+            or manifest["parent_catalog_sha256"] != previous_hash
+        ):
+            raise IntegrityError("attempt catalog ancestry is not contiguous")
+        previous_revision = revision
+        previous_hash = manifest["catalog_sha256"]
+
+    previous_revision = None
+    previous_hash = None
+    for revision in range(1, plan_revision + 1):
+        if not (run / "plans" / f"{revision:03d}").is_dir():
+            raise IntegrityError("attempt plan ancestry is not contiguous")
+        values = _load_plan_revision(run, revision)
+        manifest = values["manifest.json"]
+        if (
+            manifest["parent_revision"] != previous_revision
+            or manifest["parent_plan_sha256"] != previous_hash
+            or not _plan_event_present(run, manifest)
+        ):
+            raise IntegrityError("attempt plan ancestry is not contiguous")
+        previous_revision = revision
+        previous_hash = manifest["plan_sha256"]
+
+    if re.fullmatch(r"[0-9]{2}", attempt_id) is None or attempt_id == "00":
+        raise IntegrityError("attempt ancestry target is invalid")
+    previous_attempt: str | None = None
+    for number in range(1, int(attempt_id) + 1):
+        current_id = f"{number:02d}"
+        if not (run / "attempts" / current_id).is_dir():
+            raise IntegrityError("attempt ancestry is not contiguous")
+        context = _validate_attempt_context(run, current_id)
+        if context["parent_attempt"] != previous_attempt:
+            raise IntegrityError("attempt ancestry is not contiguous")
+        if not _bound_event_present(
+            run,
+            _attempt_started_event(context),
+            identity_fields=("operation_id", "attempt_id"),
+        ):
+            raise IntegrityError("attempt start event lineage is incomplete")
+        previous_attempt = current_id
+
+    for entry in _load_bound_supersession_entries(
+        run, leaf["supersession_ledger"]
+    ):
+        event = {
+            "event": "curation_reopened",
+            "operation_id": entry["operation_id"],
+            "attempt_id": entry["attempt_id"],
+            "repair_route": entry["repair_route"],
+        }
+        if not _bound_event_present(
+            run,
+            event,
+            identity_fields=("operation_id", "attempt_id"),
+        ):
+            raise IntegrityError("reopen event lineage is incomplete")
 
 
 def _validate_reopen_request(request: Mapping[str, Any]) -> dict[str, Any]:
@@ -2373,11 +2500,11 @@ def reopen_curation(
             "attempt_id": attempt_id,
             "repair_route": value["repair_route"],
         }
-        events = _read_event_log(run / "events.jsonl")
-        if events.count(event) > 1:
-            raise IntegrityError("reopen curation event is duplicated")
-        if event not in events:
-            append_jsonl(run / "events.jsonl", event)
+        _ensure_bound_event(
+            run,
+            event,
+            identity_fields=("operation_id", "attempt_id"),
+        )
         if fail_at == "after_reopen_event_write":
             raise SimulatedCrash("after reopen curation event write")
         return {
@@ -5473,6 +5600,25 @@ def _curation_documents(
     }
 
 
+def _catalog_asset_binding_set(catalog: Mapping[str, Any]) -> set[tuple[str, str]]:
+    assets = catalog.get("assets")
+    if not isinstance(assets, list):
+        raise IntegrityError("reviewed catalog asset list is invalid")
+    bindings: set[tuple[str, str]] = set()
+    for item in assets:
+        if not isinstance(item, Mapping):
+            raise IntegrityError("reviewed catalog asset binding is invalid")
+        asset_id = item.get("asset_id")
+        digest = item.get("sha256")
+        if not isinstance(asset_id, str) or not isinstance(digest, str):
+            raise IntegrityError("reviewed catalog asset binding is invalid")
+        binding = (asset_id, digest)
+        if binding in bindings:
+            raise IntegrityError("reviewed catalog asset binding is duplicated")
+        bindings.add(binding)
+    return bindings
+
+
 def _validate_committed_curation_lineage(
     run: Path,
     revision: int,
@@ -5759,6 +5905,25 @@ def record_source_review(
         stage: Path | None = None
         if value["verdict"] == "pass":
             revision, documents = _curation_documents(context, value)
+            if (
+                state.get("pending_supersession_operation_id") is not None
+                and state.get("repair_route") == "source_reingest"
+            ):
+                parent_revision = documents["manifest.json"]["parent_revision"]
+                if not isinstance(parent_revision, int):
+                    raise IntegrityError(
+                        "source reingest has no parent catalog revision"
+                    )
+                parent_catalog = _load_curation_revision(
+                    run, parent_revision
+                )["catalog.json"]
+                if not (
+                    _catalog_asset_binding_set(documents["catalog.json"])
+                    - _catalog_asset_binding_set(parent_catalog)
+                ):
+                    raise StateError(
+                        "source reingest must select a new immutable asset binding"
+                    )
             target = run / "curations" / f"{revision:03d}"
             stage = run / "curations" / f".curation-staging-{operation_id[:24]}"
             if stages and stages != [stage]:
@@ -6659,29 +6824,37 @@ def _apply_semantic_review_state(
     review_sha256: str | None = None,
 ) -> None:
     if run_format_version == AGENT_FIRST_RUN_FORMAT_VERSION:
-        if value["verdict"] == "pass":
-            transition_state(run, "semantic_passed")
-            current = _read_json(run / "run.json")
-            for field in (
-                "failure_origin",
-                "repair_route",
-                "semantic_review_sha256",
-            ):
-                current.pop(field, None)
-            _write_run(run, current)
-            return
         if review_sha256 is None:
             raise IntegrityError("v2 semantic review state requires a review hash")
-        mark_side_state(run, "failed", reason="semantic review failed")
+        if value["verdict"] == "pass":
+            transition_state(
+                run,
+                "semantic_passed",
+                semantic_review_sha256=review_sha256,
+            )
+            return
         current = _read_json(run / "run.json")
+        previous = current.get("state")
+        if previous != "deterministic_passed":
+            raise IntegrityError("v2 semantic review state parent is invalid")
         current.update(
             {
+                "state": "failed",
+                "reason": "semantic review failed",
+                "resume_from": previous,
                 "failure_origin": "semantic_review",
                 "repair_route": value["repair_route"],
                 "semantic_review_sha256": review_sha256,
             }
         )
         _write_run(run, current)
+        _event(
+            run,
+            "side_state",
+            previous=previous,
+            state="failed",
+            reason="semantic review failed",
+        )
         return
     if value["verdict"] == "pass" and not value["blockers"]:
         transition_state(run, "semantic_passed")
@@ -6689,6 +6862,40 @@ def _apply_semantic_review_state(
         mark_side_state(run, "needs_visual_review", reason="semantic review requires vision")
     else:
         mark_side_state(run, "failed", reason="semantic review failed")
+
+
+def _repair_split_v2_semantic_failure(
+    run: Path,
+    state: Mapping[str, Any],
+    attempt_id: str,
+    review: Mapping[str, Any],
+) -> dict[str, Any]:
+    if (
+        state.get("state") != "failed"
+        or state.get("resume_from") != "deterministic_passed"
+        or state.get("reason") != "semantic review failed"
+        or any(
+            state.get(field) is not None
+            for field in (
+                "failure_origin",
+                "repair_route",
+                "semantic_review_sha256",
+            )
+        )
+        or review.get("verdict") != "fail"
+    ):
+        raise IntegrityError("persisted semantic review and run state disagree")
+    review_path = run / "attempts" / attempt_id / "qa" / "semantic-review.json"
+    repaired = dict(state)
+    repaired.update(
+        {
+            "failure_origin": "semantic_review",
+            "repair_route": review["repair_route"],
+            "semantic_review_sha256": sha256_file(review_path),
+        }
+    )
+    _write_run(run, repaired)
+    return repaired
 
 
 def _read_validated_semantic_review(run: Path, attempt_id: str) -> dict[str, Any]:
@@ -6739,6 +6946,13 @@ def record_semantic_review(
                     if persisted != requested:
                         raise IntegrityError(
                             "refusing to overwrite an existing semantic review"
+                        )
+                    if (
+                        state.get("state") == "failed"
+                        and state.get("failure_origin") is None
+                    ):
+                        _repair_split_v2_semantic_failure(
+                            run, state, attempt_id, persisted
                         )
                     return persisted
                 raise StateError(
@@ -6859,6 +7073,10 @@ def _validate_attempt_for_finalization(
         raise StateError("finalization requires the active reviewed attempt")
     report = _validate_deterministic_report(run, attempt_id)
     review = _read_validated_semantic_review(run, attempt_id)
+    if inspect_run_format(run) == AGENT_FIRST_RUN_FORMAT_VERSION:
+        review_path = run / "attempts" / attempt_id / "qa" / "semantic-review.json"
+        if state.get("semantic_review_sha256") != sha256_file(review_path):
+            raise IntegrityError("semantic review hash disagrees with run state")
     if review.get("verdict") == "pass" and not review.get("blockers"):
         status = "verified"
         expected_state = "semantic_passed"
@@ -7256,11 +7474,16 @@ def _recover_plan_transactions(run: Path) -> None:
         state["state"] = "planned"
         _write_run(run, state)
     state = _read_json(run / "run.json")
-    active_revision = state.get("active_plan_revision")
-    if isinstance(active_revision, int):
-        manifest = _load_plan_revision(run, active_revision)["manifest.json"]
-        if not _plan_event_present(run, manifest):
-            append_jsonl(run / "events.jsonl", _plan_event(run, manifest))
+    revisions, _stages = _plan_registry(
+        run, state, allow_missing_active_event=True
+    )
+    for revision in revisions:
+        manifest = _load_plan_revision(run, revision)["manifest.json"]
+        _ensure_bound_event(
+            run,
+            _plan_event(run, manifest),
+            identity_fields=("operation_id", "revision"),
+        )
     _plan_registry(run, _read_json(run / "run.json"))
 
 
@@ -7318,6 +7541,14 @@ def _recover_attempt_transactions(run: Path) -> None:
         state.get("active_attempt"), str
     ):
         _begin_attempt_v2(run, fail_at=None)
+    numeric = sorted(
+        int(path.name)
+        for path in attempts.iterdir()
+        if path.is_dir() and re.fullmatch(r"[0-9]{2}", path.name)
+    )
+    for number in numeric:
+        context = _validate_attempt_context(run, f"{number:02d}")
+        _ensure_attempt_started_event(run, context)
 
 
 def _recover_reopen_transaction(run: Path) -> None:
@@ -7377,19 +7608,18 @@ def _recover_reopen_transaction(run: Path) -> None:
             for field in ("reason", "resume_from", "failure_origin"):
                 state.pop(field, None)
             _write_run(run, state)
-    if entry is None:
-        return
-    event = {
-        "event": "curation_reopened",
-        "operation_id": entry["operation_id"],
-        "attempt_id": entry["attempt_id"],
-        "repair_route": entry["repair_route"],
-    }
-    events = _read_event_log(run / "events.jsonl")
-    if events.count(event) > 1:
-        raise IntegrityError("reopen curation event is duplicated")
-    if event not in events:
-        append_jsonl(run / "events.jsonl", event)
+    for committed in entries:
+        event = {
+            "event": "curation_reopened",
+            "operation_id": committed["operation_id"],
+            "attempt_id": committed["attempt_id"],
+            "repair_route": committed["repair_route"],
+        }
+        _ensure_bound_event(
+            run,
+            event,
+            identity_fields=("operation_id", "attempt_id"),
+        )
 
 
 def _recover_v2_task4_transactions(run: Path) -> None:
@@ -7426,6 +7656,20 @@ def _resume_run_v2(run_dir: Path | str, *, skill_root: Path | str) -> dict[str, 
     if current == "needs_visual_review":
         return {**state, "next_action": "resolve_blocker"}
     if current == "failed":
+        attempt_id = state.get("active_attempt")
+        if (
+            state.get("failure_origin") is None
+            and state.get("resume_from") == "deterministic_passed"
+            and isinstance(attempt_id, str)
+        ):
+            semantic_path = (
+                run / "attempts" / attempt_id / "qa" / "semantic-review.json"
+            )
+            if semantic_path.is_file():
+                review = _read_validated_semantic_review(run, attempt_id)
+                state = _repair_split_v2_semantic_failure(
+                    run, state, attempt_id, review
+                )
         if state.get("failure_origin") == "semantic_review":
             attempt_id = state.get("active_attempt")
             if not isinstance(attempt_id, str):
@@ -7536,7 +7780,11 @@ def _resume_run_v2(run_dir: Path | str, *, skill_root: Path | str) -> dict[str, 
         return {**state, "next_action": "semantic_review"}
     if current == "semantic_passed":
         review = _read_validated_semantic_review(run, attempt_id)
-        if review["verdict"] != "pass":
+        review_path = run / "attempts" / attempt_id / "qa" / "semantic-review.json"
+        if (
+            review["verdict"] != "pass"
+            or state.get("semantic_review_sha256") != sha256_file(review_path)
+        ):
             raise IntegrityError(
                 "passing semantic review disagrees with persisted run state"
             )

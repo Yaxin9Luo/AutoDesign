@@ -395,6 +395,203 @@ elif name == "pdfimages":
         ).encode("utf-8")
         return hashlib.sha256(data).hexdigest()
 
+    def _two_attempt_event_fixture(self, name: str) -> Path:
+        run, assets, first, context = self._deterministic_attempt(name)
+        failure = self._semantic_review(
+            first,
+            context,
+            verdict="fail",
+            repair_route="content_replan",
+            route_findings=[
+                self._route_finding("content", "content_replan")
+            ],
+        )
+        self._record_valid_v2_review(run, first, failure)
+        core.reopen_curation(
+            run,
+            self._reopen_request(
+                run, first, "content_replan", ["content"]
+            ),
+        )
+        core.save_plan_revision(
+            run,
+            self._poster_plan(assets, title="Replanned event fixture"),
+        )
+        second = core.begin_attempt(run)
+        self.assertEqual(second, "02")
+        core.write_source_map(
+            run,
+            second,
+            [
+                {
+                    "id": "claim-method",
+                    "text": "Central method.",
+                    "source_ids": ["ev-001"],
+                }
+            ],
+        )
+        second_root = run / "attempts" / second
+        core.atomic_write_bytes(
+            second_root / "artifact" / "poster.html",
+            b"<main>Central method.</main>\n",
+        )
+        core.atomic_write_bytes(
+            second_root / "qa" / "previews" / "poster.png",
+            b"preview",
+        )
+        core.record_deterministic_result(
+            run,
+            second,
+            passed=True,
+            checks=[{"id": "poster_contract", "passed": True}],
+            artifact_paths=["artifact/poster.html"],
+            preview_paths={"poster": "qa/previews/poster.png"},
+        )
+        return run
+
+    def _two_attempt_source_reingest_fixture(self, name: str) -> Path:
+        run, assets, first, context = self._deterministic_attempt(name)
+        failure = self._semantic_review(
+            first,
+            context,
+            verdict="fail",
+            repair_route="source_reingest",
+            route_findings=[
+                self._route_finding("source", "source_reingest")
+            ],
+        )
+        self._record_valid_v2_review(run, first, failure)
+        core.reopen_curation(
+            run,
+            self._reopen_request(
+                run, first, "source_reingest", ["source"]
+            ),
+        )
+        inspection = core.inspect_source(run)
+        replacement = core.crop_source(
+            run,
+            self._crop_request(
+                inspection,
+                page=1,
+                role="method",
+                claim="A new immutable source binding is selected.",
+                bbox=[0.0, 0.0, 0.9, 1.0],
+            ),
+        )
+        selection = {
+            "run_format_version": 2,
+            "assets": [
+                {
+                    "asset_id": replacement["asset_id"],
+                    "roles": ["method"],
+                    "max_reuse": 1,
+                    "importance": "essential",
+                },
+                {
+                    "asset_id": assets["result"]["asset_id"],
+                    "roles": ["result"],
+                    "max_reuse": 1,
+                    "importance": "essential",
+                },
+            ],
+            "source_story": {
+                "central_method": {
+                    "status": "covered",
+                    "asset_ids": [replacement["asset_id"]],
+                    "evidence_ids": ["ev-001"],
+                    "rationale": "The new crop covers the central method.",
+                },
+                "primary_result": {
+                    "status": "covered",
+                    "asset_ids": [assets["result"]["asset_id"]],
+                    "evidence_ids": ["ev-002"],
+                    "rationale": "The reviewed result remains primary evidence.",
+                },
+            },
+        }
+        source_context = core.create_source_review_context(run, selection)
+        core.record_source_review(
+            run,
+            source_context["context_path"],
+            self._passing_source_review(source_context),
+        )
+        revised_assets = {"method": replacement, "result": assets["result"]}
+        core.save_plan_revision(
+            run,
+            self._poster_plan(revised_assets, title="Reingested ancestry fixture"),
+        )
+        self.assertEqual(core.begin_attempt(run), "02")
+        return run
+
+    def _run_events(self, run: Path) -> list[dict[str, object]]:
+        return [
+            json.loads(line)
+            for line in (run / "events.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        ]
+
+    def _write_run_events(
+        self, run: Path, events: list[dict[str, object]]
+    ) -> None:
+        data = b"".join(
+            (
+                json.dumps(
+                    event,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                + "\n"
+            ).encode("utf-8")
+            for event in events
+        )
+        core.atomic_write_bytes(run / "events.jsonl", data)
+
+    def _bound_event(
+        self, run: Path, family: str
+    ) -> dict[str, object]:
+        if family == "plan01":
+            manifest = json.loads(
+                (run / "plans" / "001" / "manifest.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            return {
+                "event": "plan_revision_committed",
+                "operation_id": manifest["operation_id"],
+                "revision": 1,
+            }
+        if family in {"attempt01", "active_attempt"}:
+            attempt_id = "01" if family == "attempt01" else "02"
+            context = json.loads(
+                (
+                    run
+                    / "attempts"
+                    / attempt_id
+                    / "attempt-context.json"
+                ).read_text(encoding="utf-8")
+            )
+            return {
+                "event": "attempt_started",
+                "operation_id": self._canonical_hash(
+                    {"operation": "begin_attempt", "context": context}
+                ),
+                "attempt_id": attempt_id,
+                "parent_attempt": context["parent_attempt"],
+                "catalog_revision": context["catalog_revision"],
+                "plan_revision": context["plan_revision"],
+            }
+        if family == "reopen":
+            entry = self._ledger_entries(run)[0]
+            return {
+                "event": "curation_reopened",
+                "operation_id": entry["operation_id"],
+                "attempt_id": "01",
+                "repair_route": "content_replan",
+            }
+        self.fail(f"unknown event family: {family}")
+
     def test_plan_revision_is_immutable_catalog_bound_and_idempotent(self) -> None:
         run, assets = self._reviewed_run("plan-revision")
         save_plan_revision = self._api("save_plan_revision")
@@ -708,6 +905,42 @@ elif name == "pdfimages":
             (1, 1, 1, 2, "01"),
         )
 
+    def test_content_replan_rejects_parent_identical_plan(self) -> None:
+        run, _assets, attempt, context = self._deterministic_attempt(
+            "content-replan-noop"
+        )
+        review = self._semantic_review(
+            attempt,
+            context,
+            verdict="fail",
+            repair_route="content_replan",
+            route_findings=[
+                self._route_finding("content", "content_replan")
+            ],
+        )
+        self._record_valid_v2_review(run, attempt, review)
+        core.reopen_curation(
+            run,
+            self._reopen_request(
+                run, attempt, "content_replan", ["content"]
+            ),
+        )
+        parent_plan = core.load_attempt_plan(run, attempt)
+
+        with self.assertRaises(core.StateError):
+            core.save_plan_revision(run, parent_plan)
+
+        state = json.loads((run / "run.json").read_text(encoding="utf-8"))
+        self.assertEqual(
+            (
+                state["state"],
+                state["active_plan_revision"],
+                state["attempt_count"],
+                (run / "plans" / "002").exists(),
+            ),
+            ("curated", 1, 1, False),
+        )
+
     def test_source_reingest_requires_a_new_catalog_and_plan(self) -> None:
         run, assets, attempt, context = self._deterministic_attempt(
             "source-reingest"
@@ -821,6 +1054,62 @@ elif name == "pdfimages":
                 second_context["parent_attempt"],
             ),
             (2, 2, "01"),
+        )
+
+    def test_source_reingest_rejects_catalog_without_new_asset_binding(
+        self,
+    ) -> None:
+        run, _assets, attempt, context = self._deterministic_attempt(
+            "source-reingest-noop"
+        )
+        review = self._semantic_review(
+            attempt,
+            context,
+            verdict="fail",
+            repair_route="source_reingest",
+            route_findings=[
+                self._route_finding("source", "source_reingest")
+            ],
+        )
+        self._record_valid_v2_review(run, attempt, review)
+        core.reopen_curation(
+            run,
+            self._reopen_request(
+                run, attempt, "source_reingest", ["source"]
+            ),
+        )
+        parent_catalog = core.load_attempt_visual_catalog(run, attempt)
+        selection = {
+            "run_format_version": 2,
+            "assets": [
+                {
+                    "asset_id": item["asset_id"],
+                    "roles": item["roles"],
+                    "max_reuse": item["max_reuse"],
+                    "importance": item["importance"],
+                }
+                for item in parent_catalog["assets"]
+            ],
+            "source_story": parent_catalog["source_story"],
+        }
+        source_context = core.create_source_review_context(run, selection)
+
+        with self.assertRaises(core.StateError):
+            core.record_source_review(
+                run,
+                source_context["context_path"],
+                self._passing_source_review(source_context),
+            )
+
+        state = json.loads((run / "run.json").read_text(encoding="utf-8"))
+        self.assertEqual(
+            (
+                state["state"],
+                state["active_curation_revision"],
+                state["attempt_count"],
+                (run / "curations" / "002").exists(),
+            ),
+            ("curating", 1, 1, False),
         )
 
     def test_plan_and_attempt_transactions_recover_every_crash_boundary(self) -> None:
@@ -992,6 +1281,195 @@ elif name == "pdfimages":
                     1,
                 )
 
+    def test_resume_restores_missing_historical_and_active_commit_events(
+        self,
+    ) -> None:
+        for family in ("plan01", "attempt01", "reopen", "active_attempt"):
+            with self.subTest(family=family):
+                run = self._two_attempt_event_fixture(
+                    f"missing-bound-event-{family}"
+                )
+                expected = self._bound_event(run, family)
+                events = self._run_events(run)
+                self.assertEqual(events.count(expected), 1)
+                events.remove(expected)
+                self._write_run_events(run, events)
+
+                status = core.resume_run(run, skill_root=self.skill)
+
+                self.assertEqual(status["next_action"], "semantic_review")
+                self.assertEqual(self._run_events(run).count(expected), 1)
+
+    def test_resume_rejects_duplicate_historical_and_active_commit_events(
+        self,
+    ) -> None:
+        for family in ("plan01", "attempt01", "reopen", "active_attempt"):
+            with self.subTest(family=family):
+                run = self._two_attempt_event_fixture(
+                    f"duplicate-bound-event-{family}"
+                )
+                expected = self._bound_event(run, family)
+                events = self._run_events(run)
+                self.assertEqual(events.count(expected), 1)
+                events.append(expected)
+                self._write_run_events(run, events)
+
+                with self.assertRaises(core.IntegrityError):
+                    core.resume_run(run, skill_root=self.skill)
+
+    def test_resume_rejects_conflicting_bound_commit_events(self) -> None:
+        for family in ("plan01", "attempt01", "reopen"):
+            with self.subTest(family=family):
+                run = self._two_attempt_event_fixture(
+                    f"conflicting-bound-event-{family}"
+                )
+                expected = self._bound_event(run, family)
+                conflict = dict(expected)
+                if family == "plan01":
+                    conflict["revision"] = 99
+                elif family == "attempt01":
+                    conflict["plan_revision"] = 99
+                else:
+                    conflict["repair_route"] = "source_reingest"
+                events = self._run_events(run)
+                events.append(conflict)
+                self._write_run_events(run, events)
+
+                with self.assertRaises(core.IntegrityError):
+                    core.resume_run(run, skill_root=self.skill)
+
+    def test_direct_attempt_loaders_require_complete_plan_ancestry(
+        self,
+    ) -> None:
+        import shutil
+
+        run = self._two_attempt_event_fixture("loader-plan-ancestry")
+        shutil.rmtree(run / "plans" / "001")
+
+        for loader in (
+            core.load_attempt_plan,
+            core.load_attempt_visual_catalog,
+        ):
+            with self.subTest(loader=loader.__name__):
+                with self.assertRaises(core.IntegrityError):
+                    loader(run, "02")
+        with self.assertRaises(core.IntegrityError):
+            core.resume_run(run, skill_root=self.skill)
+
+    def test_direct_attempt_loaders_require_complete_catalog_ancestry(
+        self,
+    ) -> None:
+        import shutil
+
+        run = self._two_attempt_source_reingest_fixture(
+            "loader-catalog-ancestry"
+        )
+        shutil.rmtree(run / "curations" / "001")
+
+        for loader in (
+            core.load_attempt_plan,
+            core.load_attempt_visual_catalog,
+        ):
+            with self.subTest(loader=loader.__name__):
+                with self.assertRaises(core.IntegrityError):
+                    loader(run, "02")
+        with self.assertRaises(core.IntegrityError):
+            core.resume_run(run, skill_root=self.skill)
+
+    def test_direct_attempt_loaders_require_complete_committed_event_lineage(
+        self,
+    ) -> None:
+        for family in ("plan01", "attempt01", "reopen", "active_attempt"):
+            with self.subTest(family=family):
+                run = self._two_attempt_event_fixture(
+                    f"loader-event-lineage-{family}"
+                )
+                expected = self._bound_event(run, family)
+                events = self._run_events(run)
+                events.remove(expected)
+                self._write_run_events(run, events)
+                before = (run / "events.jsonl").read_bytes()
+
+                for loader in (
+                    core.load_attempt_plan,
+                    core.load_attempt_visual_catalog,
+                ):
+                    with self.subTest(loader=loader.__name__):
+                        with self.assertRaises(core.IntegrityError):
+                            loader(run, "02")
+                self.assertEqual((run / "events.jsonl").read_bytes(), before)
+
+    def test_fail_review_repairs_split_state_write_on_retry_and_resume(
+        self,
+    ) -> None:
+        for recovery in ("api_retry", "resume"):
+            with self.subTest(recovery=recovery):
+                run, _assets, attempt, context = self._deterministic_attempt(
+                    f"split-fail-review-{recovery}"
+                )
+                review = self._semantic_review(
+                    attempt,
+                    context,
+                    verdict="fail",
+                    repair_route="content_replan",
+                    route_findings=[
+                        self._route_finding("content", "content_replan")
+                    ],
+                )
+                with self.assertRaises(core.SimulatedCrash):
+                    core.record_semantic_review(
+                        run, attempt, review, fail_after_write=True
+                    )
+                core.mark_side_state(
+                    run, "failed", reason="semantic review failed"
+                )
+
+                if recovery == "api_retry":
+                    self.assertEqual(
+                        core.record_semantic_review(run, attempt, review),
+                        review,
+                    )
+                    status = core.resume_run(run, skill_root=self.skill)
+                else:
+                    status = core.resume_run(run, skill_root=self.skill)
+
+                review_path = (
+                    run
+                    / "attempts"
+                    / attempt
+                    / "qa"
+                    / "semantic-review.json"
+                )
+                state = json.loads(
+                    (run / "run.json").read_text(encoding="utf-8")
+                )
+                self.assertEqual(
+                    (
+                        state["state"],
+                        state.get("failure_origin"),
+                        state.get("repair_route"),
+                        state.get("semantic_review_sha256"),
+                        status["next_action"],
+                    ),
+                    (
+                        "failed",
+                        "semantic_review",
+                        "content_replan",
+                        core.sha256_file(review_path),
+                        "reopen_curation",
+                    ),
+                )
+                events = [
+                    json.loads(line)
+                    for line in (run / "events.jsonl")
+                    .read_text(encoding="utf-8")
+                    .splitlines()
+                ]
+                self.assertEqual(
+                    sum(event.get("event") == "side_state" for event in events),
+                    1,
+                )
+
     def test_resume_and_finalize_reject_persisted_v2_review_state_mismatch(
         self,
     ) -> None:
@@ -1054,6 +1532,61 @@ elif name == "pdfimages":
 
         with self.assertRaises(core.IntegrityError):
             core.resume_run(run, skill_root=self.skill)
+
+    def test_pass_review_persists_exact_review_hash(self) -> None:
+        run, _assets, attempt, context = self._deterministic_attempt(
+            "pass-review-hash"
+        )
+        review = self._semantic_review(
+            attempt,
+            context,
+            verdict="pass",
+            repair_route=None,
+            route_findings=[],
+        )
+        self._record_valid_v2_review(run, attempt, review)
+
+        review_path = (
+            run / "attempts" / attempt / "qa" / "semantic-review.json"
+        )
+        state = json.loads((run / "run.json").read_text(encoding="utf-8"))
+        self.assertEqual(
+            (state["state"], state.get("semantic_review_sha256")),
+            ("semantic_passed", core.sha256_file(review_path)),
+        )
+
+    def test_resume_and_finalize_reject_changed_valid_pass_review_bytes(
+        self,
+    ) -> None:
+        for consumer in ("resume", "finalize"):
+            with self.subTest(consumer=consumer):
+                run, _assets, attempt, context = self._deterministic_attempt(
+                    f"changed-pass-review-{consumer}"
+                )
+                review = self._semantic_review(
+                    attempt,
+                    context,
+                    verdict="pass",
+                    repair_route=None,
+                    route_findings=[],
+                )
+                self._record_valid_v2_review(run, attempt, review)
+                changed = json.loads(json.dumps(review))
+                changed["dimension_scores"]["fidelity"] = 5
+                core.atomic_write_json(
+                    run
+                    / "attempts"
+                    / attempt
+                    / "qa"
+                    / "semantic-review.json",
+                    changed,
+                )
+
+                with self.assertRaises(core.IntegrityError):
+                    if consumer == "resume":
+                        core.resume_run(run, skill_root=self.skill)
+                    else:
+                        core.finalize_attempt(run, attempt)
 
     def test_reopen_request_binds_persisted_review_route_findings_and_hash(
         self,
