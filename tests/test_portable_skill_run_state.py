@@ -2044,6 +2044,39 @@ elif name == "pdfimages":
             png_bytes,
         )
 
+    def test_synced_nonposter_core_import_does_not_require_png_helper(self) -> None:
+        code = """
+import importlib.util
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+spec = importlib.util.spec_from_file_location("isolated_portable", path)
+assert spec is not None and spec.loader is not None
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+assert module.RELEASED_RUN_FORMAT_VERSION == 1
+assert module.AGENT_FIRST_RUN_FORMAT_VERSION == 2
+assert not (path.parent / "portable_png.py").exists()
+assert "_autodesign_portable_png" not in sys.modules
+"""
+        for skill_name in ("autodesign-ppt", "autodesign-webpage", "autodesign-video"):
+            with self.subTest(skill=skill_name):
+                portable = (
+                    REPO_ROOT / "agent_skills" / skill_name / "scripts" / "_portable.py"
+                )
+                completed = subprocess.run(
+                    [sys.executable, "-c", code, str(portable)],
+                    cwd=REPO_ROOT,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                    env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+                )
+                self.assertEqual(
+                    completed.returncode, 0, completed.stdout + completed.stderr
+                )
+
     def test_sync_check_reports_drift_without_mutating_target(self) -> None:
         root = self.root / "agent_skills"
         _seed_sync_fixture(root)

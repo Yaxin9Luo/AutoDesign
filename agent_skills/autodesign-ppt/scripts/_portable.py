@@ -9,22 +9,30 @@ are read only for snapshotting and drift verification.
 from __future__ import annotations
 
 import ast
+import contextlib
 import hashlib
+import importlib.util
 import json
 import math
 import os
 import re
 import shutil
+import struct
 import subprocess
 import tempfile
+import threading
 import unicodedata
 from collections import Counter
+from contextlib import contextmanager
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from stat import S_ISREG
+from typing import Any, Iterable, Iterator, Mapping, Sequence
 
 
 FORMAT_VERSION = 1
+RELEASED_RUN_FORMAT_VERSION = 1
+AGENT_FIRST_RUN_FORMAT_VERSION = 2
 MAIN_STATES = (
     "initialized",
     "planned",
@@ -72,6 +80,8 @@ _STOPWORDS = {
 _DEFAULT_VISUAL_ROLES = (
     "background", "comparison", "context", "method", "overview", "result", "supporting"
 )
+_THREAD_RUN_LOCKS: dict[str, threading.Lock] = {}
+_THREAD_RUN_LOCKS_GUARD = threading.Lock()
 
 
 class PortableError(RuntimeError):
@@ -125,6 +135,12 @@ def _canonical_json_bytes(value: Any) -> bytes:
 
 def _canonical_hash(value: Any) -> str:
     return sha256_bytes(_canonical_json_bytes(value))
+
+
+def _stored_json_bytes(value: Any) -> bytes:
+    return (json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode(
+        "utf-8"
+    )
 
 
 def safe_path(root: Path | str, relative: Path | str, *, must_exist: bool = False) -> Path:
@@ -303,6 +319,172 @@ def _read_json(path: Path) -> dict[str, Any]:
     return value
 
 
+def inspect_run_format(run_dir: Path | str) -> int:
+    """Read only the top-level run contract and report its known format."""
+
+    run = Path(run_dir).absolute()
+    if run.is_symlink() or not run.is_dir():
+        raise PathSafetyError(f"run directory must be a regular directory: {run}")
+    state_path = run / "run.json"
+    if state_path.is_symlink() or not state_path.is_file():
+        raise PathSafetyError(f"run contract must be a regular file: {state_path}")
+    if state_path.stat().st_nlink != 1:
+        raise PathSafetyError(f"run contract must not be hardlinked: {state_path}")
+    state = _read_json(state_path)
+    version = state.get("run_format_version", state.get("format_version"))
+    if (
+        not isinstance(version, int)
+        or isinstance(version, bool)
+        or version not in {RELEASED_RUN_FORMAT_VERSION, AGENT_FIRST_RUN_FORMAT_VERSION}
+    ):
+        raise IntegrityError(f"unknown or missing run format version: {version!r}")
+    return version
+
+
+def diagnose_v1_run(run_dir: Path | str) -> dict[str, Any]:
+    """Report inert legacy metadata without traversing or loading its snapshot."""
+
+    run = Path(run_dir).absolute()
+    if inspect_run_format(run) != RELEASED_RUN_FORMAT_VERSION:
+        raise StateError("diagnose_v1_run requires a version-1 run")
+    state = _read_json(run / "run.json")
+    source_path = run / "evidence" / "source_manifest.json"
+    source_status: str | None = None
+    source_manifest_sha256: str | None = None
+    source_input_path: str | None = None
+    if source_path.exists():
+        if (
+            source_path.is_symlink()
+            or not source_path.is_file()
+            or source_path.stat().st_nlink != 1
+        ):
+            raise PathSafetyError(f"unsafe legacy source contract: {source_path}")
+        source = _read_json(source_path)
+        source_status = source.get("status") if isinstance(source.get("status"), str) else None
+        source_manifest_sha256 = sha256_file(source_path)
+        if isinstance(source.get("input_path"), str):
+            try:
+                safe_path(run, source["input_path"])
+            except PathSafetyError as error:
+                raise IntegrityError("legacy source path is unsafe") from error
+            source_input_path = source["input_path"]
+    event_count = 0
+    events_path = run / "events.jsonl"
+    if events_path.exists():
+        if (
+            events_path.is_symlink()
+            or not events_path.is_file()
+            or events_path.stat().st_nlink != 1
+        ):
+            raise PathSafetyError(f"unsafe legacy event log: {events_path}")
+        try:
+            lines = events_path.read_text(encoding="utf-8").splitlines()
+        except OSError as error:
+            raise IntegrityError("cannot read legacy event log") from error
+        for line in lines:
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError as error:
+                raise IntegrityError("legacy event log contains invalid JSON") from error
+            if not isinstance(event, dict):
+                raise IntegrityError("legacy event log entry must be an object")
+            event_count += 1
+    active_attempt = state.get("active_attempt")
+    active_attempt_path = (
+        f"attempts/{active_attempt}" if isinstance(active_attempt, str) else None
+    )
+    return {
+        "mode": "read_only",
+        "run_format_version": RELEASED_RUN_FORMAT_VERSION,
+        "run_path": ".",
+        "state": state.get("state"),
+        "active_attempt": active_attempt,
+        "active_attempt_path": active_attempt_path,
+        "attempt_count": state.get("attempt_count"),
+        "source_manifest_path": "evidence/source_manifest.json",
+        "source_input_path": source_input_path,
+        "source_status": source_status,
+        "source_manifest_sha256": source_manifest_sha256,
+        "event_log_path": "events.jsonl",
+        "event_count": event_count,
+    }
+
+
+def _load_agent_first_run(run_dir: Path | str) -> tuple[Path, dict[str, Any]]:
+    if inspect_run_format(run_dir) != AGENT_FIRST_RUN_FORMAT_VERSION:
+        raise StateError("version-1 runs do not support Agent-first source APIs")
+    run, state = _load_run(run_dir)
+    for path in run.rglob("*"):
+        if path.is_file() and path.stat().st_nlink != 1:
+            raise PathSafetyError(f"Agent-first run must not contain hardlinks: {path}")
+    return run, state
+
+
+def _open_run_lock(path: Path) -> int:
+    if path.is_symlink() or (path.exists() and not path.is_file()):
+        raise PathSafetyError(f"unsafe run advisory lock: {path}")
+    flags = os.O_RDWR | os.O_CREAT
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags, 0o600)
+    try:
+        opened = os.fstat(descriptor)
+        published = path.lstat()
+        if (
+            not S_ISREG(opened.st_mode)
+            or not S_ISREG(published.st_mode)
+            or opened.st_nlink != 1
+            or published.st_nlink != 1
+            or (opened.st_dev, opened.st_ino) != (published.st_dev, published.st_ino)
+        ):
+            raise PathSafetyError(f"unsafe run advisory lock: {path}")
+        if opened.st_size == 0:
+            os.write(descriptor, b"\0")
+            os.fsync(descriptor)
+        elif opened.st_size != 1:
+            raise PathSafetyError(f"unsafe run advisory lock size: {path}")
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _thread_run_lock(run: Path) -> threading.Lock:
+    key = str(run)
+    with _THREAD_RUN_LOCKS_GUARD:
+        return _THREAD_RUN_LOCKS.setdefault(key, threading.Lock())
+
+
+@contextmanager
+def _run_lock(run: Path) -> Iterator[None]:
+    thread_lock = _thread_run_lock(run)
+    with thread_lock:
+        descriptor = _open_run_lock(run / ".run.lock")
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(descriptor, msvcrt.LK_LOCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(descriptor, fcntl.LOCK_EX)
+            yield
+        finally:
+            with contextlib.suppress(OSError):
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                if os.name == "nt":
+                    import msvcrt
+
+                    msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
+
+
 def _event(run_dir: Path, event: str, **payload: Any) -> None:
     append_jsonl(run_dir / "events.jsonl", redact_secrets({"event": event, **payload}))
 
@@ -337,8 +519,17 @@ def initialize_run(
     *,
     release_version: str,
     archive_sha256: str | None = None,
+    run_format_version: int = RELEASED_RUN_FORMAT_VERSION,
 ) -> dict[str, Any]:
     """Create a run and immutable snapshot of all bundled runtime inputs."""
+
+    if (
+        not isinstance(run_format_version, int)
+        or isinstance(run_format_version, bool)
+        or run_format_version
+        not in {RELEASED_RUN_FORMAT_VERSION, AGENT_FIRST_RUN_FORMAT_VERSION}
+    ):
+        raise ContractError(f"unknown run format version: {run_format_version!r}")
 
     run = Path(run_dir).absolute()
     skill = Path(skill_root).absolute()
@@ -350,6 +541,8 @@ def initialize_run(
         raise PathSafetyError("run directory must be outside the installed Skill")
     if run.exists():
         if (run / "run.json").is_file():
+            if inspect_run_format(run) != run_format_version:
+                raise IntegrityError("requested run format differs from the existing run")
             manifest = verify_skill_snapshot(run, skill_root=skill)
             if manifest.get("release_version") != release_version:
                 raise IntegrityError("requested release version differs from the run snapshot")
@@ -359,10 +552,21 @@ def initialize_run(
         if any(run.iterdir()):
             raise StateError(f"run directory is not empty: {run}")
     run.mkdir(parents=True, exist_ok=True)
-    for relative in (
+    directories = [
         "input", "evidence/pages", "evidence/assets", "evidence/reference_images", "skill_snapshot/files",
         "attempts", "provenance",
-    ):
+    ]
+    if run_format_version == AGENT_FIRST_RUN_FORMAT_VERSION:
+        directories.extend(
+            (
+                "source-assets/files",
+                "source-assets/receipts",
+                "source-reviews",
+                "curations",
+                "plans",
+            )
+        )
+    for relative in directories:
         safe_path(run, relative).mkdir(parents=True, exist_ok=True)
 
     entries: list[dict[str, Any]] = []
@@ -387,14 +591,29 @@ def initialize_run(
         run / "evidence" / "source_visuals.json",
         {"format_version": FORMAT_VERSION, "visuals": []},
     )
-    state = {
-        "format_version": FORMAT_VERSION,
-        "state": "initialized",
-        "active_attempt": None,
-        "attempt_count": 0,
-        "skill_snapshot_manifest_sha256": sha256_file(manifest_path),
-        "source_manifest_sha256": sha256_file(run / "evidence" / "source_manifest.json"),
-    }
+    if run_format_version == RELEASED_RUN_FORMAT_VERSION:
+        state = {
+            "format_version": FORMAT_VERSION,
+            "state": "initialized",
+            "active_attempt": None,
+            "attempt_count": 0,
+            "skill_snapshot_manifest_sha256": sha256_file(manifest_path),
+            "source_manifest_sha256": sha256_file(run / "evidence" / "source_manifest.json"),
+        }
+    else:
+        atomic_write_bytes(run / "provenance" / "supersessions.jsonl", b"")
+        state = {
+            "run_format_version": AGENT_FIRST_RUN_FORMAT_VERSION,
+            "state": "initialized",
+            "active_attempt": None,
+            "attempt_count": 0,
+            "active_curation_revision": None,
+            "active_curation_sha256": None,
+            "active_plan_revision": None,
+            "active_plan_sha256": None,
+            "skill_snapshot_manifest_sha256": sha256_file(manifest_path),
+            "source_manifest_sha256": sha256_file(run / "evidence" / "source_manifest.json"),
+        }
     _write_run(run, state)
     _event(run, "run_initialized", state="initialized")
     return state
@@ -686,6 +905,346 @@ def _parse_pdfimages_list(text: str) -> list[tuple[int, int]]:
     return mappings
 
 
+def _route_poppler(
+    run: Path, input_source: Path, resolved: Mapping[str, str]
+) -> tuple[Path, dict[str, subprocess.CompletedProcess[str]]]:
+    """Run the verified Poppler command set against one immutable run input."""
+
+    text_path = run / "evidence" / "source.txt"
+    info = subprocess.run(
+        [resolved["pdfinfo"], str(input_source)],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    atomic_write_bytes(run / "evidence" / "pdfinfo.txt", info.stdout.encode("utf-8"))
+    text_result = subprocess.run(
+        [resolved["pdftotext"], str(input_source), str(text_path)],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    page_result = subprocess.run(
+        [
+            resolved["pdftoppm"],
+            "-png",
+            "-r",
+            "144",
+            str(input_source),
+            str(run / "evidence" / "pages" / "page"),
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    image_list = subprocess.run(
+        [resolved["pdfimages"], "-list", str(input_source)],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    atomic_write_bytes(
+        run / "evidence" / "pdfimages-list.txt", image_list.stdout.encode("utf-8")
+    )
+    image_result = subprocess.run(
+        [
+            resolved["pdfimages"],
+            "-png",
+            str(input_source),
+            str(run / "evidence" / "assets" / "pdf-image"),
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    return text_path, {
+        "pdfinfo": info,
+        "pdftotext": text_result,
+        "pdftoppm": page_result,
+        "pdfimages_list": image_list,
+        "pdfimages_extract": image_result,
+    }
+
+
+def _run_relative_diagnostic(run: Path, text: str) -> str:
+    redacted = str(redact_secrets(text))
+    for prefix in {str(run), run.as_posix()}:
+        redacted = redacted.replace(f"{prefix}{os.sep}", "")
+        redacted = redacted.replace(f"{prefix}/", "")
+        redacted = redacted.replace(prefix, ".")
+    return redacted
+
+
+def _png_dimensions(path: Path) -> tuple[int, int]:
+    """Read only the fixed PNG signature and IHDR dimensions."""
+
+    try:
+        header = path.read_bytes()[:24]
+    except OSError as error:
+        raise IntegrityError(f"cannot read rendered page: {path}") from error
+    if (
+        len(header) != 24
+        or header[:8] != b"\x89PNG\r\n\x1a\n"
+        or header[8:12] != b"\x00\x00\x00\r"
+        or header[12:16] != b"IHDR"
+    ):
+        raise IntegrityError(f"rendered page is not a canonical PNG: {path}")
+    width, height = struct.unpack(">II", header[16:24])
+    if width < 1 or height < 1:
+        raise IntegrityError(f"rendered page has invalid dimensions: {path}")
+    return width, height
+
+
+def _canonicalize_rendered_pages(run: Path) -> list[dict[str, Any]]:
+    pages_root = run / "evidence" / "pages"
+    numbered: dict[int, Path] = {}
+    for path in pages_root.iterdir():
+        if path.is_symlink() or not path.is_file() or path.stat().st_nlink != 1:
+            raise PathSafetyError(f"PDF renderer produced an unsafe page output: {path}")
+        match = re.fullmatch(r"page-(\d+)\.png", path.name)
+        if match is None:
+            raise IntegrityError(f"PDF renderer produced an unexpected page: {path.name}")
+        number = int(match.group(1))
+        if number < 1 or number in numbered:
+            raise IntegrityError("PDF renderer produced duplicate or invalid page numbers")
+        numbered[number] = path
+    if sorted(numbered) != list(range(1, len(numbered) + 1)):
+        raise IntegrityError("PDF renderer page numbers are not contiguous")
+    pages: list[dict[str, Any]] = []
+    for number in sorted(numbered):
+        source = numbered[number]
+        target = pages_root / f"page-{number:04d}.png"
+        if source != target:
+            if target.exists() or target.is_symlink():
+                raise IntegrityError(f"canonical PDF page already exists: {target.name}")
+            source.rename(target)
+        width, height = _png_dimensions(target)
+        pages.append(
+            {
+                "page": number,
+                "path": target.relative_to(run).as_posix(),
+                "sha256": sha256_file(target),
+                "width": width,
+                "height": height,
+                "renderer": "pdftoppm",
+                "dpi": 144,
+                "pdf_page_box": "poppler_default",
+                "effective_rotation": 0,
+            }
+        )
+    return pages
+
+
+def _pdfimage_hints(run: Path, image_list: str) -> list[dict[str, Any]]:
+    mappings = _parse_pdfimages_list(image_list)
+    assets_root = run / "evidence" / "assets"
+    extracted = sorted(assets_root.glob("pdf-image*"))
+    if any(
+        path.is_symlink() or not path.is_file() or path.stat().st_nlink != 1
+        for path in extracted
+    ):
+        raise PathSafetyError("pdfimages produced an unsafe extraction hint")
+    if len(extracted) != len(mappings):
+        raise IntegrityError("PDF image extraction could not be mapped to page/object metadata")
+    return [
+        {
+            "path": path.relative_to(run).as_posix(),
+            "sha256": sha256_file(path),
+            "page": page,
+            "object_number": object_number,
+            "trust": "untrusted_hint",
+            "eligible": False,
+        }
+        for path, (page, object_number) in zip(extracted, mappings)
+    ]
+
+
+def _prepare_source_v2(
+    run: Path,
+    state: dict[str, Any],
+    source_path: Path | str,
+    *,
+    extra_assets: Sequence[Path | str],
+    reference_images: Sequence[Path | str],
+    tool_paths: Mapping[str, str | Path | None] | None,
+) -> dict[str, Any]:
+    if state.get("state") not in {"initialized", "blocked"}:
+        raise StateError("source preparation must occur before curation")
+    existing_manifest = _read_json(run / "evidence" / "source_manifest.json")
+    if existing_manifest.get("status") == "ready":
+        raise StateError("a ready source cannot be replaced; initialize a new run")
+    source = Path(source_path).absolute()
+    if source.is_symlink() or not source.is_file() or source.stat().st_nlink != 1:
+        raise PathSafetyError(f"source must be a regular non-symlink file: {source}")
+    suffix = source.suffix.lower()
+    source_type = {
+        ".md": "markdown",
+        ".markdown": "markdown",
+        ".txt": "text",
+        ".pdf": "pdf",
+    }.get(suffix)
+    if source_type is None:
+        raise ContractError(f"unsupported source type: {suffix or '<none>'}")
+    if extra_assets or reference_images:
+        raise ContractError("Agent-first source preparation accepts only the primary source")
+    input_name = f"source{suffix}"
+    input_source = run / "input" / input_name
+    input_entries = list((run / "input").iterdir())
+    if input_entries:
+        if (
+            input_entries != [input_source]
+            or input_source.is_symlink()
+            or not input_source.is_file()
+            or input_source.stat().st_nlink != 1
+            or sha256_file(input_source) != sha256_file(source)
+        ):
+            raise StateError("an Agent-first run cannot replace its immutable source")
+    else:
+        atomic_write_bytes(input_source, source.read_bytes())
+
+    _clear_stale_source_outputs(run)
+    for name in ("page-manifest.json", "pdfimages-hints.json"):
+        path = run / "evidence" / name
+        if path.is_symlink():
+            raise PathSafetyError(f"source output must not be a symlink: {path}")
+        path.unlink(missing_ok=True)
+    evidence: list[dict[str, Any]] = []
+    manifest: dict[str, Any] = {
+        "format_version": FORMAT_VERSION,
+        "status": "ready",
+        "source_type": source_type,
+        "input_path": f"input/{input_name}",
+        "source_sha256": sha256_file(input_source),
+        "source_size": input_source.stat().st_size,
+        "tools": {},
+    }
+
+    if source_type in {"markdown", "text"}:
+        text = input_source.read_text(encoding="utf-8")
+        atomic_write_bytes(run / "evidence" / "source.txt", text.encode("utf-8"))
+        evidence = _text_evidence(text, markdown=source_type == "markdown")
+    else:
+        required = ("pdftotext", "pdfinfo", "pdftoppm", "pdfimages")
+        resolved: dict[str, str | None] = {}
+        for name in required:
+            configured = tool_paths.get(name) if tool_paths is not None else shutil.which(name)
+            resolved[name] = str(configured) if configured else None
+        missing = sorted(name for name, path in resolved.items() if path is None)
+        manifest["tools"] = {
+            name: {
+                "available": path is not None,
+                "identity": Path(path).name if path is not None else None,
+            }
+            for name, path in resolved.items()
+        }
+        if missing:
+            manifest.update({"status": "blocked", "missing_tools": missing})
+            _write_evidence(run, [])
+            atomic_write_json(
+                run / "evidence" / "source_visuals.json",
+                {"format_version": FORMAT_VERSION, "visuals": []},
+            )
+            _persist_source_manifest(run, manifest)
+            mark_side_state(
+                run,
+                "blocked",
+                reason=f"missing required PDF tools: {', '.join(missing)}",
+            )
+            return manifest
+        routed = {name: path for name, path in resolved.items() if path is not None}
+        text_path, commands = _route_poppler(run, input_source, routed)
+        failed = sorted(
+            name for name, result in commands.items() if result.returncode != 0
+        )
+        if not list((run / "evidence" / "pages").iterdir()):
+            failed.append("pdftoppm_output")
+        if not text_path.is_file():
+            failed.append("pdftotext_output")
+        manifest["commands"] = {
+            name: {
+                "returncode": result.returncode,
+                "stderr": _run_relative_diagnostic(run, result.stderr),
+            }
+            for name, result in commands.items()
+        }
+        if failed:
+            manifest.update({"status": "blocked", "failed_commands": sorted(set(failed))})
+            _write_evidence(run, [])
+            atomic_write_json(
+                run / "evidence" / "source_visuals.json",
+                {"format_version": FORMAT_VERSION, "visuals": []},
+            )
+            _persist_source_manifest(run, manifest)
+            mark_side_state(
+                run,
+                "blocked",
+                reason=f"PDF preparation failed: {', '.join(manifest['failed_commands'])}",
+            )
+            return manifest
+        pages = _canonicalize_rendered_pages(run)
+        hints = _pdfimage_hints(run, commands["pdfimages_list"].stdout)
+        page_manifest = {
+            "format_version": FORMAT_VERSION,
+            "source_path": manifest["input_path"],
+            "source_sha256": manifest["source_sha256"],
+            "pages": pages,
+        }
+        hints_manifest = {
+            "format_version": FORMAT_VERSION,
+            "source_path": manifest["input_path"],
+            "source_sha256": manifest["source_sha256"],
+            "hints": hints,
+        }
+        page_manifest_path = run / "evidence" / "page-manifest.json"
+        hints_manifest_path = run / "evidence" / "pdfimages-hints.json"
+        atomic_write_json(page_manifest_path, page_manifest)
+        atomic_write_json(hints_manifest_path, hints_manifest)
+        manifest.update(
+            {
+                "page_manifest_path": "evidence/page-manifest.json",
+                "page_manifest_sha256": sha256_file(page_manifest_path),
+                "pdfimages_hints_path": "evidence/pdfimages-hints.json",
+                "pdfimages_hints_sha256": sha256_file(hints_manifest_path),
+                "rendered_pages": {page["path"]: page["sha256"] for page in pages},
+            }
+        )
+        text = text_path.read_text(encoding="utf-8", errors="replace")
+        evidence = _pdf_evidence(text)
+
+    _write_evidence(run, evidence)
+    atomic_write_json(
+        run / "evidence" / "source_visuals.json",
+        {"format_version": FORMAT_VERSION, "visuals": []},
+    )
+    manifest.update(
+        {
+            "source_text_sha256": sha256_file(run / "evidence" / "source.txt"),
+            "evidence_sha256": sha256_file(run / "evidence" / "evidence.jsonl"),
+            "source_visuals_sha256": sha256_file(
+                run / "evidence" / "source_visuals.json"
+            ),
+            "evidence_count": len(evidence),
+            "visual_count": 0,
+        }
+    )
+    _persist_source_manifest(run, manifest)
+    current = _read_json(run / "run.json")
+    current["state"] = "curating"
+    current.pop("reason", None)
+    current.pop("resume_from", None)
+    _write_run(run, current)
+    if state.get("state") == "blocked":
+        _event(run, "source_blocker_resolved", state="curating")
+    _event(
+        run,
+        "source_prepared",
+        source_type=source_type,
+        evidence_count=len(evidence),
+        visual_count=0,
+    )
+    return manifest
+
+
 def prepare_source(
     run_dir: Path | str,
     source_path: Path | str,
@@ -697,6 +1256,15 @@ def prepare_source(
     """Hash and index text/Markdown, or route verified PDF ingest via Poppler."""
 
     run, state = _load_run(run_dir)
+    if state.get("run_format_version") == AGENT_FIRST_RUN_FORMAT_VERSION:
+        return _prepare_source_v2(
+            run,
+            state,
+            source_path,
+            extra_assets=extra_assets,
+            reference_images=reference_images,
+            tool_paths=tool_paths,
+        )
     if state.get("state") not in {"initialized", "blocked"}:
         raise StateError("source preparation must occur before planning")
     existing_manifest = _read_json(run / "evidence" / "source_manifest.json")
@@ -744,28 +1312,9 @@ def prepare_source(
             mark_side_state(run, "blocked", reason=f"missing required PDF tools: {', '.join(missing)}")
             return manifest
         assert all(resolved.values())
-        text_path = run / "evidence" / "source.txt"
-        info = subprocess.run(
-            [resolved["pdfinfo"], str(input_source)], text=True, capture_output=True, check=False
-        )
-        atomic_write_bytes(run / "evidence" / "pdfinfo.txt", info.stdout.encode("utf-8"))
-        text_result = subprocess.run(
-            [resolved["pdftotext"], str(input_source), str(text_path)],
-            text=True, capture_output=True, check=False,
-        )
-        page_result = subprocess.run(
-            [resolved["pdftoppm"], "-png", "-r", "144", str(input_source), str(run / "evidence" / "pages" / "page")],
-            text=True, capture_output=True, check=False,
-        )
-        image_list = subprocess.run(
-            [resolved["pdfimages"], "-list", str(input_source)], text=True, capture_output=True, check=False
-        )
-        atomic_write_bytes(run / "evidence" / "pdfimages-list.txt", image_list.stdout.encode("utf-8"))
-        image_result = subprocess.run(
-            [resolved["pdfimages"], "-png", str(input_source), str(run / "evidence" / "assets" / "pdf-image")],
-            text=True, capture_output=True, check=False,
-        )
-        commands = {"pdfinfo": info, "pdftotext": text_result, "pdftoppm": page_result, "pdfimages_list": image_list, "pdfimages_extract": image_result}
+        routed = {name: str(path) for name, path in resolved.items() if path is not None}
+        text_path, commands = _route_poppler(run, input_source, routed)
+        image_list = commands["pdfimages_list"]
         failed = sorted(name for name, result in commands.items() if result.returncode != 0)
         rendered_page_paths = sorted((run / "evidence" / "pages").iterdir())
         if any(path.is_symlink() or not path.is_file() for path in rendered_page_paths):
@@ -939,6 +1488,785 @@ def _verify_source_contract(run: Path, state: Mapping[str, Any]) -> dict[str, An
             raise IntegrityError(f"source visual hash mismatch: {visual.get('id')}")
     _verify_vlm_history(run, manifest, visuals)
     return manifest
+
+
+def _load_v2_pdf_registries(
+    run: Path, manifest: Mapping[str, Any]
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    page_manifest_value = manifest.get("page_manifest_path")
+    hint_manifest_value = manifest.get("pdfimages_hints_path")
+    if not isinstance(page_manifest_value, str) or not isinstance(hint_manifest_value, str):
+        raise IntegrityError("Agent-first PDF source is missing canonical registries")
+    page_manifest_path = safe_path(run, page_manifest_value, must_exist=True)
+    hint_manifest_path = safe_path(run, hint_manifest_value, must_exist=True)
+    if (
+        page_manifest_path.parent != run / "evidence"
+        or page_manifest_path.name != "page-manifest.json"
+        or hint_manifest_path.parent != run / "evidence"
+        or hint_manifest_path.name != "pdfimages-hints.json"
+    ):
+        raise IntegrityError("Agent-first PDF registry path is noncanonical")
+    if sha256_file(page_manifest_path) != manifest.get("page_manifest_sha256"):
+        raise IntegrityError("page manifest hash mismatch")
+    if sha256_file(hint_manifest_path) != manifest.get("pdfimages_hints_sha256"):
+        raise IntegrityError("pdfimages hints hash mismatch")
+    page_manifest = _read_json(page_manifest_path)
+    hint_manifest = _read_json(hint_manifest_path)
+    source_binding = {
+        "source_path": manifest.get("input_path"),
+        "source_sha256": manifest.get("source_sha256"),
+    }
+    for value, name in (
+        (page_manifest, "page manifest"),
+        (hint_manifest, "pdfimages hints"),
+    ):
+        if value.get("format_version") != FORMAT_VERSION or any(
+            value.get(key) != expected for key, expected in source_binding.items()
+        ):
+            raise IntegrityError(f"{name} source binding mismatch")
+    pages = page_manifest.get("pages")
+    if not isinstance(pages, list) or not pages:
+        raise IntegrityError("page manifest has no pages")
+    expected_page_keys = {
+        "page",
+        "path",
+        "sha256",
+        "width",
+        "height",
+        "renderer",
+        "dpi",
+        "pdf_page_box",
+        "effective_rotation",
+    }
+    for number, page in enumerate(pages, start=1):
+        if not isinstance(page, dict) or set(page) != expected_page_keys:
+            raise IntegrityError("page manifest entry has an unknown or incomplete schema")
+        expected_path = f"evidence/pages/page-{number:04d}.png"
+        if (
+            page.get("page") != number
+            or page.get("path") != expected_path
+            or page.get("renderer") != "pdftoppm"
+            or page.get("dpi") != 144
+            or page.get("pdf_page_box") != "poppler_default"
+            or page.get("effective_rotation") != 0
+        ):
+            raise IntegrityError("page manifest metadata is noncanonical")
+        path = safe_path(run, expected_path, must_exist=True)
+        if path.stat().st_nlink != 1 or sha256_file(path) != page.get("sha256"):
+            raise IntegrityError(f"rendered page hash mismatch: {expected_path}")
+        width, height = _png_dimensions(path)
+        if page.get("width") != width or page.get("height") != height:
+            raise IntegrityError(f"rendered page dimensions mismatch: {expected_path}")
+    pages_root = run / "evidence" / "pages"
+    if {path.name for path in pages_root.iterdir()} != {
+        f"page-{number:04d}.png" for number in range(1, len(pages) + 1)
+    }:
+        raise IntegrityError("rendered page registry is not an exact set")
+
+    hints = hint_manifest.get("hints")
+    if not isinstance(hints, list):
+        raise IntegrityError("pdfimages hints must be a list")
+    expected_hint_keys = {
+        "path",
+        "sha256",
+        "page",
+        "object_number",
+        "trust",
+        "eligible",
+    }
+    expected_hint_paths: set[str] = set()
+    for hint in hints:
+        if not isinstance(hint, dict) or set(hint) != expected_hint_keys:
+            raise IntegrityError("pdfimages hint has an unknown or incomplete schema")
+        relative = hint.get("path")
+        if (
+            not isinstance(relative, str)
+            or hint.get("trust") != "untrusted_hint"
+            or hint.get("eligible") is not False
+            or not isinstance(hint.get("page"), int)
+            or isinstance(hint.get("page"), bool)
+            or not 1 <= hint["page"] <= len(pages)
+            or not isinstance(hint.get("object_number"), int)
+            or isinstance(hint.get("object_number"), bool)
+            or hint["object_number"] < 0
+        ):
+            raise IntegrityError("pdfimages hint metadata is invalid")
+        path = safe_path(run, relative, must_exist=True)
+        if path.parent != run / "evidence" / "assets":
+            raise IntegrityError("pdfimages hint is outside its registry")
+        if path.stat().st_nlink != 1 or sha256_file(path) != hint.get("sha256"):
+            raise IntegrityError("pdfimages hint hash mismatch")
+        if relative in expected_hint_paths:
+            raise IntegrityError("duplicate pdfimages hint path")
+        expected_hint_paths.add(relative)
+    actual_hint_paths = {
+        path.relative_to(run).as_posix()
+        for path in (run / "evidence" / "assets").glob("pdf-image*")
+    }
+    if actual_hint_paths != expected_hint_paths:
+        raise IntegrityError("pdfimages hint registry is not an exact set")
+    return [dict(page) for page in pages], [dict(hint) for hint in hints]
+
+
+def inspect_source(run_dir: Path | str) -> dict[str, Any]:
+    """Return verified Agent-first source, page, and extraction-hint bindings."""
+
+    run, state = _load_agent_first_run(run_dir)
+    manifest = _verify_source_contract(run, state)
+    source: dict[str, Any] | None = None
+    if isinstance(manifest.get("input_path"), str):
+        source = {
+            "path": manifest["input_path"],
+            "sha256": manifest.get("source_sha256"),
+            "source_type": manifest.get("source_type"),
+        }
+    pages: list[dict[str, Any]] = []
+    hints: list[dict[str, Any]] = []
+    if manifest.get("status") == "ready" and manifest.get("source_type") == "pdf":
+        pages, raw_hints = _load_v2_pdf_registries(run, manifest)
+        hints = [
+            {
+                **hint,
+                "trust": "untrusted",
+            }
+            for hint in raw_hints
+        ]
+    return {
+        "run_format_version": AGENT_FIRST_RUN_FORMAT_VERSION,
+        "source": source,
+        "source_manifest_sha256": state.get("source_manifest_sha256"),
+        "page_manifest_path": manifest.get("page_manifest_path"),
+        "page_manifest_sha256": manifest.get("page_manifest_sha256"),
+        "pages": pages,
+        "extraction_hints": hints,
+        "active_curation_revision": state.get("active_curation_revision"),
+        "active_plan_revision": state.get("active_plan_revision"),
+        "next_action": (
+            "prepare_source"
+            if manifest.get("status") == "not_prepared"
+            else "curate_source"
+        ),
+    }
+
+
+def _validate_crop_request(
+    run: Path, state: Mapping[str, Any], request: Mapping[str, Any]
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    manifest = _verify_source_contract(run, state)
+    if manifest.get("status") != "ready" or manifest.get("source_type") != "pdf":
+        raise StateError("source cropping requires a ready PDF")
+    required = {
+        "run_format_version",
+        "source_sha256",
+        "page_manifest_sha256",
+        "page",
+        "page_sha256",
+        "bbox_normalized",
+        "role",
+        "claim",
+        "max_reuse",
+    }
+    if not isinstance(request, Mapping) or set(request) != required:
+        raise ContractError("crop request has an unknown or incomplete schema")
+    value = dict(request)
+    if value.get("run_format_version") != AGENT_FIRST_RUN_FORMAT_VERSION:
+        raise ContractError("crop request targets the wrong run format")
+    page_number = value.get("page")
+    if (
+        not isinstance(page_number, int)
+        or isinstance(page_number, bool)
+        or page_number < 1
+    ):
+        raise ContractError("crop page must be a positive integer")
+    bbox = value.get("bbox_normalized")
+    if not isinstance(bbox, list) or len(bbox) != 4:
+        raise ContractError("crop bbox_normalized must contain four coordinates")
+    coordinates: list[float] = []
+    for coordinate in bbox:
+        if (
+            not isinstance(coordinate, (int, float))
+            or isinstance(coordinate, bool)
+            or not math.isfinite(coordinate)
+            or not 0 <= coordinate <= 1
+        ):
+            raise ContractError("crop coordinates must be finite numbers in [0, 1]")
+        coordinates.append(float(coordinate))
+    if not coordinates[0] < coordinates[2] or not coordinates[1] < coordinates[3]:
+        raise ContractError("crop bbox must have positive width and height")
+    value["bbox_normalized"] = coordinates
+    for field in ("role", "claim"):
+        field_value = value.get(field)
+        if not isinstance(field_value, str) or not field_value.strip():
+            raise ContractError(f"crop {field} must be non-empty")
+        value[field] = field_value.strip()
+    max_reuse = value.get("max_reuse")
+    if (
+        not isinstance(max_reuse, int)
+        or isinstance(max_reuse, bool)
+        or max_reuse < 1
+    ):
+        raise ContractError("crop max_reuse must be a positive integer")
+
+    pages, _hints = _load_v2_pdf_registries(run, manifest)
+    if page_number > len(pages):
+        raise ContractError("crop page is outside the rendered page set")
+    page = pages[page_number - 1]
+    for field, expected in (
+        ("source_sha256", manifest.get("source_sha256")),
+        ("page_manifest_sha256", manifest.get("page_manifest_sha256")),
+        ("page_sha256", page.get("sha256")),
+    ):
+        supplied = value.get(field)
+        if (
+            not isinstance(supplied, str)
+            or re.fullmatch(r"[0-9a-f]{64}", supplied) is None
+        ):
+            raise ContractError(f"crop {field} must be a lowercase SHA-256 digest")
+        if supplied != expected:
+            raise IntegrityError(f"crop {field} binding is stale")
+    return value, dict(manifest), page
+
+
+def _crop_result(receipt: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "run_format_version": AGENT_FIRST_RUN_FORMAT_VERSION,
+        "asset_id": receipt["asset_id"],
+        "asset_path": receipt["asset_path"],
+        "asset_sha256": receipt["asset_sha256"],
+        "receipt_path": receipt["receipt_path"],
+        "receipt_sha256": receipt["receipt_sha256"],
+        "bbox_pixels": receipt["bbox_pixels"],
+    }
+
+
+def _validate_crop_receipt_document(
+    run: Path,
+    state: Mapping[str, Any],
+    receipt: dict[str, Any],
+    *,
+    asset_path: Path,
+) -> dict[str, Any]:
+    required = {
+        "run_format_version",
+        "asset_id",
+        "operation_id",
+        "asset_path",
+        "asset_sha256",
+        "receipt_path",
+        "receipt_sha256",
+        "source_manifest_sha256",
+        "source_path",
+        "source_sha256",
+        "page_manifest_path",
+        "page_manifest_sha256",
+        "page",
+        "page_path",
+        "page_sha256",
+        "page_width",
+        "page_height",
+        "renderer",
+        "dpi",
+        "pdf_page_box",
+        "effective_rotation",
+        "bbox_normalized",
+        "bbox_pixels",
+        "semantic_request",
+    }
+    if set(receipt) != required or receipt.get("run_format_version") != AGENT_FIRST_RUN_FORMAT_VERSION:
+        raise IntegrityError("crop receipt has an unknown or incomplete schema")
+    receipt_without_hash = dict(receipt)
+    receipt_hash = receipt_without_hash.pop("receipt_sha256", None)
+    if receipt_hash != _canonical_hash(receipt_without_hash):
+        raise IntegrityError("crop receipt hash mismatch")
+    asset_id = receipt.get("asset_id")
+    operation_id = receipt.get("operation_id")
+    if (
+        not isinstance(asset_id, str)
+        or re.fullmatch(r"src-[0-9a-f]{24}", asset_id) is None
+        or not isinstance(operation_id, str)
+        or re.fullmatch(r"[0-9a-f]{64}", operation_id) is None
+        or asset_id != f"src-{operation_id[:24]}"
+    ):
+        raise IntegrityError("crop receipt operation identity is invalid")
+    expected_asset = f"source-assets/files/{asset_id}.png"
+    expected_receipt = f"source-assets/receipts/{asset_id}.json"
+    if (
+        receipt.get("asset_path") != expected_asset
+        or receipt.get("receipt_path") != expected_receipt
+    ):
+        raise IntegrityError("crop receipt registry path is noncanonical")
+    if (
+        asset_path.is_symlink()
+        or not asset_path.is_file()
+        or asset_path.stat().st_nlink != 1
+        or sha256_file(asset_path) != receipt.get("asset_sha256")
+    ):
+        raise IntegrityError("crop output hash mismatch")
+    manifest = _verify_source_contract(run, state)
+    if (
+        receipt.get("source_manifest_sha256") != state.get("source_manifest_sha256")
+        or receipt.get("source_path") != manifest.get("input_path")
+        or receipt.get("source_sha256") != manifest.get("source_sha256")
+        or receipt.get("page_manifest_path") != manifest.get("page_manifest_path")
+        or receipt.get("page_manifest_sha256") != manifest.get("page_manifest_sha256")
+    ):
+        raise IntegrityError("crop receipt source binding is stale")
+    pages, _hints = _load_v2_pdf_registries(run, manifest)
+    page_number = receipt.get("page")
+    if (
+        not isinstance(page_number, int)
+        or isinstance(page_number, bool)
+        or not 1 <= page_number <= len(pages)
+    ):
+        raise IntegrityError("crop receipt page is invalid")
+    page = pages[page_number - 1]
+    expected_page_fields = {
+        "page_path": "path",
+        "page_sha256": "sha256",
+        "page_width": "width",
+        "page_height": "height",
+        "renderer": "renderer",
+        "dpi": "dpi",
+        "pdf_page_box": "pdf_page_box",
+        "effective_rotation": "effective_rotation",
+    }
+    if any(
+        receipt.get(receipt_field) != page.get(page_field)
+        for receipt_field, page_field in expected_page_fields.items()
+    ):
+        raise IntegrityError("crop receipt page binding is stale")
+    bbox = receipt.get("bbox_normalized")
+    pixels = receipt.get("bbox_pixels")
+    if (
+        not isinstance(bbox, list)
+        or len(bbox) != 4
+        or any(
+            not isinstance(value, (int, float))
+            or isinstance(value, bool)
+            or not math.isfinite(value)
+            or not 0 <= value <= 1
+            for value in bbox
+        )
+        or not bbox[0] < bbox[2]
+        or not bbox[1] < bbox[3]
+        or not isinstance(pixels, list)
+        or len(pixels) != 4
+        or any(not isinstance(value, int) or isinstance(value, bool) for value in pixels)
+    ):
+        raise IntegrityError("crop receipt bbox binding is invalid")
+    expected_pixels = [
+        math.floor(bbox[0] * page["width"]),
+        math.floor(bbox[1] * page["height"]),
+        math.ceil(bbox[2] * page["width"]),
+        math.ceil(bbox[3] * page["height"]),
+    ]
+    if pixels != expected_pixels:
+        raise IntegrityError("crop receipt pixel bbox binding is stale")
+    semantic = receipt.get("semantic_request")
+    if not isinstance(semantic, dict) or set(semantic) != {"role", "claim", "max_reuse"}:
+        raise IntegrityError("crop receipt semantic request is invalid")
+    if (
+        any(
+            not isinstance(semantic.get(field), str)
+            or not semantic[field].strip()
+            or semantic[field] != semantic[field].strip()
+            for field in ("role", "claim")
+        )
+        or not isinstance(semantic.get("max_reuse"), int)
+        or isinstance(semantic.get("max_reuse"), bool)
+        or semantic["max_reuse"] < 1
+    ):
+        raise IntegrityError("crop receipt semantic request values are invalid")
+    request = {
+        "run_format_version": AGENT_FIRST_RUN_FORMAT_VERSION,
+        "source_sha256": receipt["source_sha256"],
+        "page_manifest_sha256": receipt["page_manifest_sha256"],
+        "page": page_number,
+        "page_sha256": receipt["page_sha256"],
+        "bbox_normalized": [float(value) for value in bbox],
+        "role": semantic["role"],
+        "claim": semantic["claim"],
+        "max_reuse": semantic["max_reuse"],
+    }
+    expected_operation = _canonical_hash(
+        {
+            "operation": "crop_source",
+            "source_manifest_sha256": state["source_manifest_sha256"],
+            "source_sha256": manifest["source_sha256"],
+            "page_manifest_sha256": manifest["page_manifest_sha256"],
+            "page_sha256": page["sha256"],
+            "request": request,
+        }
+    )
+    if operation_id != expected_operation:
+        raise IntegrityError("crop receipt operation binding is stale")
+    return receipt
+
+
+def _read_crop_receipt(
+    run: Path,
+    state: Mapping[str, Any],
+    receipt_path: Path,
+    *,
+    asset_path: Path,
+) -> dict[str, Any]:
+    if (
+        receipt_path.is_symlink()
+        or not receipt_path.is_file()
+        or receipt_path.stat().st_nlink != 1
+    ):
+        raise PathSafetyError(f"unsafe crop receipt: {receipt_path}")
+    receipt = _read_json(receipt_path)
+    if receipt_path.read_bytes() != _stored_json_bytes(receipt):
+        raise IntegrityError("crop receipt contains noncanonical JSON bytes")
+    return _validate_crop_receipt_document(run, state, receipt, asset_path=asset_path)
+
+
+def _crop_event_exists(run: Path, operation_id: str) -> bool:
+    events_path = run / "events.jsonl"
+    for line in events_path.read_text(encoding="utf-8").splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError as error:
+            raise IntegrityError("event log contains invalid JSON") from error
+        if not isinstance(event, dict):
+            raise IntegrityError("event log entry must be an object")
+        if (
+            event.get("event") == "source_crop_registered"
+            and event.get("operation_id") == operation_id
+        ):
+            return True
+    return False
+
+
+def _record_crop_event(run: Path, receipt: Mapping[str, Any]) -> None:
+    if not _crop_event_exists(run, str(receipt["operation_id"])):
+        _event(
+            run,
+            "source_crop_registered",
+            asset_id=receipt["asset_id"],
+            operation_id=receipt["operation_id"],
+        )
+
+
+def _stage_entries(stage: Path) -> set[str]:
+    if stage.is_symlink() or not stage.is_dir():
+        raise PathSafetyError(f"unsafe crop staging path: {stage}")
+    entries = list(stage.iterdir())
+    if any(
+        path.is_symlink() or not path.is_file() or path.stat().st_nlink != 1
+        for path in entries
+    ):
+        raise PathSafetyError(f"unsafe crop staging entry: {stage}")
+    return {path.name for path in entries}
+
+
+def _load_crop_png_module() -> Any:
+    """Resolve the Poster-only helper only when a crop actually executes."""
+
+    try:
+        if __package__:
+            from . import portable_png
+
+            return portable_png
+    except (ImportError, ValueError):
+        pass
+    path = Path(__file__).resolve().with_name("portable_png.py")
+    try:
+        spec = importlib.util.spec_from_file_location("_autodesign_portable_png", path)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"cannot load bundled PNG helper: {path}")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    except (ImportError, OSError, ValueError) as error:
+        raise IntegrityError("Agent-first crop requires the bundled portable PNG helper") from error
+
+
+def _fsync_directory(path: Path) -> None:
+    try:
+        descriptor = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    except OSError:
+        pass
+
+
+def _promote_crop_pair(
+    run: Path,
+    state: Mapping[str, Any],
+    stage: Path,
+    asset_path: Path,
+    receipt_path: Path,
+    *,
+    fail_at: str | None,
+) -> dict[str, Any]:
+    asset_id = asset_path.stem
+    staged_asset = stage / f"{asset_id}.png"
+    staged_receipt = stage / f"{asset_id}.json"
+    expected = {staged_asset.name, staged_receipt.name}
+    if _stage_entries(stage) != expected:
+        raise IntegrityError("crop staging directory is not an exact pair")
+    receipt = _read_crop_receipt(
+        run, state, staged_receipt, asset_path=staged_asset
+    )
+    if asset_path.exists() or receipt_path.exists():
+        raise IntegrityError("crop target appeared during promotion")
+    os.replace(staged_asset, asset_path)
+    _fsync_directory(asset_path.parent)
+    if fail_at == "after_asset_promotion":
+        raise SimulatedCrash("after crop asset promotion")
+    os.replace(staged_receipt, receipt_path)
+    _fsync_directory(receipt_path.parent)
+    _record_crop_event(run, receipt)
+    shutil.rmtree(stage)
+    return receipt
+
+
+def crop_source(
+    run_dir: Path | str,
+    request: Mapping[str, Any],
+    *,
+    fail_at: str | None = None,
+) -> dict[str, Any]:
+    """Register one deterministic crop from a verified complete PDF page."""
+
+    aliases = {
+        "after_asset_write": "after_staged_asset_write",
+        "after_receipt_write": "after_staged_receipt_write",
+        "between_promotion_steps": "after_asset_promotion",
+    }
+    fail_at = aliases.get(fail_at, fail_at)
+    if fail_at not in {
+        None,
+        "after_staged_asset_write",
+        "after_staged_receipt_write",
+        "after_asset_promotion",
+    }:
+        raise ContractError(f"unknown crop crash boundary: {fail_at}")
+    run, _state = _load_agent_first_run(run_dir)
+    with _run_lock(run):
+        run, state = _load_agent_first_run(run)
+        if state.get("state") != "curating":
+            raise StateError("source cropping requires curating state")
+        value, manifest, page = _validate_crop_request(run, state, request)
+        operation_id = _canonical_hash(
+            {
+                "operation": "crop_source",
+                "source_manifest_sha256": state["source_manifest_sha256"],
+                "source_sha256": manifest["source_sha256"],
+                "page_manifest_sha256": manifest["page_manifest_sha256"],
+                "page_sha256": page["sha256"],
+                "request": value,
+            }
+        )
+        asset_id = f"src-{operation_id[:24]}"
+        asset_path = run / "source-assets" / "files" / f"{asset_id}.png"
+        receipt_path = run / "source-assets" / "receipts" / f"{asset_id}.json"
+        stage = run / "source-assets" / f".crop-staging-{asset_id}"
+
+        if asset_path.exists() and receipt_path.exists():
+            receipt = _read_crop_receipt(
+                run, state, receipt_path, asset_path=asset_path
+            )
+            if receipt.get("operation_id") != operation_id:
+                raise IntegrityError("crop operation ID collision")
+            if stage.exists() or stage.is_symlink():
+                _stage_entries(stage)
+                shutil.rmtree(stage)
+            _record_crop_event(run, receipt)
+            return _crop_result(receipt)
+
+        if asset_path.exists() and not receipt_path.exists():
+            if stage.exists() and _stage_entries(stage) == {f"{asset_id}.json"}:
+                receipt = _read_crop_receipt(
+                    run, state, stage / f"{asset_id}.json", asset_path=asset_path
+                )
+                if receipt.get("operation_id") != operation_id:
+                    raise IntegrityError("crop recovery operation mismatch")
+                os.replace(stage / f"{asset_id}.json", receipt_path)
+                _fsync_directory(receipt_path.parent)
+                shutil.rmtree(stage)
+                _record_crop_event(run, receipt)
+                return _crop_result(receipt)
+            if asset_path.is_symlink() or not asset_path.is_file():
+                raise PathSafetyError(f"unsafe partial crop output: {asset_path}")
+            asset_path.unlink()
+        elif receipt_path.exists() and not asset_path.exists():
+            if receipt_path.is_symlink() or not receipt_path.is_file():
+                raise PathSafetyError(f"unsafe partial crop receipt: {receipt_path}")
+            receipt_path.unlink()
+
+        if stage.exists() or stage.is_symlink():
+            entries = _stage_entries(stage)
+            if entries == {f"{asset_id}.png", f"{asset_id}.json"}:
+                receipt = _promote_crop_pair(
+                    run,
+                    state,
+                    stage,
+                    asset_path,
+                    receipt_path,
+                    fail_at=fail_at,
+                )
+                return _crop_result(receipt)
+            shutil.rmtree(stage)
+
+        png = _load_crop_png_module()
+        stage.mkdir()
+        staged_asset = stage / f"{asset_id}.png"
+        staged_receipt = stage / f"{asset_id}.json"
+        width = int(page["width"])
+        height = int(page["height"])
+        bbox = value["bbox_normalized"]
+        pixels = [
+            math.floor(bbox[0] * width),
+            math.floor(bbox[1] * height),
+            math.ceil(bbox[2] * width),
+            math.ceil(bbox[3] * height),
+        ]
+        if not pixels[0] < pixels[2] or not pixels[1] < pixels[3]:
+            shutil.rmtree(stage)
+            raise ContractError("normalized crop collapses at page resolution")
+        page_path = safe_path(run, page["path"], must_exist=True)
+        try:
+            cropped = png.crop_png(page_path.read_bytes(), tuple(pixels))
+        except ValueError as error:
+            shutil.rmtree(stage)
+            raise IntegrityError("registered source page is not a supported PNG") from error
+        atomic_write_bytes(staged_asset, cropped)
+        if fail_at == "after_staged_asset_write":
+            raise SimulatedCrash("after staged crop asset write")
+        receipt: dict[str, Any] = {
+            "run_format_version": AGENT_FIRST_RUN_FORMAT_VERSION,
+            "asset_id": asset_id,
+            "operation_id": operation_id,
+            "asset_path": asset_path.relative_to(run).as_posix(),
+            "asset_sha256": sha256_file(staged_asset),
+            "receipt_path": receipt_path.relative_to(run).as_posix(),
+            "source_manifest_sha256": state["source_manifest_sha256"],
+            "source_path": manifest["input_path"],
+            "source_sha256": manifest["source_sha256"],
+            "page_manifest_path": manifest["page_manifest_path"],
+            "page_manifest_sha256": manifest["page_manifest_sha256"],
+            "page": value["page"],
+            "page_path": page["path"],
+            "page_sha256": page["sha256"],
+            "page_width": width,
+            "page_height": height,
+            "renderer": page["renderer"],
+            "dpi": page["dpi"],
+            "pdf_page_box": page["pdf_page_box"],
+            "effective_rotation": page["effective_rotation"],
+            "bbox_normalized": bbox,
+            "bbox_pixels": pixels,
+            "semantic_request": {
+                "role": value["role"],
+                "claim": value["claim"],
+                "max_reuse": value["max_reuse"],
+            },
+        }
+        receipt["receipt_sha256"] = _canonical_hash(receipt)
+        atomic_write_json(staged_receipt, receipt)
+        if fail_at == "after_staged_receipt_write":
+            raise SimulatedCrash("after staged crop receipt write")
+        try:
+            promoted = _promote_crop_pair(
+                run,
+                state,
+                stage,
+                asset_path,
+                receipt_path,
+                fail_at=fail_at,
+            )
+        except SimulatedCrash:
+            raise
+        except Exception:
+            if asset_path.exists() and not receipt_path.exists():
+                asset_path.unlink()
+            if receipt_path.exists() and not asset_path.exists():
+                receipt_path.unlink()
+            if stage.exists() and not stage.is_symlink():
+                shutil.rmtree(stage)
+            raise
+        return _crop_result(promoted)
+
+
+def crop_source_from_file(
+    run_dir: Path | str,
+    request_path: Path | str,
+    *,
+    fail_at: str | None = None,
+) -> dict[str, Any]:
+    """Validate canonical request-file bytes before Mapping-level dispatch."""
+
+    if inspect_run_format(run_dir) != AGENT_FIRST_RUN_FORMAT_VERSION:
+        raise StateError("version-1 runs do not support Agent-first source APIs")
+    path = Path(request_path).absolute()
+    if path.is_symlink() or not path.is_file() or path.stat().st_nlink != 1:
+        raise PathSafetyError(f"crop request must be a regular file: {path}")
+    request = _read_json(path)
+    if path.read_bytes() != _stored_json_bytes(request):
+        raise ContractError("crop request file must contain canonical JSON bytes")
+    return crop_source(run_dir, request, fail_at=fail_at)
+
+
+def _load_derived_source_assets(
+    run: Path, state: Mapping[str, Any]
+) -> list[dict[str, Any]]:
+    assets_root = run / "source-assets" / "files"
+    receipts_root = run / "source-assets" / "receipts"
+    receipts: list[dict[str, Any]] = []
+    for receipt_path in sorted(receipts_root.iterdir()):
+        if re.fullmatch(r"src-[0-9a-f]{24}\.json", receipt_path.name) is None:
+            raise IntegrityError(f"unexpected crop receipt registry entry: {receipt_path.name}")
+        asset_path = assets_root / f"{receipt_path.stem}.png"
+        receipts.append(
+            _read_crop_receipt(run, state, receipt_path, asset_path=asset_path)
+        )
+    expected_assets = {f"{receipt['asset_id']}.png" for receipt in receipts}
+    actual_assets = {path.name for path in assets_root.iterdir()}
+    if actual_assets != expected_assets:
+        raise IntegrityError("crop asset and receipt registries differ")
+    if any(
+        path.is_symlink() or not path.is_file() or path.stat().st_nlink != 1
+        for path in assets_root.iterdir()
+    ):
+        raise PathSafetyError("crop asset registry contains an unsafe entry")
+    return receipts
+
+
+def list_source_assets(run_dir: Path | str) -> dict[str, Any]:
+    """Separate untrusted extraction hints from unreviewed derived crops."""
+
+    run, state = _load_agent_first_run(run_dir)
+    manifest = _verify_source_contract(run, state)
+    hints: list[dict[str, Any]] = []
+    if manifest.get("status") == "ready" and manifest.get("source_type") == "pdf":
+        _pages, raw_hints = _load_v2_pdf_registries(run, manifest)
+        hints = [dict(hint) for hint in raw_hints]
+    derived = [
+        {
+            "asset_id": receipt["asset_id"],
+            "path": receipt["asset_path"],
+            "sha256": receipt["asset_sha256"],
+            "receipt_path": receipt["receipt_path"],
+            "receipt_sha256": receipt["receipt_sha256"],
+            "page": receipt["page"],
+            "bbox_normalized": receipt["bbox_normalized"],
+            "semantic_request": receipt["semantic_request"],
+            "trust": "agent_derived_unreviewed",
+            "eligible": False,
+        }
+        for receipt in _load_derived_source_assets(run, state)
+    ]
+    return {
+        "run_format_version": AGENT_FIRST_RUN_FORMAT_VERSION,
+        "extraction_hints": hints,
+        "derived_assets": derived,
+        "active_curation_revision": state.get("active_curation_revision"),
+    }
 
 
 def load_evidence(run_dir: Path | str) -> list[dict[str, Any]]:
@@ -1941,10 +3269,13 @@ def resume_run(run_dir: Path | str, *, skill_root: Path | str) -> dict[str, Any]
 
 
 __all__ = [
-    "ContractError", "IntegrityError", "MAIN_STATES", "PathSafetyError", "PortableError",
+    "AGENT_FIRST_RUN_FORMAT_VERSION", "ContractError", "IntegrityError", "MAIN_STATES",
+    "PathSafetyError", "PortableError", "RELEASED_RUN_FORMAT_VERSION",
     "SIDE_STATES", "SimulatedCrash", "StateError", "append_jsonl", "atomic_write_bytes",
     "atomic_write_json", "begin_attempt", "bind_host_vlm_visuals", "create_review_context",
-    "finalize_attempt", "initialize_run", "lexical_retrieve", "load_evidence", "mark_side_state",
+    "crop_source", "crop_source_from_file", "diagnose_v1_run", "finalize_attempt",
+    "initialize_run", "inspect_run_format", "inspect_source", "lexical_retrieve",
+    "list_source_assets", "load_evidence", "mark_side_state",
     "prepare_source", "record_deterministic_result", "record_semantic_review", "redact_secrets",
     "resume_run", "safe_path", "save_plan", "sha256_bytes", "sha256_file", "transition_state",
     "tree_hash", "validate_grounding", "validate_visual_plan", "verify_skill_snapshot",
