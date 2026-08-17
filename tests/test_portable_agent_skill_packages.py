@@ -36,6 +36,65 @@ def _frontmatter(skill_file: Path) -> dict[str, str]:
 
 
 class PortableAgentSkillPackageTests(unittest.TestCase):
+    def test_news_links_directly_to_agent_skills_readme(self) -> None:
+        root_documentation = ROOT_README.read_text(encoding="utf-8")
+        launch_rows = [
+            line
+            for line in root_documentation.splitlines()
+            if "**2026-08-17**" in line
+        ]
+
+        self.assertEqual(len(launch_rows), 1)
+        self.assertIn("./agent_skills/README.md", launch_rows[0])
+        self.assertNotIn("/pull/", launch_rows[0])
+        self.assertIn(
+            "| **2026-08-15** | [Added official DeepSeek Harness support for "
+            "coding agents](https://github.com/Yaxin9Luo/AutoDesign/pull/2) |",
+            root_documentation,
+        )
+        self.assertIn(
+            "| **2026-08-14** | [Initial public release]"
+            "(https://github.com/Yaxin9Luo/AutoDesign/commit/"
+            "55586f66fa4a126997f0d252e070701c4ae68920) |",
+            root_documentation,
+        )
+
+    def test_launch_guide_is_installable_and_honest(self) -> None:
+        skills_documentation = SKILLS_README.read_text(encoding="utf-8")
+
+        for name in APPROVED_SKILLS:
+            with self.subTest(skill=name):
+                self.assertIn(name, skills_documentation)
+                self.assertIn(
+                    f"agent_skills/{name} --agent codex --scope user",
+                    skills_documentation,
+                )
+        for heading in (
+            "## Quick install",
+            "## Install by Coding Agent",
+            "## First run",
+            "## Requirements",
+            "## Skills vs. the full AutoDesign Harness",
+            "## Roadmap and contributing",
+            "## Maintainer verification",
+        ):
+            self.assertIn(heading, skills_documentation)
+        for marker in (
+            "gh skill install",
+            "--agent claude-code --scope user",
+            '--dir "$HOME/.dsh/skills"',
+            "package_agent_skills.py install",
+            "70–80%",
+            "future target",
+            "does not replace",
+            "Contributing",
+            "https://developers.openai.com/codex/skills",
+            "https://code.claude.com/docs/en/skills",
+            "https://github.com/deepseek-ai/deepseek-harness/blob/master/"
+            "docs/subsystems/skills.md",
+        ):
+            self.assertIn(marker, skills_documentation)
+
     def test_public_docs_cover_agent_discovery_interpreters_and_prerequisites(self) -> None:
         skills_documentation = SKILLS_README.read_text(encoding="utf-8")
         root_documentation = ROOT_README.read_text(encoding="utf-8")
