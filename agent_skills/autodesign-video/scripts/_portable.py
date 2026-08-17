@@ -1396,6 +1396,7 @@ def _load_plan_revision(
     revision: int,
     *,
     directory: Path | None = None,
+    require_catalog_lineage: bool = True,
 ) -> dict[str, dict[str, Any]]:
     root = directory or (run / "plans" / f"{revision:03d}")
     files, directories = _regular_tree_inventory(root)
@@ -1451,7 +1452,11 @@ def _load_plan_revision(
         or catalog_revision < 1
     ):
         raise IntegrityError("plan revision catalog binding is invalid")
-    curation = _load_curation_revision(run, catalog_revision)
+    curation = _load_curation_revision(
+        run,
+        catalog_revision,
+        require_committed_lineage=require_catalog_lineage,
+    )
     if curation["manifest.json"]["catalog_sha256"] != manifest["catalog_sha256"]:
         raise IntegrityError("plan revision catalog hash binding is stale")
     try:
@@ -1518,6 +1523,75 @@ def _ensure_bound_event(
         run, expected, identity_fields=identity_fields
     ):
         append_jsonl(run / "events.jsonl", dict(expected))
+
+
+def _event_log_bytes_match_binding(
+    data: bytes, binding: Mapping[str, Any]
+) -> bool:
+    if set(binding) != {"path", "sha256", "size", "entry_count"} or binding.get(
+        "path"
+    ) != "events.jsonl":
+        return False
+    size = binding.get("size")
+    entry_count = binding.get("entry_count")
+    if (
+        not isinstance(size, int)
+        or isinstance(size, bool)
+        or size < 0
+        or not isinstance(entry_count, int)
+        or isinstance(entry_count, bool)
+        or entry_count < 0
+        or len(data) < size
+    ):
+        return False
+    prefix = data[:size]
+    return (
+        sha256_bytes(prefix) == binding.get("sha256")
+        and (not prefix or prefix.endswith(b"\n"))
+        and len(prefix.splitlines()) == entry_count
+    )
+
+
+def _recover_bound_event_in_order(
+    run: Path,
+    expected: Mapping[str, Any],
+    *,
+    identity_fields: Sequence[str],
+    parent_bindings: Sequence[Mapping[str, Any]],
+) -> None:
+    if _bound_event_present(
+        run, expected, identity_fields=identity_fields
+    ):
+        return
+    _canonical_jsonl_binding(run, "events.jsonl")
+    events = _read_event_log(run / "events.jsonl")
+    current_bytes = b"".join(_canonical_json_bytes(event) for event in events)
+    invalid_bindings = [
+        binding
+        for binding in parent_bindings
+        if not _event_log_bytes_match_binding(current_bytes, binding)
+    ]
+    if not invalid_bindings:
+        append_jsonl(run / "events.jsonl", dict(expected))
+        return
+    candidates: list[bytes] = []
+    for index in range(len(events) + 1):
+        candidate_events = [
+            *events[:index],
+            dict(expected),
+            *events[index:],
+        ]
+        candidate_bytes = b"".join(
+            _canonical_json_bytes(event) for event in candidate_events
+        )
+        if all(
+            _event_log_bytes_match_binding(candidate_bytes, binding)
+            for binding in invalid_bindings
+        ):
+            candidates.append(candidate_bytes)
+    if len(candidates) != 1:
+        raise IntegrityError("bound event recovery order is ambiguous")
+    atomic_write_bytes(run / "events.jsonl", candidates[0])
 
 
 def _plan_event_present(run: Path, manifest: Mapping[str, Any]) -> bool:
@@ -1770,7 +1844,12 @@ def _ledger_prefix_matches(run: Path, binding: Mapping[str, Any]) -> bool:
     )
 
 
-def _validate_attempt_context(run: Path, attempt_id: str) -> dict[str, Any]:
+def _validate_attempt_context(
+    run: Path,
+    attempt_id: str,
+    *,
+    require_revision_lineage: bool = True,
+) -> dict[str, Any]:
     attempt = safe_path(run / "attempts", attempt_id, must_exist=True)
     context_path = attempt / "attempt-context.json"
     catalog_path = attempt / "catalog-snapshot.json"
@@ -1818,8 +1897,16 @@ def _validate_attempt_context(run: Path, attempt_id: str) -> dict[str, Any]:
         or isinstance(plan_revision, bool)
     ):
         raise IntegrityError("attempt context revision numbers are invalid")
-    curation = _load_curation_revision(run, catalog_revision)
-    plan_values = _load_plan_revision(run, plan_revision)
+    curation = _load_curation_revision(
+        run,
+        catalog_revision,
+        require_committed_lineage=require_revision_lineage,
+    )
+    plan_values = _load_plan_revision(
+        run,
+        plan_revision,
+        require_catalog_lineage=require_revision_lineage,
+    )
     manifest = plan_values["manifest.json"]
     if (
         catalog != curation["catalog.json"]
@@ -7274,6 +7361,139 @@ def _resume_run_v1(run_dir: Path | str, *, skill_root: Path | str) -> dict[str, 
     raise IntegrityError(f"unknown run state: {current}")
 
 
+def _committed_curation_event_log_bindings(
+    run: Path, state: Mapping[str, Any]
+) -> list[dict[str, Any]]:
+    active = state.get("active_curation_revision")
+    active_hash = state.get("active_curation_sha256")
+    if active is None:
+        if active_hash is not None:
+            raise IntegrityError("active curation pointer is incomplete")
+        return []
+    if (
+        not isinstance(active, int)
+        or isinstance(active, bool)
+        or active < 1
+        or not isinstance(active_hash, str)
+    ):
+        raise IntegrityError("active curation pointer is invalid")
+    bindings: list[dict[str, Any]] = []
+    previous_revision: int | None = None
+    previous_hash: str | None = None
+    for revision in range(1, active + 1):
+        if not (run / "curations" / f"{revision:03d}").is_dir():
+            raise IntegrityError("committed curation ancestry is not contiguous")
+        values = _load_curation_revision(
+            run,
+            revision,
+            require_committed_lineage=False,
+        )
+        manifest = values["manifest.json"]
+        if (
+            manifest["parent_revision"] != previous_revision
+            or manifest["parent_catalog_sha256"] != previous_hash
+        ):
+            raise IntegrityError("committed curation ancestry is not contiguous")
+        context = _load_source_review_context(
+            run, state, manifest["source_review_context_path"]
+        )
+        binding = context["event_log_parent"]
+        if not isinstance(binding, Mapping):
+            raise IntegrityError("source review event log binding is invalid")
+        bindings.append(dict(binding))
+        previous_revision = revision
+        previous_hash = manifest["catalog_sha256"]
+    if previous_hash != active_hash:
+        raise IntegrityError("active curation hash pointer is stale")
+    return bindings
+
+
+def _recover_prerequisite_bound_events(run: Path) -> None:
+    state = _read_json(run / "run.json")
+    parent_bindings = _committed_curation_event_log_bindings(run, state)
+
+    active_plan = state.get("active_plan_revision")
+    active_plan_hash = state.get("active_plan_sha256")
+    if active_plan is None:
+        if active_plan_hash is not None:
+            raise IntegrityError("active plan pointer is incomplete")
+    elif (
+        not isinstance(active_plan, int)
+        or isinstance(active_plan, bool)
+        or active_plan < 1
+        or not isinstance(active_plan_hash, str)
+    ):
+        raise IntegrityError("active plan pointer is invalid")
+    else:
+        previous_revision: int | None = None
+        previous_hash: str | None = None
+        for revision in range(1, active_plan + 1):
+            if not (run / "plans" / f"{revision:03d}").is_dir():
+                raise IntegrityError("committed plan ancestry is not contiguous")
+            values = _load_plan_revision(
+                run,
+                revision,
+                require_catalog_lineage=False,
+            )
+            manifest = values["manifest.json"]
+            if (
+                manifest["parent_revision"] != previous_revision
+                or manifest["parent_plan_sha256"] != previous_hash
+            ):
+                raise IntegrityError("committed plan ancestry is not contiguous")
+            _recover_bound_event_in_order(
+                run,
+                _plan_event(run, manifest),
+                identity_fields=("operation_id", "revision"),
+                parent_bindings=parent_bindings,
+            )
+            previous_revision = revision
+            previous_hash = manifest["plan_sha256"]
+        if previous_hash != active_plan_hash:
+            raise IntegrityError("active plan hash pointer is stale")
+
+    attempt_count = state.get("attempt_count")
+    if (
+        not isinstance(attempt_count, int)
+        or isinstance(attempt_count, bool)
+        or attempt_count < 0
+    ):
+        raise IntegrityError("attempt count is invalid")
+    previous_attempt: str | None = None
+    for number in range(1, attempt_count + 1):
+        attempt_id = f"{number:02d}"
+        if not (run / "attempts" / attempt_id).is_dir():
+            raise IntegrityError("committed attempt ancestry is not contiguous")
+        context = _validate_attempt_context(
+            run,
+            attempt_id,
+            require_revision_lineage=False,
+        )
+        if context["parent_attempt"] != previous_attempt:
+            raise IntegrityError("committed attempt ancestry is not contiguous")
+        _recover_bound_event_in_order(
+            run,
+            _attempt_started_event(context),
+            identity_fields=("operation_id", "attempt_id"),
+            parent_bindings=parent_bindings,
+        )
+        previous_attempt = attempt_id
+
+    for entry in _load_supersession_entries(run):
+        event = {
+            "event": "curation_reopened",
+            "operation_id": entry["operation_id"],
+            "attempt_id": entry["attempt_id"],
+            "repair_route": entry["repair_route"],
+        }
+        _recover_bound_event_in_order(
+            run,
+            event,
+            identity_fields=("operation_id", "attempt_id"),
+            parent_bindings=parent_bindings,
+        )
+
+
 def _recover_curation_transactions(run: Path) -> None:
     state = _read_json(run / "run.json")
     _revisions, stages = _curation_registry(
@@ -7623,6 +7843,7 @@ def _recover_reopen_transaction(run: Path) -> None:
 
 
 def _recover_v2_task4_transactions(run: Path) -> None:
+    _recover_prerequisite_bound_events(run)
     _recover_curation_transactions(run)
     _recover_plan_transactions(run)
     _recover_attempt_transactions(run)

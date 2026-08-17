@@ -520,7 +520,36 @@ elif name == "pdfimages":
             run,
             self._poster_plan(revised_assets, title="Reingested ancestry fixture"),
         )
-        self.assertEqual(core.begin_attempt(run), "02")
+        second = core.begin_attempt(run)
+        self.assertEqual(second, "02")
+        core.write_source_map(
+            run,
+            second,
+            [
+                {
+                    "id": "claim-method",
+                    "text": "Central method.",
+                    "source_ids": ["ev-001"],
+                }
+            ],
+        )
+        second_root = run / "attempts" / second
+        core.atomic_write_bytes(
+            second_root / "artifact" / "poster.html",
+            b"<main>Central method.</main>\n",
+        )
+        core.atomic_write_bytes(
+            second_root / "qa" / "previews" / "poster.png",
+            b"preview",
+        )
+        core.record_deterministic_result(
+            run,
+            second,
+            passed=True,
+            checks=[{"id": "poster_contract", "passed": True}],
+            artifact_paths=["artifact/poster.html"],
+            preview_paths={"poster": "qa/previews/poster.png"},
+        )
         return run
 
     def _run_events(self, run: Path) -> list[dict[str, object]]:
@@ -587,8 +616,8 @@ elif name == "pdfimages":
             return {
                 "event": "curation_reopened",
                 "operation_id": entry["operation_id"],
-                "attempt_id": "01",
-                "repair_route": "content_replan",
+                "attempt_id": entry["attempt_id"],
+                "repair_route": entry["repair_route"],
             }
         self.fail(f"unknown event family: {family}")
 
@@ -1296,6 +1325,32 @@ elif name == "pdfimages":
                 self._write_run_events(run, events)
 
                 status = core.resume_run(run, skill_root=self.skill)
+
+                self.assertEqual(status["next_action"], "semantic_review")
+                self.assertEqual(self._run_events(run).count(expected), 1)
+
+    def test_source_reingest_resume_restores_prerequisite_historical_events_in_order(
+        self,
+    ) -> None:
+        for family in ("plan01", "attempt01", "reopen"):
+            with self.subTest(family=family):
+                run = self._two_attempt_source_reingest_fixture(
+                    f"source-reingest-event-order-{family}"
+                )
+                expected = self._bound_event(run, family)
+                events = self._run_events(run)
+                self.assertEqual(events.count(expected), 1)
+                events.remove(expected)
+                self._write_run_events(run, events)
+
+                failure = None
+                try:
+                    status = core.resume_run(run, skill_root=self.skill)
+                except core.IntegrityError as error:
+                    failure = error
+                if failure is not None:
+                    self.assertEqual(self._run_events(run).count(expected), 0)
+                    raise failure
 
                 self.assertEqual(status["next_action"], "semantic_review")
                 self.assertEqual(self._run_events(run).count(expected), 1)
