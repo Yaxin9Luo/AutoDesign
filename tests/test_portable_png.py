@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import struct
+import tracemalloc
 import unittest
 import zlib
 from pathlib import Path
@@ -65,19 +66,46 @@ def _filtered_rows(rows: tuple[bytes, ...], filter_type: int, bytes_per_pixel: i
 
 
 def _output_pixels(data: bytes) -> tuple[dict[str, int], bytes]:
+    if not data.startswith(PNG_SIGNATURE):
+        raise AssertionError("invalid PNG signature")
     position = len(PNG_SIGNATURE)
     chunks: list[tuple[bytes, bytes]] = []
     while position < len(data):
+        if len(data) - position < 12:
+            raise AssertionError("truncated PNG chunk")
         length = struct.unpack(">I", data[position : position + 4])[0]
         kind = data[position + 4 : position + 8]
-        payload = data[position + 8 : position + 8 + length]
+        payload_end = position + 8 + length
+        chunk_end = payload_end + 4
+        if chunk_end > len(data):
+            raise AssertionError("truncated PNG chunk")
+        payload = data[position + 8 : payload_end]
+        crc = struct.unpack(">I", data[payload_end:chunk_end])[0]
+        if crc != zlib.crc32(kind + payload) & 0xFFFFFFFF:
+            raise AssertionError("invalid PNG chunk CRC")
         chunks.append((kind, payload))
-        position += length + 12
+        position = chunk_end
+    if [kind for kind, _payload in chunks] != [b"IHDR", b"IDAT", b"IEND"]:
+        raise AssertionError("unexpected PNG chunk order")
+    if len(chunks[0][1]) != 13 or chunks[2][1]:
+        raise AssertionError("invalid PNG header or end chunk")
     header = struct.unpack(">IIBBBBB", chunks[0][1])
     width, height, bit_depth, color_type, _compression, _filtering, interlace = header
-    channels = {0: 1, 2: 3, 4: 2, 6: 4}[color_type]
+    if not width or not height or bit_depth != 8 or interlace != 0:
+        raise AssertionError("invalid PNG dimensions or layout")
+    if _compression != 0 or _filtering != 0:
+        raise AssertionError("invalid PNG methods")
+    channels_by_color_type = {0: 1, 2: 3, 4: 2, 6: 4}
+    if color_type not in channels_by_color_type:
+        raise AssertionError("unsupported PNG color type")
+    channels = channels_by_color_type[color_type]
     row_bytes = width * channels
-    raw = zlib.decompress(b"".join(payload for kind, payload in chunks if kind == b"IDAT"))
+    decompressor = zlib.decompressobj()
+    raw = decompressor.decompress(chunks[1][1])
+    if not decompressor.eof or decompressor.unused_data or decompressor.unconsumed_tail:
+        raise AssertionError("invalid PNG IDAT stream")
+    if len(raw) != height * (row_bytes + 1):
+        raise AssertionError("invalid PNG IDAT length")
     pixels = bytearray()
     for offset in range(0, len(raw), row_bytes + 1):
         assert raw[offset] == 0
@@ -151,6 +179,32 @@ class PortablePngTests(unittest.TestCase):
             fixture = PNG_SIGNATURE + _chunk(b"IHDR", header) + _chunk(b"IDAT", zlib.compress(raw) + b"junk") + _chunk(b"IEND", b"")
             with self.assertRaises(portable_png.PNGError):
                 portable_png.inspect_png(fixture)
+
+    def test_rejects_expansion_bomb_without_large_output_allocation(self) -> None:
+        header = struct.pack(">IIBBBBB", 1, 1, 8, 6, 0, 0, 0)
+        fixture = (
+            PNG_SIGNATURE
+            + _chunk(b"IHDR", header)
+            + _chunk(b"IDAT", zlib.compress(b"\x00" * 4_000_000, level=9))
+            + _chunk(b"IEND", b"")
+        )
+        tracemalloc.start()
+        try:
+            with self.assertRaises(portable_png.PNGError):
+                portable_png.inspect_png(fixture)
+            _current, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertLess(peak, 1_000_000)
+
+    def test_independent_output_reader_rejects_invalid_crc(self) -> None:
+        valid = portable_png.crop_png(
+            _png(_filtered_rows((bytes(range(16)),) * 3, 0, 4)), (1, 0, 4, 2)
+        )
+        corrupted = bytearray(valid)
+        corrupted[-5] ^= 1
+        with self.assertRaises(AssertionError):
+            _output_pixels(bytes(corrupted))
 
     def test_rejects_unsupported_png_layouts_and_invalid_filter(self) -> None:
         cases = (

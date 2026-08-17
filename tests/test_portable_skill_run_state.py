@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -20,6 +21,55 @@ SKILLS = (
     "autodesign-webpage",
     "autodesign-video",
 )
+
+
+def _seed_sync_fixture(root: Path) -> None:
+    shared = root / "_shared"
+    shared.mkdir(parents=True)
+    sources = {
+        "portable_core.py": b"canonical-core",
+        "source-grounding.md": b"canonical-grounding",
+        "browser_worker.py": b"canonical-browser-worker",
+        "setup_browser.py": b"canonical-browser-setup",
+        "requirements-browser.lock": b"canonical-browser-lock",
+        "portable_png.py": b"canonical-png",
+    }
+    for name, data in sources.items():
+        (shared / name).write_bytes(data)
+    for skill in SKILLS:
+        package = root / skill
+        (package / "scripts").mkdir(parents=True)
+        (package / "references").mkdir()
+        (package / "scripts" / "_portable.py").write_bytes(sources["portable_core.py"])
+        (package / "scripts" / "browser_worker.py").write_bytes(sources["browser_worker.py"])
+        (package / "scripts" / "setup_browser.py").write_bytes(sources["setup_browser.py"])
+        (package / "scripts" / "requirements-browser.lock").write_bytes(
+            sources["requirements-browser.lock"]
+        )
+        (package / "references" / "source-grounding.md").write_bytes(
+            sources["source-grounding.md"]
+        )
+    (root / "autodesign-poster" / "scripts" / "portable_png.py").write_bytes(
+        sources["portable_png.py"]
+    )
+
+
+def _tree_snapshot(root: Path) -> dict[str, tuple[int, int, bytes | str | None]]:
+    snapshot: dict[str, tuple[int, int, bytes | str | None]] = {}
+    for path in sorted(root.rglob("*")):
+        details = path.lstat()
+        if stat.S_ISREG(details.st_mode):
+            content: bytes | str | None = path.read_bytes()
+        elif stat.S_ISLNK(details.st_mode):
+            content = os.readlink(path)
+        else:
+            content = None
+        snapshot[path.relative_to(root).as_posix()] = (
+            stat.S_IFMT(details.st_mode),
+            details.st_nlink,
+            content,
+        )
+    return snapshot
 
 
 class PortableSkillRunStateTests(unittest.TestCase):
@@ -1996,21 +2046,7 @@ elif name == "pdfimages":
 
     def test_sync_check_reports_drift_without_mutating_target(self) -> None:
         root = self.root / "agent_skills"
-        shared = root / "_shared"
-        shared.mkdir(parents=True)
-        (shared / "portable_core.py").write_bytes(b"canonical-core")
-        (shared / "source-grounding.md").write_bytes(b"canonical-grounding")
-        (shared / "browser_worker.py").write_bytes(b"canonical-browser-worker")
-        (shared / "setup_browser.py").write_bytes(b"canonical-browser-setup")
-        (shared / "requirements-browser.lock").write_bytes(b"canonical-browser-lock")
-        (shared / "portable_png.py").write_bytes(b"canonical-png")
-        for skill in SKILLS:
-            (root / skill / "scripts").mkdir(parents=True)
-            (root / skill / "references").mkdir()
-            (root / skill / "scripts" / "_portable.py").write_bytes(b"drifted-core")
-            (root / skill / "references" / "source-grounding.md").write_bytes(
-                b"canonical-grounding"
-            )
+        _seed_sync_fixture(root)
         target = root / "autodesign-poster" / "scripts" / "portable_png.py"
         target.write_bytes(b"drifted-png")
         before = target.read_bytes()
@@ -2028,10 +2064,70 @@ elif name == "pdfimages":
             check=False,
         )
         self.assertEqual(completed.returncode, 1)
-        self.assertIn("DRIFT:", completed.stdout)
+        self.assertEqual(
+            completed.stdout,
+            "DRIFT: autodesign-poster/scripts/portable_png.py\n",
+        )
         self.assertEqual(target.read_bytes(), before)
         for skill_name in ("autodesign-ppt", "autodesign-webpage", "autodesign-video"):
             self.assertFalse((root / skill_name / "scripts" / "portable_png.py").exists())
+
+    def test_sync_rejects_hardlinked_canonical_sources_and_targets(self) -> None:
+        for case in ("source", "target"):
+            with self.subTest(case=case):
+                root = self.root / f"sync-hardlink-{case}"
+                _seed_sync_fixture(root)
+                outside = self.root / f"outside-hardlink-{case}"
+                if case == "source":
+                    source = root / "_shared" / "portable_png.py"
+                    outside.write_bytes(source.read_bytes())
+                    source.unlink()
+                    os.link(outside, source)
+                else:
+                    target = root / "autodesign-poster" / "scripts" / "portable_png.py"
+                    outside.write_bytes(target.read_bytes())
+                    target.unlink()
+                    os.link(outside, target)
+                completed = subprocess.run(
+                    [
+                        sys.executable,
+                        str(REPO_ROOT / "scripts" / "sync_agent_skill_core.py"),
+                        "--root",
+                        str(root),
+                    ],
+                    cwd=REPO_ROOT,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertIn("hardlink", completed.stdout + completed.stderr)
+
+    def test_sync_preflight_rejects_late_unsafe_target_without_any_mutation(self) -> None:
+        root = self.root / "sync-preflight"
+        _seed_sync_fixture(root)
+        (root / "autodesign-poster" / "scripts" / "_portable.py").write_bytes(b"drifted")
+        unsafe_target = root / "autodesign-video" / "scripts" / "_portable.py"
+        outside = self.root / "outside-preflight"
+        outside.write_bytes(b"outside")
+        unsafe_target.unlink()
+        unsafe_target.symlink_to(outside)
+        before = _tree_snapshot(root)
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(REPO_ROOT / "scripts" / "sync_agent_skill_core.py"),
+                "--root",
+                str(root),
+            ],
+            cwd=REPO_ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("symlink", completed.stdout + completed.stderr)
+        self.assertEqual(_tree_snapshot(root), before)
 
     def test_sync_rejects_symlinked_packages_directories_and_targets(self) -> None:
         cases = ("package", "scripts", "references", "target")

@@ -110,7 +110,6 @@ def _parse_png(data: bytes) -> tuple[dict[str, int], bytes]:
     decompressor = zlib.decompressobj()
     try:
         raw = decompressor.decompress(b"".join(idat_parts), expected_length + 1)
-        raw += decompressor.flush()
     except zlib.error as error:
         raise PNGError("invalid PNG IDAT stream") from error
     if (

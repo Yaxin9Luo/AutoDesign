@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import stat
 import sys
 import tempfile
 from pathlib import Path
@@ -35,6 +36,34 @@ def _atomic_copy(source: Path, target: Path) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def _canonical_source_bytes(source: Path) -> bytes:
+    try:
+        details = source.lstat()
+    except FileNotFoundError as error:
+        raise FileNotFoundError(f"missing canonical source: {source}") from error
+    if stat.S_ISLNK(details.st_mode):
+        raise ValueError(f"canonical source must not be a symlink: {source}")
+    if not stat.S_ISREG(details.st_mode):
+        raise ValueError(f"canonical source must be a regular file: {source}")
+    if details.st_nlink != 1:
+        raise ValueError(f"canonical source must not be a hardlink: {source}")
+    return source.read_bytes()
+
+
+def _target_bytes(target: Path) -> bytes | None:
+    try:
+        details = target.lstat()
+    except FileNotFoundError:
+        return None
+    if stat.S_ISLNK(details.st_mode):
+        raise ValueError(f"vendored target must not be a symlink: {target}")
+    if not stat.S_ISREG(details.st_mode):
+        raise ValueError(f"vendored target must be a regular file: {target}")
+    if details.st_nlink != 1:
+        raise ValueError(f"vendored target must not be a hardlink: {target}")
+    return target.read_bytes()
+
+
 def sync(root: Path, *, check: bool = False) -> list[str]:
     if root.is_symlink() or not root.is_dir():
         raise ValueError(f"Agent Skills root must be a regular directory, not a symlink: {root}")
@@ -56,12 +85,11 @@ def sync(root: Path, *, check: bool = False) -> list[str]:
         Path("scripts/requirements-browser.lock"): shared / "requirements-browser.lock",
     }
     sources.update(browser_sources)
-    for source in (*sources.values(), *(source for entries in skill_specific_sources.values() for source in entries.values())):
-        if source.is_symlink():
-            raise ValueError(f"canonical source must not be a symlink: {source}")
-        if not source.is_file():
-            raise FileNotFoundError(f"missing canonical source: {source}")
-    drift: list[str] = []
+    source_bytes = {
+        source: _canonical_source_bytes(source)
+        for source in (*sources.values(), *(source for entries in skill_specific_sources.values() for source in entries.values()))
+    }
+    manifest: list[tuple[Path, Path, bytes | None]] = []
     for skill_name in SKILL_NAMES:
         package = root / skill_name
         if package.is_symlink():
@@ -78,12 +106,16 @@ def sync(root: Path, *, check: bool = False) -> list[str]:
         package_sources.update(skill_specific_sources.get(skill_name, {}))
         for relative, source in package_sources.items():
             target = package / relative
-            if target.is_symlink():
-                raise ValueError(f"vendored target must not be a symlink: {target}")
-            if not target.is_file() or target.read_bytes() != source.read_bytes():
-                drift.append(target.relative_to(root).as_posix())
-                if not check:
-                    _atomic_copy(source, target)
+            manifest.append((target, source, _target_bytes(target)))
+    drift = [
+        target.relative_to(root).as_posix()
+        for target, source, target_bytes in manifest
+        if target_bytes != source_bytes[source]
+    ]
+    if not check:
+        for target, source, target_bytes in manifest:
+            if target_bytes != source_bytes[source]:
+                _atomic_copy(source, target)
     return drift
 
 
