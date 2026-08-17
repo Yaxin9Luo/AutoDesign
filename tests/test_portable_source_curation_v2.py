@@ -160,6 +160,667 @@ elif name == "pdfimages":
         request.update(updates)
         return request
 
+    def _review_fixture(
+        self,
+        context: dict[str, object],
+        **updates: object,
+    ) -> dict[str, object]:
+        review: dict[str, object] = {
+            "run_format_version": 2,
+            "source_review_context_sha256": context["context_sha256"],
+            "reviewer_kind": "fresh_subagent",
+            "dimension_scores": {
+                "importance": 4,
+                "crop_completeness": 4,
+                "caption_claim_match": 4,
+                "label_axis_legend_readability": 4,
+                "duplicate_or_ornamental_content": 4,
+                "method_result_coverage": 4,
+                "poster_area_fit": 4,
+            },
+            "asset_findings": [],
+            "coverage_findings": [],
+            "blockers": [],
+            "localized_repairs": [],
+            "verdict": "pass",
+            "complete": True,
+        }
+        review.update(updates)
+        return review
+
+    def _review_source_fixture(
+        self,
+        name: str,
+    ) -> tuple[Path, dict[str, object], dict[str, object]]:
+        run, inspection = self._prepare_pdf_run(name)
+        pages = inspection["pages"]
+        assert isinstance(pages, list)
+        method = core.crop_source(run, self._crop_request(inspection))
+        result = core.crop_source(
+            run,
+            self._crop_request(
+                inspection,
+                page=2,
+                page_sha256=pages[1]["sha256"],
+                bbox_normalized=[0.0, 0.0, 1.0, 1.0],
+                role="result",
+                claim="The primary result appears on the second page.",
+            ),
+        )
+        selection: dict[str, object] = {
+            "run_format_version": 2,
+            "assets": [
+                {
+                    "asset_id": method["asset_id"],
+                    "roles": ["method-overview"],
+                    "max_reuse": 1,
+                    "importance": "essential",
+                },
+                {
+                    "asset_id": result["asset_id"],
+                    "roles": ["novel-result-emphasis"],
+                    "max_reuse": 99,
+                    "importance": "supporting",
+                },
+            ],
+            "source_story": {
+                "central_method": {
+                    "status": "covered",
+                    "asset_ids": [method["asset_id"]],
+                    "evidence_ids": ["ev-001"],
+                    "rationale": "The complete framework crop explains the central method.",
+                },
+                "primary_result": {
+                    "status": "covered",
+                    "asset_ids": [result["asset_id"]],
+                    "evidence_ids": ["ev-002"],
+                    "rationale": "The second-page crop contains the primary result.",
+                },
+            },
+        }
+        return run, selection, {"method": method, "result": result}
+
+    def _canonical_digest(self, value: object) -> str:
+        encoded = (
+            json.dumps(
+                value,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+            + "\n"
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def test_source_review_context_binds_the_complete_selected_source_set(self) -> None:
+        run, selection, crops = self._review_source_fixture("review-context")
+
+        first = core.create_source_review_context(run, selection)
+        second = core.create_source_review_context(run, selection)
+
+        self.assertRegex(
+            first["context_path"],
+            r"^source-reviews/review-[0-9a-f]{12}-001/context\.json$",
+        )
+        self.assertEqual(
+            second["context_path"],
+            first["context_path"].replace("-001/context.json", "-002/context.json"),
+        )
+        context_path = run / str(first["context_path"])
+        context = json.loads(context_path.read_text(encoding="utf-8"))
+        payload = dict(context)
+        context_sha256 = payload.pop("context_sha256")
+        self.assertEqual(context_sha256, self._canonical_digest(payload))
+        self.assertEqual(first, context)
+        self.assertEqual(context["selection"], selection)
+        self.assertEqual(
+            context["source_manifest"],
+            {
+                "path": "evidence/source_manifest.json",
+                "sha256": core.sha256_file(run / "evidence" / "source_manifest.json"),
+            },
+        )
+        self.assertEqual(
+            context["page_manifest"],
+            {
+                "path": "evidence/page-manifest.json",
+                "sha256": core.sha256_file(run / "evidence" / "page-manifest.json"),
+            },
+        )
+        self.assertEqual(context["current_catalog_parent"], {"revision": None, "sha256": None})
+        self.assertEqual(context["evidence_ids"], ["ev-001", "ev-002"])
+        self.assertEqual(
+            context["rubric"]["dimensions"],
+            [
+                "importance",
+                "crop_completeness",
+                "caption_claim_match",
+                "label_axis_legend_readability",
+                "duplicate_or_ornamental_content",
+                "method_result_coverage",
+                "poster_area_fit",
+            ],
+        )
+        bindings = {item["asset_id"]: item for item in context["asset_bindings"]}
+        self.assertEqual(set(bindings), {crops["method"]["asset_id"], crops["result"]["asset_id"]})
+        for crop in crops.values():
+            binding = bindings[crop["asset_id"]]
+            receipt_path = run / crop["receipt_path"]
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            self.assertEqual(binding["asset_sha256"], crop["asset_sha256"])
+            self.assertEqual(binding["receipt_sha256"], receipt["receipt_sha256"])
+            self.assertEqual(binding["receipt_file_sha256"], core.sha256_file(receipt_path))
+            preview_path = context_path.parent / binding["preview_path"]
+            self.assertEqual(preview_path.read_bytes(), (run / crop["asset_path"]).read_bytes())
+            self.assertEqual(binding["preview_sha256"], core.sha256_file(preview_path))
+        self.assertEqual(
+            sorted(path.relative_to(context_path.parent).as_posix() for path in context_path.parent.rglob("*") if path.is_file()),
+            [
+                "context.json",
+                f"previews/{crops['method']['asset_id']}.png",
+                f"previews/{crops['result']['asset_id']}.png",
+            ],
+        )
+
+    def test_source_review_context_rejects_invalid_or_stale_selection_without_writes(self) -> None:
+        run, selection, crops = self._review_source_fixture("review-context-reject")
+        invalid: list[dict[str, object]] = []
+
+        extra = json.loads(json.dumps(selection))
+        extra["unexpected"] = True
+        invalid.append(extra)
+        duplicate = json.loads(json.dumps(selection))
+        duplicate["assets"].append(duplicate["assets"][0])
+        invalid.append(duplicate)
+        unknown_asset = json.loads(json.dumps(selection))
+        unknown_asset["assets"][0]["asset_id"] = "src-000000000000000000000000"
+        invalid.append(unknown_asset)
+        unknown_evidence = json.loads(json.dumps(selection))
+        unknown_evidence["source_story"]["central_method"]["evidence_ids"] = ["claim-unknown"]
+        invalid.append(unknown_evidence)
+        invalid_role = json.loads(json.dumps(selection))
+        invalid_role["assets"][0]["roles"] = ["not canonical"]
+        invalid.append(invalid_role)
+        invalid_reuse = json.loads(json.dumps(selection))
+        invalid_reuse["assets"][0]["max_reuse"] = True
+        invalid.append(invalid_reuse)
+        invalid_importance = json.loads(json.dumps(selection))
+        invalid_importance["assets"][0]["importance"] = "decorative"
+        invalid.append(invalid_importance)
+        invalid_not_applicable = json.loads(json.dumps(selection))
+        invalid_not_applicable["source_story"]["primary_result"] = {
+            "status": "not_applicable",
+            "asset_ids": [],
+            "evidence_ids": [],
+            "rationale": "",
+        }
+        invalid.append(invalid_not_applicable)
+        invalid_covered = json.loads(json.dumps(selection))
+        invalid_covered["source_story"]["central_method"]["asset_ids"] = []
+        invalid.append(invalid_covered)
+
+        for index, candidate in enumerate(invalid):
+            with self.subTest(index=index):
+                before = _tree_snapshot(run)
+                with self.assertRaises((core.ContractError, core.IntegrityError)):
+                    core.create_source_review_context(run, candidate)
+                self.assertEqual(_tree_snapshot(run), before)
+
+        hint_selection = json.loads(json.dumps(selection))
+        hint_selection["assets"][0]["asset_id"] = "pdfimage-0001"
+        with self.assertRaises(core.ContractError):
+            core.create_source_review_context(run, hint_selection)
+
+        receipt_path = run / crops["method"]["receipt_path"]
+        tampered = json.loads(receipt_path.read_text(encoding="utf-8"))
+        tampered["semantic_request"]["role"] = "tampered"
+        core.atomic_write_json(receipt_path, tampered)
+        before = _tree_snapshot(run)
+        with self.assertRaises(core.IntegrityError):
+            core.create_source_review_context(run, selection)
+        self.assertEqual(_tree_snapshot(run), before)
+
+    def test_source_review_supports_source_grounded_no_visuals_without_a_quota(self) -> None:
+        run = self.root / "runs" / "review-no-visuals"
+        self._initialize(run, run_format_version=2)
+        source = self.root / "review-no-visuals.md"
+        source.write_text("# Conceptual paper\n\nNo figures are present.\n", encoding="utf-8")
+        core.prepare_source(run, source)
+        selection = {
+            "run_format_version": 2,
+            "assets": [],
+            "source_story": {
+                "central_method": {
+                    "status": "not_applicable",
+                    "asset_ids": [],
+                    "evidence_ids": ["ev-001"],
+                    "rationale": "The source describes a conceptual argument and contains no visual method.",
+                },
+                "primary_result": {
+                    "status": "not_applicable",
+                    "asset_ids": [],
+                    "evidence_ids": ["ev-001"],
+                    "rationale": "The source contains no visual quantitative result.",
+                },
+            },
+        }
+
+        context = core.create_source_review_context(run, selection)
+        result = core.record_source_review(run, context["context_path"], self._review_fixture(context))
+
+        self.assertEqual((result["verdict"], result["state"]), ("pass", "curated"))
+        catalog = json.loads((run / "curations" / "001" / "catalog.json").read_text(encoding="utf-8"))
+        self.assertEqual(catalog["assets"], [])
+        self.assertNotIn("visual_count", catalog)
+        self.assertNotIn("minimum_visuals", catalog)
+
+    def test_source_review_schema_is_exact_and_failures_remain_in_curation(self) -> None:
+        run, selection, crops = self._review_source_fixture("review-schema")
+        context = core.create_source_review_context(run, selection)
+        valid = self._review_fixture(context)
+        invalid: list[dict[str, object]] = []
+        extra = json.loads(json.dumps(valid))
+        extra["unexpected"] = True
+        invalid.append(extra)
+        reviewer = json.loads(json.dumps(valid))
+        reviewer["reviewer_kind"] = "author"
+        invalid.append(reviewer)
+        for score in (True, 4.0, float("nan"), 3, 6):
+            review = json.loads(json.dumps(valid))
+            review["dimension_scores"]["importance"] = score
+            invalid.append(review)
+        blocked_pass = json.loads(json.dumps(valid))
+        blocked_pass["blockers"] = [{"code": "unreadable", "finding": "The key crop is unreadable."}]
+        invalid.append(blocked_pass)
+        incomplete = json.loads(json.dumps(valid))
+        incomplete["complete"] = False
+        invalid.append(incomplete)
+        empty_fail = json.loads(json.dumps(valid))
+        empty_fail["verdict"] = "fail"
+        empty_fail["dimension_scores"]["crop_completeness"] = 2
+        invalid.append(empty_fail)
+
+        for index, review in enumerate(invalid):
+            with self.subTest(index=index):
+                before = _tree_snapshot(run)
+                with self.assertRaises(core.ContractError):
+                    core.record_source_review(run, context["context_path"], review)
+                self.assertEqual(_tree_snapshot(run), before)
+
+        failing_context = core.create_source_review_context(run, selection)
+        failing_review = self._review_fixture(
+            failing_context,
+            verdict="fail",
+            dimension_scores={
+                **valid["dimension_scores"],
+                "crop_completeness": 2,
+            },
+            asset_findings=[{
+                "asset_id": crops["method"]["asset_id"],
+                "dimension": "crop_completeness",
+                "finding": "The method label is cropped.",
+            }],
+            localized_repairs=[{
+                "target": f"asset:{crops['method']['asset_id']}",
+                "instruction": "Register a wider crop from the same page.",
+            }],
+        )
+        before_invalid_boundary = _tree_snapshot(run)
+        with self.assertRaises(core.ContractError):
+            core.record_source_review(
+                run,
+                failing_context["context_path"],
+                failing_review,
+                fail_at="after_review_staging_write",
+            )
+        self.assertEqual(_tree_snapshot(run), before_invalid_boundary)
+
+        result = core.record_source_review(
+            run, failing_context["context_path"], failing_review
+        )
+        self.assertEqual((result["verdict"], result["state"]), ("fail", "curating"))
+        self.assertEqual(list((run / "curations").iterdir()), [])
+        self.assertTrue((run / failing_context["context_path"]).parent.joinpath("review.json").is_file())
+        self.assertEqual(
+            sum(event.get("event") == "source_review_failed" for event in _events(run)),
+            1,
+        )
+
+    def test_passing_source_review_commits_one_immutable_catalog_with_cas(self) -> None:
+        run, selection, crops = self._review_source_fixture("review-pass")
+        accepted = core.create_source_review_context(run, selection)
+        stale = core.create_source_review_context(run, selection)
+        review = self._review_fixture(accepted, reviewer_kind="host_fresh_pass")
+
+        result = core.record_source_review(run, accepted["context_path"], review)
+        replay = core.record_source_review(run, accepted["context_path"], review)
+
+        self.assertEqual(replay, result)
+        revision = run / "curations" / "001"
+        self.assertEqual(
+            {path.name for path in revision.iterdir()},
+            {"catalog.json", "review.json", "manifest.json", "COMMIT.json"},
+        )
+        state = json.loads((run / "run.json").read_text(encoding="utf-8"))
+        catalog = json.loads((revision / "catalog.json").read_text(encoding="utf-8"))
+        self.assertEqual(
+            (state["state"], state["active_curation_revision"], state["active_curation_sha256"]),
+            ("curated", 1, core.sha256_file(revision / "catalog.json")),
+        )
+        self.assertEqual(catalog["parent"], {"revision": None, "sha256": None})
+        self.assertEqual(catalog["source_story"], selection["source_story"])
+        self.assertEqual({asset["asset_id"] for asset in catalog["assets"]}, {item["asset_id"] for item in crops.values()})
+        selected_by_id = {item["asset_id"]: item for item in selection["assets"]}
+        for asset in catalog["assets"]:
+            selected = selected_by_id[asset["asset_id"]]
+            receipt = json.loads((run / asset["receipt_path"]).read_text(encoding="utf-8"))
+            self.assertEqual(asset["trust"], "reviewed")
+            self.assertEqual(asset["receipt_sha256"], receipt["receipt_sha256"])
+            self.assertEqual(asset["roles"], selected["roles"])
+            self.assertEqual(asset["max_reuse"], selected["max_reuse"])
+            self.assertEqual(asset["importance"], selected["importance"])
+        self.assertEqual(
+            sum(event.get("event") == "source_review_passed" for event in _events(run)),
+            1,
+        )
+        with self.assertRaises((core.StateError, core.IntegrityError)):
+            core.record_source_review(run, stale["context_path"], self._review_fixture(stale))
+
+        exhausted_context = json.loads(json.dumps(accepted))
+        exhausted_context["current_catalog_parent"] = {
+            "revision": 999,
+            "sha256": "a" * 64,
+        }
+        with self.assertRaises(core.StateError):
+            core._curation_documents(exhausted_context, review)
+
+        before_tampered_retry = _tree_snapshot(run)
+        catalog["assets"][0]["trust"] = "tampered"
+        core.atomic_write_json(revision / "catalog.json", catalog)
+        after_tamper = _tree_snapshot(run)
+        with self.assertRaises(core.IntegrityError):
+            core.record_source_review(run, accepted["context_path"], review)
+        self.assertNotEqual(after_tamper, before_tampered_retry)
+        self.assertEqual(_tree_snapshot(run), after_tamper)
+
+    def test_source_review_rejects_context_asset_ledger_and_path_tamper(self) -> None:
+        run, selection, _crops = self._review_source_fixture("review-tamper")
+        context = core.create_source_review_context(run, selection)
+        review = self._review_fixture(context)
+        context_dir = (run / context["context_path"]).parent
+        outside = self.root / "outside-context.json"
+        outside.write_bytes((context_dir / "context.json").read_bytes())
+        with self.assertRaises(core.PathSafetyError):
+            core.record_source_review(run, outside, review)
+
+        preview = next((context_dir / "previews").iterdir())
+        preview.write_bytes(_png(1, 1, 123))
+        before = _tree_snapshot(run)
+        with self.assertRaises(core.IntegrityError):
+            core.record_source_review(run, context["context_path"], review)
+        self.assertEqual(_tree_snapshot(run), before)
+
+        run2, selection2, _ = self._review_source_fixture("review-event-tamper")
+        context2 = core.create_source_review_context(run2, selection2)
+        events = (run2 / "events.jsonl").read_bytes()
+        (run2 / "events.jsonl").write_bytes(events.replace(b"source_crop_registered", b"source_crop_rewritten", 1))
+        before2 = _tree_snapshot(run2)
+        with self.assertRaises(core.IntegrityError):
+            core.record_source_review(run2, context2["context_path"], self._review_fixture(context2))
+        self.assertEqual(_tree_snapshot(run2), before2)
+
+        run3, selection3, _ = self._review_source_fixture("review-ledger-tamper")
+        context3 = core.create_source_review_context(run3, selection3)
+        (run3 / "provenance" / "supersessions.jsonl").write_text("{}\n", encoding="utf-8")
+        before3 = _tree_snapshot(run3)
+        with self.assertRaises(core.IntegrityError):
+            core.record_source_review(run3, context3["context_path"], self._review_fixture(context3))
+        self.assertEqual(_tree_snapshot(run3), before3)
+
+    def test_source_review_recovers_each_transaction_boundary_exactly_once(self) -> None:
+        boundaries = (
+            "after_review_staging_write",
+            "after_curation_promotion",
+            "after_curation_pointer_write",
+            "after_curation_event_write",
+        )
+        for boundary in boundaries:
+            with self.subTest(boundary=boundary):
+                run, selection, _ = self._review_source_fixture(f"review-crash-{boundary}")
+                context = core.create_source_review_context(run, selection)
+                review = self._review_fixture(context)
+                with self.assertRaises(core.SimulatedCrash):
+                    core.record_source_review(
+                        run, context["context_path"], review, fail_at=boundary
+                    )
+
+                recovered = core.record_source_review(run, context["context_path"], review)
+
+                self.assertEqual((recovered["verdict"], recovered["curation_revision"]), ("pass", 1))
+                self.assertEqual(
+                    {path.name for path in (run / "curations" / "001").iterdir()},
+                    {"catalog.json", "review.json", "manifest.json", "COMMIT.json"},
+                )
+                self.assertFalse(any((run / "curations").glob(".curation-staging-*")))
+                self.assertEqual(
+                    sum(event.get("event") == "source_review_passed" for event in _events(run)),
+                    1,
+                )
+
+        run, selection, _ = self._review_source_fixture("review-stage-extra")
+        context = core.create_source_review_context(run, selection)
+        review = self._review_fixture(context)
+        with self.assertRaises(core.SimulatedCrash):
+            core.record_source_review(
+                run,
+                context["context_path"],
+                review,
+                fail_at="after_review_staging_write",
+            )
+        stage = next((run / "curations").glob(".curation-staging-*"))
+        (stage / "unexpected.bin").write_bytes(b"not part of the commit")
+        with self.assertRaises(core.IntegrityError):
+            core.record_source_review(run, context["context_path"], review)
+
+    def test_source_review_transactions_serialize_and_v1_rejects_before_locking(self) -> None:
+        run, selection, _ = self._review_source_fixture("review-concurrency")
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            contexts = list(
+                executor.map(
+                    lambda _index: core.create_source_review_context(run, selection),
+                    range(4),
+                )
+            )
+        self.assertEqual(
+            sorted(Path(item["context_path"]).parent.name.rsplit("-", 1)[1] for item in contexts),
+            ["001", "002", "003", "004"],
+        )
+        context = contexts[0]
+        review = self._review_fixture(context)
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            results = list(
+                executor.map(
+                    lambda _index: core.record_source_review(
+                        run, context["context_path"], review
+                    ),
+                    range(4),
+                )
+            )
+        self.assertTrue(all(result == results[0] for result in results))
+        self.assertEqual(
+            sum(event.get("event") == "source_review_passed" for event in _events(run)),
+            1,
+        )
+
+        v1 = self.root / "runs" / "review-v1"
+        self._initialize(v1)
+        parent_before = _tree_snapshot(v1.parent)
+        with self.assertRaises(core.StateError):
+            core.create_source_review_context(v1, selection)
+        with self.assertRaises(core.StateError):
+            core.record_source_review(v1, "source-reviews/review-deadbeef0000-001/context.json", {})
+        self.assertEqual(_tree_snapshot(v1.parent), parent_before)
+
+    def test_source_review_registry_and_committed_history_are_exact_before_append(self) -> None:
+        run, selection, _ = self._review_source_fixture("review-registry-extra")
+        context = core.create_source_review_context(run, selection)
+        context_dir = (run / context["context_path"]).parent
+        (context_dir / "unlisted.bin").write_bytes(b"not part of the review context")
+        before = _tree_snapshot(run)
+
+        with self.assertRaises(core.IntegrityError):
+            core.create_source_review_context(run, selection)
+
+        self.assertEqual(_tree_snapshot(run), before)
+
+        run_record, selection_record, _ = self._review_source_fixture(
+            "review-registry-extra-before-record"
+        )
+        unrelated = core.create_source_review_context(run_record, selection_record)
+        candidate = core.create_source_review_context(run_record, selection_record)
+        (run_record / unrelated["context_path"]).parent.joinpath(
+            "unlisted.bin"
+        ).write_bytes(b"not part of any context")
+        before_record = _tree_snapshot(run_record)
+
+        with self.assertRaises(core.IntegrityError):
+            core.record_source_review(
+                run_record,
+                candidate["context_path"],
+                self._review_fixture(candidate),
+            )
+
+        self.assertEqual(_tree_snapshot(run_record), before_record)
+
+        run_gap, selection_gap, _ = self._review_source_fixture(
+            "review-registry-sequence-gap"
+        )
+        removed = core.create_source_review_context(run_gap, selection_gap)
+        remaining = core.create_source_review_context(run_gap, selection_gap)
+        core._remove_regular_tree((run_gap / removed["context_path"]).parent)
+        before_gap = _tree_snapshot(run_gap)
+
+        with self.assertRaises(core.IntegrityError):
+            core.record_source_review(
+                run_gap,
+                remaining["context_path"],
+                self._review_fixture(remaining),
+            )
+
+        self.assertEqual(_tree_snapshot(run_gap), before_gap)
+
+        run2, selection2, _ = self._review_source_fixture("review-history-tamper")
+        accepted = core.create_source_review_context(run2, selection2)
+        core.record_source_review(
+            run2, accepted["context_path"], self._review_fixture(accepted)
+        )
+        manifest_path = run2 / "curations" / "001" / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["source_review_context_sha256"] = "0" * 64
+        core.atomic_write_json(manifest_path, manifest)
+        state_path = run2 / "run.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["state"] = "curating"
+        core.atomic_write_json(state_path, state)
+        before2 = _tree_snapshot(run2)
+
+        with self.assertRaises(core.IntegrityError):
+            core.create_source_review_context(run2, selection2)
+
+        self.assertEqual(_tree_snapshot(run2), before2)
+
+    def test_conflicting_orphan_curation_does_not_consume_an_unrelated_context(self) -> None:
+        for boundary in ("after_review_staging_write", "after_curation_promotion"):
+            with self.subTest(boundary=boundary):
+                run, selection, _ = self._review_source_fixture(
+                    f"review-orphan-conflict-{boundary}"
+                )
+                first = core.create_source_review_context(run, selection)
+                second = core.create_source_review_context(run, selection)
+                with self.assertRaises(core.SimulatedCrash):
+                    core.record_source_review(
+                        run,
+                        first["context_path"],
+                        self._review_fixture(first),
+                        fail_at=boundary,
+                    )
+                second_review = (run / second["context_path"]).parent / "review.json"
+                self.assertFalse(second_review.exists())
+                before = _tree_snapshot(run)
+
+                with self.assertRaises(core.IntegrityError):
+                    core.record_source_review(
+                        run,
+                        second["context_path"],
+                        self._review_fixture(second),
+                    )
+
+                self.assertFalse(second_review.exists())
+                self.assertEqual(_tree_snapshot(run), before)
+
+    def test_persisted_pass_review_rejects_event_conflicts_before_catalog_writes(self) -> None:
+        run, selection, crops = self._review_source_fixture(
+            "review-persisted-event-conflict"
+        )
+        passing_context = core.create_source_review_context(run, selection)
+        failing_context = core.create_source_review_context(run, selection)
+        passing_review = self._review_fixture(passing_context)
+        core.atomic_write_json(
+            (run / passing_context["context_path"]).with_name("review.json"),
+            passing_review,
+        )
+        failing_review = self._review_fixture(
+            failing_context,
+            verdict="fail",
+            asset_findings=[{
+                "asset_id": crops["method"]["asset_id"],
+                "dimension": "importance",
+                "finding": "The alternative selection needs another review.",
+            }],
+        )
+        core.record_source_review(
+            run,
+            failing_context["context_path"],
+            failing_review,
+        )
+        before = _tree_snapshot(run)
+
+        with self.assertRaises(core.IntegrityError):
+            core.record_source_review(
+                run,
+                passing_context["context_path"],
+                passing_review,
+            )
+
+        self.assertEqual(_tree_snapshot(run), before)
+
+    def test_persisted_pass_review_rejects_an_event_without_catalog_state(self) -> None:
+        run, selection, _ = self._review_source_fixture(
+            "review-event-before-catalog"
+        )
+        context = core.create_source_review_context(run, selection)
+        review = self._review_fixture(context)
+        core.atomic_write_json(
+            (run / context["context_path"]).with_name("review.json"),
+            review,
+        )
+        operation_id = core._review_operation_id(context, review)
+        core.append_jsonl(
+            run / "events.jsonl",
+            {
+                "event": "source_review_passed",
+                "operation_id": operation_id,
+                "revision": 1,
+            },
+        )
+        before = _tree_snapshot(run)
+
+        with self.assertRaises(core.IntegrityError):
+            core.record_source_review(run, context["context_path"], review)
+
+        self.assertEqual(_tree_snapshot(run), before)
+
     def test_v2_initialization_is_explicit_and_v1_default_is_unchanged(self) -> None:
         v1 = self.root / "runs" / "v1"
         v1_state = self._initialize(v1)

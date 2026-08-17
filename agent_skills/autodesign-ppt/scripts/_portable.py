@@ -35,6 +35,19 @@ from typing import Any, Iterable, Iterator, Mapping, Sequence
 FORMAT_VERSION = 1
 RELEASED_RUN_FORMAT_VERSION = 1
 AGENT_FIRST_RUN_FORMAT_VERSION = 2
+SOURCE_IMPORTANCE = ("essential", "supporting")
+_SOURCE_REVIEW_DIMENSIONS = (
+    "importance",
+    "crop_completeness",
+    "caption_claim_match",
+    "label_axis_legend_readability",
+    "duplicate_or_ornamental_content",
+    "method_result_coverage",
+    "poster_area_fit",
+)
+_SOURCE_REVIEWER_KINDS = ("fresh_subagent", "host_fresh_pass")
+_SOURCE_STORY_KEYS = ("central_method", "primary_result")
+_STRUCTURAL_SOURCE_TOKEN = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*\Z")
 MAIN_STATES = (
     "initialized",
     "planned",
@@ -3499,6 +3512,1185 @@ def list_source_assets(run_dir: Path | str) -> dict[str, Any]:
         "derived_assets": derived,
         "active_curation_revision": state.get("active_curation_revision"),
     }
+
+
+def _exact_mapping(
+    value: Any,
+    keys: set[str],
+    *,
+    label: str,
+) -> dict[str, Any]:
+    if not isinstance(value, Mapping) or set(value) != keys:
+        raise ContractError(f"{label} has an unknown or incomplete schema")
+    return {str(key): item for key, item in value.items()}
+
+
+def _unique_nonempty_strings(value: Any, *, label: str) -> list[str]:
+    if not isinstance(value, list) or any(
+        not isinstance(item, str)
+        or not item.strip()
+        or item != item.strip()
+        for item in value
+    ):
+        raise ContractError(f"{label} must be a list of non-empty canonical strings")
+    if len(set(value)) != len(value):
+        raise ContractError(f"{label} must not contain duplicates")
+    return list(value)
+
+
+def _regular_file_binding(run: Path, relative: str) -> dict[str, Any]:
+    path = safe_path(run, relative, must_exist=True)
+    if path.is_symlink() or not path.is_file() or path.stat().st_nlink != 1:
+        raise PathSafetyError(f"unsafe bound file: {path}")
+    return {"path": relative, "sha256": sha256_file(path)}
+
+
+def _canonical_jsonl_binding(run: Path, relative: str) -> dict[str, Any]:
+    path = safe_path(run, relative, must_exist=True)
+    if path.is_symlink() or not path.is_file() or path.stat().st_nlink != 1:
+        raise PathSafetyError(f"unsafe append-only ledger: {path}")
+    data = path.read_bytes()
+    entries: list[dict[str, Any]] = []
+    if data:
+        if not data.endswith(b"\n"):
+            raise IntegrityError(f"append-only ledger is truncated: {path}")
+        for raw in data.splitlines():
+            try:
+                entry = json.loads(raw)
+            except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise IntegrityError(f"append-only ledger is invalid: {path}") from error
+            if not isinstance(entry, dict) or raw + b"\n" != _canonical_json_bytes(entry):
+                raise IntegrityError(f"append-only ledger is noncanonical: {path}")
+            entries.append(entry)
+    return {
+        "path": relative,
+        "sha256": sha256_bytes(data),
+        "size": len(data),
+        "entry_count": len(entries),
+    }
+
+
+def _validate_source_story(
+    value: Any,
+    *,
+    selected_ids: set[str],
+    evidence_ids: set[str],
+) -> dict[str, Any]:
+    story = _exact_mapping(
+        value,
+        set(_SOURCE_STORY_KEYS),
+        label="source_story",
+    )
+    clean: dict[str, Any] = {}
+    for story_key in _SOURCE_STORY_KEYS:
+        entry = _exact_mapping(
+            story[story_key],
+            {"status", "asset_ids", "evidence_ids", "rationale"},
+            label=f"source_story {story_key}",
+        )
+        assets = _unique_nonempty_strings(
+            entry["asset_ids"], label=f"source_story {story_key} asset_ids"
+        )
+        evidence = _unique_nonempty_strings(
+            entry["evidence_ids"], label=f"source_story {story_key} evidence_ids"
+        )
+        rationale = entry["rationale"]
+        if (
+            not isinstance(rationale, str)
+            or not rationale.strip()
+            or rationale != rationale.strip()
+        ):
+            raise ContractError(f"source_story {story_key} requires a canonical rationale")
+        if not set(assets).issubset(selected_ids) or not set(evidence).issubset(
+            evidence_ids
+        ):
+            raise ContractError(f"source_story {story_key} references an unbound ID")
+        status = entry["status"]
+        if status == "covered":
+            if not assets or not evidence:
+                raise ContractError(
+                    f"covered source_story {story_key} requires asset and evidence IDs"
+                )
+        elif status == "not_applicable":
+            if assets or not evidence:
+                raise ContractError(
+                    f"not_applicable source_story {story_key} requires evidence and no assets"
+                )
+        else:
+            raise ContractError(f"source_story {story_key} has an invalid status")
+        clean[story_key] = {
+            "status": status,
+            "asset_ids": assets,
+            "evidence_ids": evidence,
+            "rationale": rationale,
+        }
+    return clean
+
+
+def _validate_source_review_selection(
+    run: Path,
+    state: Mapping[str, Any],
+    selection: Mapping[str, Any],
+) -> tuple[dict[str, Any], list[dict[str, Any]], list[str]]:
+    value = _exact_mapping(
+        selection,
+        {"run_format_version", "assets", "source_story"},
+        label="source review selection",
+    )
+    if value["run_format_version"] != AGENT_FIRST_RUN_FORMAT_VERSION:
+        raise ContractError("source review selection targets the wrong run format")
+    raw_assets = value["assets"]
+    if not isinstance(raw_assets, list) or any(
+        not isinstance(item, Mapping) for item in raw_assets
+    ):
+        raise ContractError("source review assets must be a list of objects")
+    receipts = {
+        receipt["asset_id"]: receipt
+        for receipt in _load_derived_source_assets(run, state)
+    }
+    selected: list[dict[str, Any]] = []
+    bindings: list[dict[str, Any]] = []
+    selected_ids: set[str] = set()
+    for raw in raw_assets:
+        item = _exact_mapping(
+            raw,
+            {"asset_id", "roles", "max_reuse", "importance"},
+            label="source review asset",
+        )
+        asset_id = item["asset_id"]
+        if (
+            not isinstance(asset_id, str)
+            or asset_id not in receipts
+            or asset_id in selected_ids
+        ):
+            raise ContractError(
+                "source review selection contains an unknown or duplicate crop"
+            )
+        roles = _unique_nonempty_strings(item["roles"], label="source review roles")
+        if not roles or any(_STRUCTURAL_SOURCE_TOKEN.fullmatch(role) is None for role in roles):
+            raise ContractError("source review role is not a structural token")
+        max_reuse = item["max_reuse"]
+        if (
+            not isinstance(max_reuse, int)
+            or isinstance(max_reuse, bool)
+            or max_reuse < 1
+        ):
+            raise ContractError("source review max_reuse must be a positive integer")
+        importance = item["importance"]
+        if importance not in SOURCE_IMPORTANCE:
+            raise ContractError("source review importance is invalid")
+        receipt = receipts[asset_id]
+        receipt_path = safe_path(run, receipt["receipt_path"], must_exist=True)
+        binding = {
+            "asset_id": asset_id,
+            "asset_path": receipt["asset_path"],
+            "asset_sha256": receipt["asset_sha256"],
+            "receipt_path": receipt["receipt_path"],
+            "receipt_sha256": receipt["receipt_sha256"],
+            "receipt_file_sha256": sha256_file(receipt_path),
+        }
+        selected_ids.add(asset_id)
+        selected.append(
+            {
+                "asset_id": asset_id,
+                "roles": roles,
+                "max_reuse": max_reuse,
+                "importance": importance,
+            }
+        )
+        bindings.append(binding)
+    evidence = load_evidence(run)
+    available_evidence = {item["id"] for item in evidence}
+    story = _validate_source_story(
+        value["source_story"],
+        selected_ids=selected_ids,
+        evidence_ids=available_evidence,
+    )
+    bound_evidence = sorted(
+        {
+            evidence_id
+            for story_key in _SOURCE_STORY_KEYS
+            for evidence_id in story[story_key]["evidence_ids"]
+        }
+    )
+    return (
+        {
+            "run_format_version": AGENT_FIRST_RUN_FORMAT_VERSION,
+            "assets": selected,
+            "source_story": story,
+        },
+        bindings,
+        bound_evidence,
+    )
+
+
+def _source_review_operation_payload(context: Mapping[str, Any]) -> dict[str, Any]:
+    bindings = []
+    for raw in context["asset_bindings"]:
+        binding = dict(raw)
+        binding.pop("preview_path", None)
+        binding.pop("preview_sha256", None)
+        bindings.append(binding)
+    return {
+        "operation": "create_source_review_context",
+        "source_manifest": context["source_manifest"],
+        "page_manifest": context["page_manifest"],
+        "evidence_ledger": context["evidence_ledger"],
+        "supersession_ledger": context["supersession_ledger"],
+        "event_log_parent": context["event_log_parent"],
+        "current_catalog_parent": context["current_catalog_parent"],
+        "selection": context["selection"],
+        "evidence_ids": context["evidence_ids"],
+        "asset_bindings": bindings,
+    }
+
+
+def _source_review_context_file(run: Path, value: Path | str) -> Path:
+    candidate = Path(value)
+    if candidate.is_absolute():
+        try:
+            relative = candidate.relative_to(run)
+        except ValueError as error:
+            raise PathSafetyError("source review context must be inside the run") from error
+    else:
+        relative = candidate
+    path = safe_path(run, relative, must_exist=True)
+    if (
+        path.name != "context.json"
+        or path.parent.parent != run / "source-reviews"
+        or re.fullmatch(r"review-[0-9a-f]{12}-[0-9]{3}", path.parent.name) is None
+    ):
+        raise PathSafetyError("source review context is outside its canonical registry")
+    return path
+
+
+def _load_source_review_context(
+    run: Path,
+    state: Mapping[str, Any],
+    context_path: Path | str,
+) -> dict[str, Any]:
+    path = _source_review_context_file(run, context_path)
+    if path.is_symlink() or not path.is_file() or path.stat().st_nlink != 1:
+        raise PathSafetyError(f"unsafe source review context: {path}")
+    context = _read_json(path)
+    if path.read_bytes() != _stored_json_bytes(context):
+        raise IntegrityError("source review context contains noncanonical JSON bytes")
+    required = {
+        "run_format_version",
+        "operation_id",
+        "sequence",
+        "context_path",
+        "source_manifest",
+        "page_manifest",
+        "evidence_ledger",
+        "supersession_ledger",
+        "event_log_parent",
+        "current_catalog_parent",
+        "selection",
+        "evidence_ids",
+        "asset_bindings",
+        "rubric",
+        "context_sha256",
+    }
+    if set(context) != required or context.get("run_format_version") != AGENT_FIRST_RUN_FORMAT_VERSION:
+        raise IntegrityError("source review context has an unknown or incomplete schema")
+    payload = dict(context)
+    context_sha256 = payload.pop("context_sha256", None)
+    if context_sha256 != _canonical_hash(payload):
+        raise IntegrityError("source review context hash mismatch")
+    if context["context_path"] != path.relative_to(run).as_posix():
+        raise IntegrityError("source review context path binding is stale")
+    match = re.fullmatch(r"review-([0-9a-f]{12})-([0-9]{3})", path.parent.name)
+    assert match is not None
+    if (
+        not isinstance(context["sequence"], int)
+        or isinstance(context["sequence"], bool)
+        or context["sequence"] != int(match.group(2))
+        or not isinstance(context["operation_id"], str)
+        or context["operation_id"][:12] != match.group(1)
+        or context["operation_id"] != _canonical_hash(
+            _source_review_operation_payload(context)
+        )
+    ):
+        raise IntegrityError("source review context operation binding is stale")
+    if context["rubric"] != {
+        "dimensions": list(_SOURCE_REVIEW_DIMENSIONS),
+        "reviewer_kinds": list(_SOURCE_REVIEWER_KINDS),
+        "pass_scores": [4, 5],
+    }:
+        raise IntegrityError("source review context rubric binding is stale")
+    selection, expected_bindings, expected_evidence = _validate_source_review_selection(
+        run, state, context["selection"]
+    )
+    if selection != context["selection"] or expected_evidence != context["evidence_ids"]:
+        raise IntegrityError("source review context selection binding is stale")
+    bindings = context["asset_bindings"]
+    if not isinstance(bindings, list) or len(bindings) != len(expected_bindings):
+        raise IntegrityError("source review context asset bindings are incomplete")
+    expected_files = {"context.json"}
+    has_review = (path.parent / "review.json").exists()
+    if has_review:
+        expected_files.add("review.json")
+    for binding, expected in zip(bindings, expected_bindings):
+        if not isinstance(binding, dict):
+            raise IntegrityError("source review context asset binding is invalid")
+        preview_relative = f"previews/{expected['asset_id']}.png"
+        if binding != {
+            **expected,
+            "preview_path": preview_relative,
+            "preview_sha256": expected["asset_sha256"],
+        }:
+            raise IntegrityError("source review context crop binding is stale")
+        preview_path = path.parent / preview_relative
+        if (
+            preview_path.is_symlink()
+            or not preview_path.is_file()
+            or preview_path.stat().st_nlink != 1
+            or sha256_file(preview_path) != binding["preview_sha256"]
+        ):
+            raise IntegrityError("source review context preview binding is stale")
+        expected_files.add(preview_relative)
+    files, directories = _regular_tree_inventory(path.parent)
+    if files != expected_files or directories != {"previews"}:
+        raise IntegrityError("source review context file set is not exact")
+    source_binding = _regular_file_binding(run, "evidence/source_manifest.json")
+    if (
+        context["source_manifest"] != source_binding
+        or source_binding["sha256"] != state.get("source_manifest_sha256")
+    ):
+        raise IntegrityError("source review context source binding is stale")
+    manifest = _verify_source_contract(run, state)
+    if manifest.get("page_manifest_path") is None:
+        page_binding = {"path": None, "sha256": None}
+    else:
+        page_binding = _regular_file_binding(run, manifest["page_manifest_path"])
+    if context["page_manifest"] != page_binding:
+        raise IntegrityError("source review context page binding is stale")
+    if context["evidence_ledger"] != _canonical_jsonl_binding(
+        run, "evidence/evidence.jsonl"
+    ):
+        raise IntegrityError("source review context evidence ledger binding is stale")
+    if has_review:
+        review_path = path.parent / "review.json"
+        if review_path.is_symlink() or not review_path.is_file() or review_path.stat().st_nlink != 1:
+            raise PathSafetyError(f"unsafe source review record: {review_path}")
+        review = _read_json(review_path)
+        if review_path.read_bytes() != _stored_json_bytes(review):
+            raise IntegrityError("source review record contains noncanonical JSON bytes")
+        _validate_source_review_value(context, review)
+    return context
+
+
+def _source_review_registry_sequences(
+    run: Path,
+    state: Mapping[str, Any],
+    operation_prefix: str,
+) -> list[int]:
+    root = run / "source-reviews"
+    files, directories = _regular_tree_inventory(root)
+    immediate_files = {relative for relative in files if "/" not in relative}
+    if immediate_files:
+        raise IntegrityError("source review registry contains an unexpected file")
+    immediate_directories = {
+        relative for relative in directories if "/" not in relative
+    }
+    sequences: list[int] = []
+    for name in immediate_directories:
+        match = re.fullmatch(r"review-([0-9a-f]{12})-([0-9]{3})", name)
+        if match is None:
+            raise IntegrityError("source review registry contains an unknown directory")
+        _load_source_review_context(run, state, root / name / "context.json")
+        if match.group(1) == operation_prefix:
+            sequences.append(int(match.group(2)))
+    sequences.sort()
+    if sequences and sequences != list(range(1, max(sequences) + 1)):
+        raise IntegrityError("source review context sequence contains a gap")
+    return sequences
+
+
+def create_source_review_context(
+    run_dir: Path | str,
+    selection: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Create one immutable review package over selected source crops."""
+
+    if inspect_run_format(run_dir) != AGENT_FIRST_RUN_FORMAT_VERSION:
+        raise StateError("version-1 runs do not support Agent-first source APIs")
+    run = Path(run_dir).absolute()
+    with _agent_first_mutation_lock(run):
+        run, state = _load_agent_first_run(run)
+        if state.get("state") != "curating":
+            raise StateError("source review context requires curating state")
+        revisions, stages = _curation_registry(run, state)
+        if stages or (
+            revisions
+            and revisions[-1] != state.get("active_curation_revision")
+        ):
+            raise IntegrityError("source review cannot append over an orphan curation")
+        manifest = _verify_source_contract(run, state)
+        if manifest.get("status") != "ready":
+            raise StateError("source review requires a ready source")
+        clean_selection, bindings, evidence_ids = _validate_source_review_selection(
+            run, state, selection
+        )
+        source_binding = _regular_file_binding(run, "evidence/source_manifest.json")
+        if manifest.get("page_manifest_path") is None:
+            page_binding = {"path": None, "sha256": None}
+        else:
+            page_binding = _regular_file_binding(run, manifest["page_manifest_path"])
+        base_context: dict[str, Any] = {
+            "run_format_version": AGENT_FIRST_RUN_FORMAT_VERSION,
+            "source_manifest": source_binding,
+            "page_manifest": page_binding,
+            "evidence_ledger": _canonical_jsonl_binding(
+                run, "evidence/evidence.jsonl"
+            ),
+            "supersession_ledger": _canonical_jsonl_binding(
+                run, "provenance/supersessions.jsonl"
+            ),
+            "event_log_parent": _canonical_jsonl_binding(run, "events.jsonl"),
+            "current_catalog_parent": {
+                "revision": state.get("active_curation_revision"),
+                "sha256": state.get("active_curation_sha256"),
+            },
+            "selection": clean_selection,
+            "evidence_ids": evidence_ids,
+            "asset_bindings": bindings,
+        }
+        operation_id = _canonical_hash(
+            {
+                "operation": "create_source_review_context",
+                **{
+                    key: value
+                    for key, value in base_context.items()
+                    if key != "run_format_version"
+                },
+            }
+        )
+        prefix = operation_id[:12]
+        sequences = _source_review_registry_sequences(run, state, prefix)
+        sequence = (max(sequences) + 1) if sequences else 1
+        if sequence > 999:
+            raise StateError("source review context sequence is exhausted")
+        review_id = f"review-{prefix}-{sequence:03d}"
+        root = run / "source-reviews"
+        target = root / review_id
+        stage = root / f".{review_id}.staging"
+        if target.exists() or target.is_symlink() or stage.exists() or stage.is_symlink():
+            raise IntegrityError("source review context target already exists")
+        try:
+            (stage / "previews").mkdir(parents=True)
+            complete_bindings: list[dict[str, Any]] = []
+            for binding in bindings:
+                source = safe_path(run, binding["asset_path"], must_exist=True)
+                preview_relative = f"previews/{binding['asset_id']}.png"
+                preview = stage / preview_relative
+                atomic_write_bytes(preview, source.read_bytes())
+                complete_bindings.append(
+                    {
+                        **binding,
+                        "preview_path": preview_relative,
+                        "preview_sha256": sha256_file(preview),
+                    }
+                )
+            context: dict[str, Any] = {
+                **base_context,
+                "operation_id": operation_id,
+                "sequence": sequence,
+                "context_path": f"source-reviews/{review_id}/context.json",
+                "asset_bindings": complete_bindings,
+                "rubric": {
+                    "dimensions": list(_SOURCE_REVIEW_DIMENSIONS),
+                    "reviewer_kinds": list(_SOURCE_REVIEWER_KINDS),
+                    "pass_scores": [4, 5],
+                },
+            }
+            context["context_sha256"] = _canonical_hash(context)
+            atomic_write_json(stage / "context.json", context)
+            expected_files = {
+                "context.json",
+                *(f"previews/{binding['asset_id']}.png" for binding in bindings),
+            }
+            files, directories = _regular_tree_inventory(stage)
+            if files != expected_files or directories != {"previews"}:
+                raise IntegrityError("source review staging file set is not exact")
+            os.replace(stage, target)
+            _fsync_directory(root)
+            return _load_source_review_context(
+                run, state, target / "context.json"
+            )
+        except Exception:
+            if stage.exists() and not stage.is_symlink():
+                with contextlib.suppress(PortableError, OSError):
+                    _remove_regular_tree(stage)
+            raise
+
+
+def _canonical_review_string(value: Any, *, label: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not value.strip()
+        or value != value.strip()
+    ):
+        raise ContractError(f"{label} must be a non-empty canonical string")
+    return value
+
+
+def _validate_source_review_value(
+    context: Mapping[str, Any],
+    review: Mapping[str, Any],
+) -> dict[str, Any]:
+    value = _exact_mapping(
+        review,
+        {
+            "run_format_version",
+            "source_review_context_sha256",
+            "reviewer_kind",
+            "dimension_scores",
+            "asset_findings",
+            "coverage_findings",
+            "blockers",
+            "localized_repairs",
+            "verdict",
+            "complete",
+        },
+        label="source review",
+    )
+    if value["run_format_version"] != AGENT_FIRST_RUN_FORMAT_VERSION:
+        raise ContractError("source review targets the wrong run format")
+    if value["source_review_context_sha256"] != context["context_sha256"]:
+        raise ContractError("source review context hash is stale")
+    if value["reviewer_kind"] not in _SOURCE_REVIEWER_KINDS:
+        raise ContractError("source review requires a fresh reviewer kind")
+    if value["complete"] is not True:
+        raise ContractError("source review is incomplete")
+    scores = value["dimension_scores"]
+    if not isinstance(scores, Mapping) or set(scores) != set(_SOURCE_REVIEW_DIMENSIONS):
+        raise ContractError("source review scores do not match the bound rubric")
+    clean_scores: dict[str, int] = {}
+    for dimension in _SOURCE_REVIEW_DIMENSIONS:
+        score = scores[dimension]
+        if (
+            not isinstance(score, int)
+            or isinstance(score, bool)
+            or not 1 <= score <= 5
+        ):
+            raise ContractError("source review scores must be integers from 1 to 5")
+        clean_scores[dimension] = score
+    verdict = value["verdict"]
+    if verdict not in {"pass", "fail"}:
+        raise ContractError("source review verdict must be pass or fail")
+    selected_ids = {
+        item["asset_id"] for item in context["selection"]["assets"]
+    }
+    bound_evidence = set(context["evidence_ids"])
+    asset_findings = value["asset_findings"]
+    if not isinstance(asset_findings, list):
+        raise ContractError("source review asset_findings must be a list")
+    clean_asset_findings: list[dict[str, Any]] = []
+    for raw in asset_findings:
+        finding = _exact_mapping(
+            raw,
+            {"asset_id", "dimension", "finding"},
+            label="source review asset finding",
+        )
+        if finding["asset_id"] not in selected_ids:
+            raise ContractError("source review asset finding is not bound to a selected crop")
+        if finding["dimension"] not in _SOURCE_REVIEW_DIMENSIONS:
+            raise ContractError("source review asset finding dimension is invalid")
+        clean_asset_findings.append(
+            {
+                "asset_id": finding["asset_id"],
+                "dimension": finding["dimension"],
+                "finding": _canonical_review_string(
+                    finding["finding"], label="source review asset finding"
+                ),
+            }
+        )
+    coverage_findings = value["coverage_findings"]
+    if not isinstance(coverage_findings, list):
+        raise ContractError("source review coverage_findings must be a list")
+    clean_coverage_findings: list[dict[str, Any]] = []
+    for raw in coverage_findings:
+        finding = _exact_mapping(
+            raw,
+            {"story_key", "evidence_ids", "finding"},
+            label="source review coverage finding",
+        )
+        evidence_ids = _unique_nonempty_strings(
+            finding["evidence_ids"], label="source review coverage evidence_ids"
+        )
+        if finding["story_key"] not in _SOURCE_STORY_KEYS or not set(
+            evidence_ids
+        ).issubset(bound_evidence):
+            raise ContractError("source review coverage finding is not context-bound")
+        clean_coverage_findings.append(
+            {
+                "story_key": finding["story_key"],
+                "evidence_ids": evidence_ids,
+                "finding": _canonical_review_string(
+                    finding["finding"], label="source review coverage finding"
+                ),
+            }
+        )
+    blockers = value["blockers"]
+    if not isinstance(blockers, list):
+        raise ContractError("source review blockers must be a list")
+    clean_blockers: list[dict[str, Any]] = []
+    for raw in blockers:
+        blocker = _exact_mapping(
+            raw,
+            {"code", "finding"},
+            label="source review blocker",
+        )
+        code = _canonical_review_string(blocker["code"], label="source review blocker code")
+        if _STRUCTURAL_SOURCE_TOKEN.fullmatch(code) is None:
+            raise ContractError("source review blocker code is not structural")
+        clean_blockers.append(
+            {
+                "code": code,
+                "finding": _canonical_review_string(
+                    blocker["finding"], label="source review blocker finding"
+                ),
+            }
+        )
+    repairs = value["localized_repairs"]
+    if not isinstance(repairs, list):
+        raise ContractError("source review localized_repairs must be a list")
+    clean_repairs: list[dict[str, Any]] = []
+    valid_targets = {
+        *(f"asset:{asset_id}" for asset_id in selected_ids),
+        *_SOURCE_STORY_KEYS,
+        "selection_set",
+    }
+    for raw in repairs:
+        repair = _exact_mapping(
+            raw,
+            {"target", "instruction"},
+            label="source review localized repair",
+        )
+        if repair["target"] not in valid_targets:
+            raise ContractError("source review localized repair target is unbound")
+        clean_repairs.append(
+            {
+                "target": repair["target"],
+                "instruction": _canonical_review_string(
+                    repair["instruction"], label="source review repair instruction"
+                ),
+            }
+        )
+    if verdict == "pass" and (
+        clean_blockers or any(score not in {4, 5} for score in clean_scores.values())
+    ):
+        raise ContractError(
+            "passing source review requires all scores in [4,5] and no blockers"
+        )
+    if verdict == "fail" and not (
+        clean_asset_findings or clean_coverage_findings or clean_blockers
+    ):
+        raise ContractError("failing source review requires a bound finding or blocker")
+    return {
+        "run_format_version": AGENT_FIRST_RUN_FORMAT_VERSION,
+        "source_review_context_sha256": context["context_sha256"],
+        "reviewer_kind": value["reviewer_kind"],
+        "dimension_scores": clean_scores,
+        "asset_findings": clean_asset_findings,
+        "coverage_findings": clean_coverage_findings,
+        "blockers": clean_blockers,
+        "localized_repairs": clean_repairs,
+        "verdict": verdict,
+        "complete": True,
+    }
+
+
+def _review_operation_id(
+    context: Mapping[str, Any], review: Mapping[str, Any]
+) -> str:
+    return _canonical_hash(
+        {
+            "operation": "record_source_review",
+            "source_review_context_sha256": context["context_sha256"],
+            "source_review_sha256": sha256_bytes(_stored_json_bytes(review)),
+            "parent": context["current_catalog_parent"],
+            "verdict": review["verdict"],
+        }
+    )
+
+
+def _review_event_phase(
+    run: Path,
+    context: Mapping[str, Any],
+    event: Mapping[str, Any],
+) -> str:
+    binding = context["event_log_parent"]
+    if not isinstance(binding, dict) or set(binding) != {
+        "path", "sha256", "size", "entry_count"
+    }:
+        raise IntegrityError("source review event parent binding is invalid")
+    path = safe_path(run, binding["path"], must_exist=True)
+    if path.is_symlink() or not path.is_file() or path.stat().st_nlink != 1:
+        raise PathSafetyError(f"unsafe source review event log: {path}")
+    data = path.read_bytes()
+    size = binding["size"]
+    if (
+        not isinstance(size, int)
+        or isinstance(size, bool)
+        or size < 0
+        or len(data) < size
+        or sha256_bytes(data[:size]) != binding["sha256"]
+    ):
+        raise IntegrityError("source review event log parent was rewritten")
+    suffix = data[size:]
+    if not suffix:
+        return "parent"
+    if suffix != _canonical_json_bytes(redact_secrets(event)):
+        raise IntegrityError("source review event log has a conflicting suffix")
+    return "committed"
+
+
+def _validate_context_ledger_parents(
+    run: Path,
+    context: Mapping[str, Any],
+) -> None:
+    if context["supersession_ledger"] != _canonical_jsonl_binding(
+        run, "provenance/supersessions.jsonl"
+    ):
+        raise IntegrityError("source review supersession ledger was rewritten")
+
+
+def _curation_documents(
+    context: Mapping[str, Any],
+    review: Mapping[str, Any],
+) -> tuple[int, dict[str, dict[str, Any]]]:
+    parent = context["current_catalog_parent"]
+    if not isinstance(parent, dict) or set(parent) != {"revision", "sha256"}:
+        raise IntegrityError("source review catalog parent binding is invalid")
+    parent_revision = parent["revision"]
+    parent_sha256 = parent["sha256"]
+    if parent_revision is None:
+        if parent_sha256 is not None:
+            raise IntegrityError("source review catalog parent is incomplete")
+        revision = 1
+    elif (
+        not isinstance(parent_revision, int)
+        or isinstance(parent_revision, bool)
+        or parent_revision < 1
+        or not isinstance(parent_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", parent_sha256) is None
+    ):
+        raise IntegrityError("source review catalog parent is invalid")
+    else:
+        revision = parent_revision + 1
+    if revision > 999:
+        raise StateError("curation revision namespace is exhausted")
+    selected = {
+        item["asset_id"]: item for item in context["selection"]["assets"]
+    }
+    catalog_assets = []
+    for binding in context["asset_bindings"]:
+        item = selected[binding["asset_id"]]
+        catalog_assets.append(
+            {
+                "asset_id": binding["asset_id"],
+                "path": binding["asset_path"],
+                "sha256": binding["asset_sha256"],
+                "receipt_path": binding["receipt_path"],
+                "receipt_sha256": binding["receipt_sha256"],
+                "receipt_file_sha256": binding["receipt_file_sha256"],
+                "roles": item["roles"],
+                "max_reuse": item["max_reuse"],
+                "importance": item["importance"],
+                "trust": "reviewed",
+                "eligible": True,
+            }
+        )
+    review_sha256 = sha256_bytes(_stored_json_bytes(review))
+    catalog: dict[str, Any] = {
+        "run_format_version": AGENT_FIRST_RUN_FORMAT_VERSION,
+        "revision": revision,
+        "parent": {"revision": parent_revision, "sha256": parent_sha256},
+        "source_manifest": context["source_manifest"],
+        "page_manifest": context["page_manifest"],
+        "source_review_context_path": context["context_path"],
+        "source_review_context_sha256": context["context_sha256"],
+        "source_review_sha256": review_sha256,
+        "assets": catalog_assets,
+        "source_story": context["selection"]["source_story"],
+    }
+    catalog_sha256 = sha256_bytes(_stored_json_bytes(catalog))
+    operation_id = _review_operation_id(context, review)
+    manifest = {
+        "run_format_version": AGENT_FIRST_RUN_FORMAT_VERSION,
+        "revision": revision,
+        "parent_revision": parent_revision,
+        "parent_catalog_sha256": parent_sha256,
+        "source_manifest_sha256": context["source_manifest"]["sha256"],
+        "page_manifest_sha256": context["page_manifest"]["sha256"],
+        "source_review_context_path": context["context_path"],
+        "source_review_context_sha256": context["context_sha256"],
+        "catalog_sha256": catalog_sha256,
+        "review_sha256": review_sha256,
+        "operation_id": operation_id,
+    }
+    commit = {
+        "run_format_version": AGENT_FIRST_RUN_FORMAT_VERSION,
+        "operation_id": operation_id,
+        "parent_revision": parent_revision,
+        "parent_sha256": parent_sha256,
+        "target_revision": revision,
+        "content_sha256": catalog_sha256,
+        "status": "prepared",
+    }
+    return revision, {
+        "catalog.json": catalog,
+        "review.json": dict(review),
+        "manifest.json": manifest,
+        "COMMIT.json": commit,
+    }
+
+
+def _load_curation_revision(
+    run: Path,
+    revision: int,
+    *,
+    directory: Path | None = None,
+) -> dict[str, dict[str, Any]]:
+    root = directory or (run / "curations" / f"{revision:03d}")
+    files, directories = _regular_tree_inventory(root)
+    expected = {"catalog.json", "review.json", "manifest.json", "COMMIT.json"}
+    if files != expected or directories:
+        raise IntegrityError("curation revision file set is not exact")
+    values: dict[str, dict[str, Any]] = {}
+    for name in expected:
+        path = root / name
+        value = _read_json(path)
+        if not isinstance(value, dict) or path.read_bytes() != _stored_json_bytes(value):
+            raise IntegrityError("curation revision contains noncanonical JSON bytes")
+        values[name] = value
+    manifest = values["manifest.json"]
+    commit = values["COMMIT.json"]
+    if set(manifest) != {
+        "run_format_version",
+        "revision",
+        "parent_revision",
+        "parent_catalog_sha256",
+        "source_manifest_sha256",
+        "page_manifest_sha256",
+        "source_review_context_path",
+        "source_review_context_sha256",
+        "catalog_sha256",
+        "review_sha256",
+        "operation_id",
+    } or set(commit) != {
+        "run_format_version",
+        "operation_id",
+        "parent_revision",
+        "parent_sha256",
+        "target_revision",
+        "content_sha256",
+        "status",
+    }:
+        raise IntegrityError("curation revision metadata schema is invalid")
+    if (
+        manifest["run_format_version"] != AGENT_FIRST_RUN_FORMAT_VERSION
+        or manifest["revision"] != revision
+        or commit["run_format_version"] != AGENT_FIRST_RUN_FORMAT_VERSION
+        or commit["operation_id"] != manifest["operation_id"]
+        or commit["parent_revision"] != manifest["parent_revision"]
+        or commit["parent_sha256"] != manifest["parent_catalog_sha256"]
+        or commit["target_revision"] != revision
+        or commit["content_sha256"] != manifest["catalog_sha256"]
+        or commit["status"] != "prepared"
+        or sha256_file(root / "catalog.json") != manifest["catalog_sha256"]
+        or sha256_file(root / "review.json") != manifest["review_sha256"]
+    ):
+        raise IntegrityError("curation revision hash or commit binding is stale")
+    state = _read_json(run / "run.json")
+    context = _load_source_review_context(
+        run,
+        state,
+        manifest["source_review_context_path"],
+    )
+    review = _validate_source_review_value(context, values["review.json"])
+    if review["verdict"] != "pass":
+        raise IntegrityError("curation revision is bound to a failing review")
+    expected_revision, expected = _curation_documents(context, review)
+    if expected_revision != revision or any(
+        values[name] != document for name, document in expected.items()
+    ):
+        raise IntegrityError("curation revision provenance binding is stale")
+    return values
+
+
+def _curation_registry(
+    run: Path,
+    state: Mapping[str, Any],
+) -> tuple[list[int], list[Path]]:
+    root = run / "curations"
+    immediate = list(root.iterdir())
+    revisions: list[int] = []
+    stages: list[Path] = []
+    for path in immediate:
+        if path.is_symlink() or not path.is_dir():
+            raise PathSafetyError(f"unsafe curation registry entry: {path}")
+        if re.fullmatch(r"[0-9]{3}", path.name):
+            revisions.append(int(path.name))
+        elif re.fullmatch(r"\.curation-staging-[0-9a-f]{24}", path.name):
+            stages.append(path)
+        else:
+            raise IntegrityError("curation registry contains an unknown directory")
+    revisions.sort()
+    if len(stages) > 1:
+        raise IntegrityError("curation registry contains multiple staging transactions")
+    active = state.get("active_curation_revision")
+    active_hash = state.get("active_curation_sha256")
+    if active is None:
+        if active_hash is not None or revisions not in ([], [1]):
+            raise IntegrityError("curation registry and active pointer disagree")
+    elif (
+        not isinstance(active, int)
+        or isinstance(active, bool)
+        or active < 1
+        or not isinstance(active_hash, str)
+        or revisions not in (
+            list(range(1, active + 1)),
+            list(range(1, active + 2)),
+        )
+    ):
+        raise IntegrityError("curation registry and active pointer disagree")
+    previous_revision: int | None = None
+    previous_hash: str | None = None
+    for revision in revisions:
+        values = _load_curation_revision(run, revision)
+        manifest = values["manifest.json"]
+        if (
+            manifest["parent_revision"] != previous_revision
+            or manifest["parent_catalog_sha256"] != previous_hash
+        ):
+            raise IntegrityError("curation revision graph is not contiguous")
+        previous_revision = revision
+        previous_hash = manifest["catalog_sha256"]
+        if revision == active and active_hash != previous_hash:
+            raise IntegrityError("active curation hash pointer is stale")
+    return revisions, stages
+
+
+def _curation_documents_match(
+    run: Path,
+    revision: int,
+    documents: Mapping[str, Mapping[str, Any]],
+    *,
+    directory: Path | None = None,
+) -> bool:
+    root = directory or (run / "curations" / f"{revision:03d}")
+    actual = _load_curation_revision(run, revision, directory=root)
+    return all(actual[name] == value for name, value in documents.items())
+
+
+def _record_source_review_result(
+    run: Path,
+    context: Mapping[str, Any],
+    review: Mapping[str, Any],
+    *,
+    revision: int | None,
+) -> dict[str, Any]:
+    result = {
+        "run_format_version": AGENT_FIRST_RUN_FORMAT_VERSION,
+        "verdict": review["verdict"],
+        "state": "curated" if review["verdict"] == "pass" else "curating",
+        "context_path": context["context_path"],
+        "context_sha256": context["context_sha256"],
+        "review_path": str(Path(context["context_path"]).with_name("review.json")),
+    }
+    if revision is not None:
+        manifest = _load_curation_revision(run, revision)["manifest.json"]
+        result.update(
+            {
+                "curation_revision": revision,
+                "curation_sha256": manifest["catalog_sha256"],
+            }
+        )
+    return result
+
+
+def record_source_review(
+    run_dir: Path | str,
+    context_path: Path | str,
+    review: Mapping[str, Any],
+    *,
+    fail_at: str | None = None,
+) -> dict[str, Any]:
+    """Record a fresh review and atomically publish a passing catalog."""
+
+    allowed_failures = {
+        None,
+        "after_review_staging_write",
+        "after_curation_promotion",
+        "after_curation_pointer_write",
+        "after_curation_event_write",
+    }
+    if fail_at not in allowed_failures:
+        raise ContractError(f"unknown source review crash boundary: {fail_at}")
+    if inspect_run_format(run_dir) != AGENT_FIRST_RUN_FORMAT_VERSION:
+        raise StateError("version-1 runs do not support Agent-first source APIs")
+    run = Path(run_dir).absolute()
+    with _agent_first_mutation_lock(run):
+        run, state = _load_agent_first_run(run)
+        revisions, stages = _curation_registry(run, state)
+        context = _load_source_review_context(run, state, context_path)
+        _source_review_registry_sequences(
+            run, state, str(context["operation_id"])[:12]
+        )
+        value = _validate_source_review_value(context, review)
+        if value["verdict"] == "fail" and fail_at is not None:
+            raise ContractError("curation crash boundaries require a passing review")
+        active_revision = state.get("active_curation_revision")
+        has_orphan = bool(revisions) and revisions[-1] != active_revision
+        if value["verdict"] == "fail" and (stages or has_orphan):
+            raise IntegrityError("failing source review conflicts with an incomplete curation")
+        review_path = (run / context["context_path"]).with_name("review.json")
+        operation_id = _review_operation_id(context, value)
+        revision: int | None = None
+        documents: dict[str, dict[str, Any]] | None = None
+        target: Path | None = None
+        stage: Path | None = None
+        if value["verdict"] == "pass":
+            revision, documents = _curation_documents(context, value)
+            target = run / "curations" / f"{revision:03d}"
+            stage = run / "curations" / f".curation-staging-{operation_id[:24]}"
+            if stages and stages != [stage]:
+                raise IntegrityError("curation registry contains a conflicting transaction")
+            if target.exists() and not _curation_documents_match(
+                run, revision, documents
+            ):
+                raise IntegrityError("curation revision conflicts with this source review")
+            if not target.exists() and revisions and revisions[-1] >= revision:
+                raise IntegrityError("curation target revision is occupied")
+            if stage.exists() and not _curation_documents_match(
+                run, revision, documents, directory=stage
+            ):
+                raise IntegrityError("curation staging bytes are conflicting")
+        event = {
+            "event": (
+                "source_review_failed"
+                if value["verdict"] == "fail"
+                else "source_review_passed"
+            ),
+            "operation_id": operation_id,
+        }
+        if revision is not None:
+            event["revision"] = revision
+        event_phase = _review_event_phase(run, context, event)
+        if review_path.exists() or review_path.is_symlink():
+            if review_path.is_symlink() or not review_path.is_file() or review_path.stat().st_nlink != 1:
+                raise PathSafetyError(f"unsafe source review record: {review_path}")
+            persisted = _read_json(review_path)
+            if review_path.read_bytes() != _stored_json_bytes(persisted):
+                raise IntegrityError("source review record contains noncanonical JSON bytes")
+            if persisted != value:
+                raise StateError("refusing to overwrite an existing source review")
+        else:
+            if state.get("state") != "curating":
+                raise StateError("a new source review requires curating state")
+            parent = context["current_catalog_parent"]
+            if (
+                state.get("active_curation_revision") != parent["revision"]
+                or state.get("active_curation_sha256") != parent["sha256"]
+            ):
+                raise IntegrityError("source review catalog parent CAS mismatch")
+            _validate_context_ledger_parents(run, context)
+            if event_phase != "parent":
+                raise IntegrityError("source review event appeared before its record")
+            atomic_write_json(review_path, value)
+
+        _validate_context_ledger_parents(run, context)
+        if event_phase == "committed":
+            if value["verdict"] == "pass":
+                assert revision is not None
+                assert documents is not None
+                assert target is not None
+                catalog_sha256 = documents["manifest.json"]["catalog_sha256"]
+                if (
+                    not target.exists()
+                    or stages
+                    or state.get("state") != "curated"
+                    or state.get("active_curation_revision") != revision
+                    or state.get("active_curation_sha256") != catalog_sha256
+                ):
+                    raise IntegrityError(
+                        "committed source review event lacks catalog state"
+                    )
+            return _record_source_review_result(
+                run, context, value, revision=revision
+            )
+        if _review_event_phase(run, context, event) != "parent":
+            raise IntegrityError("source review event changed before catalog commit")
+        if value["verdict"] == "fail":
+            _event(run, "source_review_failed", operation_id=operation_id)
+            return _record_source_review_result(
+                run, context, value, revision=None
+            )
+
+        assert revision is not None
+        assert documents is not None
+        assert target is not None
+        assert stage is not None
+        if target.exists():
+            if stage.exists():
+                if not _curation_documents_match(
+                    run, revision, documents, directory=stage
+                ):
+                    raise IntegrityError("curation staging conflicts with its target")
+                _remove_regular_tree(stage)
+        else:
+            if not stage.exists():
+                stage.mkdir()
+                for name, document in documents.items():
+                    atomic_write_json(stage / name, document)
+                _load_curation_revision(run, revision, directory=stage)
+                if fail_at == "after_review_staging_write":
+                    raise SimulatedCrash("after source review curation staging write")
+            os.replace(stage, target)
+            _fsync_directory(target.parent)
+            _load_curation_revision(run, revision)
+            if fail_at == "after_curation_promotion":
+                raise SimulatedCrash("after source review curation promotion")
+
+        current = _read_json(run / "run.json")
+        parent = context["current_catalog_parent"]
+        catalog_sha256 = documents["manifest.json"]["catalog_sha256"]
+        if current.get("active_curation_revision") == revision:
+            if (
+                current.get("active_curation_sha256") != catalog_sha256
+                or current.get("state") != "curated"
+            ):
+                raise IntegrityError("active curation pointer is stale")
+        else:
+            if (
+                current.get("state") != "curating"
+                or current.get("active_curation_revision") != parent["revision"]
+                or current.get("active_curation_sha256") != parent["sha256"]
+            ):
+                raise IntegrityError("source review catalog parent CAS mismatch")
+            current["active_curation_revision"] = revision
+            current["active_curation_sha256"] = catalog_sha256
+            current["state"] = "curated"
+            _write_run(run, current)
+            if fail_at == "after_curation_pointer_write":
+                raise SimulatedCrash("after source review curation pointer write")
+        phase = _review_event_phase(run, context, event)
+        if phase == "parent":
+            _event(
+                run,
+                "source_review_passed",
+                operation_id=operation_id,
+                revision=revision,
+            )
+        if fail_at == "after_curation_event_write":
+            raise SimulatedCrash("after source review curation event write")
+        return _record_source_review_result(
+            run, context, value, revision=revision
+        )
 
 
 def load_evidence(run_dir: Path | str) -> list[dict[str, Any]]:
