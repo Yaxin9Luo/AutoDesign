@@ -333,11 +333,13 @@ elif name == "pdfimages":
             self.assertEqual(binding["preview_sha256"], core.sha256_file(preview_path))
         self.assertEqual(
             sorted(path.relative_to(context_path.parent).as_posix() for path in context_path.parent.rglob("*") if path.is_file()),
-            [
-                "context.json",
-                f"previews/{crops['method']['asset_id']}.png",
-                f"previews/{crops['result']['asset_id']}.png",
-            ],
+            sorted(
+                [
+                    "context.json",
+                    f"previews/{crops['method']['asset_id']}.png",
+                    f"previews/{crops['result']['asset_id']}.png",
+                ]
+            ),
         )
 
     def test_source_review_context_rejects_invalid_or_stale_selection_without_writes(self) -> None:
@@ -2298,6 +2300,101 @@ elif name == "pdfimages":
             [path.name for path in (blocked_run / "evidence" / "reference_images").iterdir()],
             ["reference-001.png"],
         )
+
+    def test_blocked_pdf_retry_rejects_changed_reordered_omitted_or_added_references_without_writes(self) -> None:
+        variants = {
+            "changed": (0, 1),
+            "reordered": (1, 0),
+            "omitted": (0,),
+            "added": (0, 1, 2),
+        }
+        for name, retry_order in variants.items():
+            with self.subTest(name=name):
+                run = self.root / "runs" / f"blocked-reference-drift-{name}"
+                self._initialize(run, run_format_version=2)
+                pdf = self.root / f"blocked-reference-drift-{name}.pdf"
+                pdf.write_bytes(b"%PDF-1.4\nblocked reference drift\n")
+                first = self.root / f"blocked-reference-drift-{name}-a.png"
+                second = self.root / f"blocked-reference-drift-{name}-b.png"
+                added = self.root / f"blocked-reference-drift-{name}-c.png"
+                first.write_bytes(_png(2, 2, 10))
+                second.write_bytes(_png(2, 2, 20))
+                added.write_bytes(_png(2, 2, 30))
+                blocked_references = [first, second]
+                blocked = core.prepare_source(
+                    run,
+                    pdf,
+                    reference_images=blocked_references,
+                    tool_paths={
+                        tool: None
+                        for tool in ("pdftotext", "pdfinfo", "pdftoppm", "pdfimages")
+                    },
+                )
+                self.assertEqual(blocked["status"], "blocked")
+                retry_references = [first, second, added]
+                if name == "changed":
+                    replacement = self.root / "blocked-reference-drift-replacement.png"
+                    replacement.write_bytes(_png(2, 2, 99))
+                    retry_references[0] = replacement
+                retry_references = [retry_references[index] for index in retry_order]
+                tools, _calls = self._fake_poppler(
+                    f"blocked-reference-drift-{name}-poppler"
+                )
+                before = _tree_snapshot(run)
+
+                with self.assertRaises(core.StateError):
+                    core.prepare_source(
+                        run,
+                        pdf,
+                        reference_images=retry_references,
+                        tool_paths=tools,
+                    )
+
+                self.assertEqual(_tree_snapshot(run), before)
+
+    def test_blocked_pdf_retry_accepts_identical_or_empty_reference_requests(self) -> None:
+        for name, with_reference in (("same-a", True), ("no-reference", False)):
+            with self.subTest(name=name):
+                run = self.root / "runs" / f"blocked-reference-positive-{name}"
+                self._initialize(run, run_format_version=2)
+                pdf = self.root / f"blocked-reference-positive-{name}.pdf"
+                pdf.write_bytes(b"%PDF-1.4\nblocked reference positive\n")
+                reference = self.root / f"blocked-reference-positive-{name}.png"
+                reference.write_bytes(_png(2, 2, 44))
+                references = [reference] if with_reference else []
+                blocked = core.prepare_source(
+                    run,
+                    pdf,
+                    reference_images=references,
+                    tool_paths={
+                        tool: None
+                        for tool in ("pdftotext", "pdfinfo", "pdftoppm", "pdfimages")
+                    },
+                )
+                tools, _calls = self._fake_poppler(
+                    f"blocked-reference-positive-{name}-poppler"
+                )
+
+                ready = core.prepare_source(
+                    run,
+                    pdf,
+                    reference_images=references,
+                    tool_paths=tools,
+                )
+
+                self.assertEqual(blocked["status"], "blocked")
+                self.assertEqual(ready["status"], "ready")
+                self.assertEqual(ready["visual_count"], len(references))
+
+        markdown_run = self.root / "runs" / "ordinary-markdown-after-reference-fix"
+        self._initialize(markdown_run, run_format_version=2)
+        markdown = self.root / "ordinary-markdown-after-reference-fix.md"
+        markdown.write_text("# Ordinary Markdown\n\nStill prepares normally.\n", encoding="utf-8")
+
+        prepared = core.prepare_source(markdown_run, markdown)
+
+        self.assertEqual(prepared["status"], "ready")
+        self.assertEqual(prepared["visual_count"], 0)
 
     def test_v2_plan_reuse_honors_catalog_limit_with_one_attempt_binding(self) -> None:
         run, selection, crops = self._review_source_fixture("plan-reuse")

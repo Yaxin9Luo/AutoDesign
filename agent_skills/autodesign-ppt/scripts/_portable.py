@@ -2840,6 +2840,56 @@ def _reference_image_bindings(
     ]
 
 
+def _style_reference_bindings_from_visuals(
+    visuals: Mapping[str, Any],
+) -> list[dict[str, str]]:
+    raw_visuals = visuals.get("visuals")
+    if not isinstance(raw_visuals, list):
+        raise IntegrityError("source visual contract has no visuals list")
+    bindings: list[dict[str, str]] = []
+    for index, visual in enumerate(raw_visuals, start=1):
+        if not isinstance(visual, Mapping) or visual.get("origin") != "style_reference":
+            raise IntegrityError("Agent-first source visual is not a style reference")
+        relative = visual.get("path")
+        digest = visual.get("sha256")
+        if not isinstance(relative, str) or not isinstance(digest, str):
+            raise IntegrityError("style reference binding is incomplete")
+        suffix = Path(relative).suffix.lower()
+        expected_path = f"reference_images/reference-{index:03d}{suffix}"
+        if (
+            relative != expected_path
+            or suffix not in _REFERENCE_IMAGE_SIGNATURES
+            or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+        ):
+            raise IntegrityError("style reference binding is noncanonical")
+        bindings.append(
+            {
+                "path": f"evidence/{relative}",
+                "suffix": suffix,
+                "sha256": digest,
+            }
+        )
+    return bindings
+
+
+def _blocked_source_reference_bindings(
+    run: Path, manifest: Mapping[str, Any]
+) -> list[dict[str, str]]:
+    digest = manifest.get("source_visuals_sha256")
+    visuals_path = run / "evidence" / "source_visuals.json"
+    if (
+        not isinstance(digest, str)
+        or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+        or sha256_file(visuals_path) != digest
+    ):
+        raise IntegrityError("blocked source visual binding is stale")
+    reconstructed = _style_reference_bindings_from_visuals(_load_visuals(run))
+    persisted = manifest.get("reference_images")
+    if persisted is not None and persisted != reconstructed:
+        raise IntegrityError("blocked source reference request binding is stale")
+    return reconstructed
+
+
 def _write_v2_style_references(
     run: Path,
     requests: Sequence[Mapping[str, Any]],
@@ -3297,6 +3347,7 @@ def _prepare_source_v2(
         "source_sha256": sha256_file(input_source),
         "source_size": input_source.stat().st_size,
         "tools": {},
+        "reference_images": _reference_image_bindings(reference_requests),
     }
     visuals = _write_v2_style_references(run, reference_requests)
     atomic_write_json(
@@ -3943,12 +3994,21 @@ def _prepare_source_v2_transaction(
         raise IntegrityError("source manifest hash mismatch")
     if state.get("state") not in {"initialized", "blocked"}:
         raise StateError("source preparation must occur before curation")
-    if _read_json(manifest_path).get("status") == "ready":
+    source_manifest = _read_json(manifest_path)
+    if source_manifest.get("status") == "ready":
         raise StateError("a ready source cannot be replaced; initialize a new run")
     suffix = source.suffix.lower()
     if suffix not in {".md", ".markdown", ".txt", ".pdf"}:
         raise ContractError(f"unsupported source type: {suffix or '<none>'}")
     reference_requests = _reference_image_requests(reference_images)
+    if source_manifest.get("status") == "blocked":
+        expected_references = _blocked_source_reference_bindings(
+            run, source_manifest
+        )
+        if expected_references != _reference_image_bindings(reference_requests):
+            raise StateError(
+                "blocked source retry must preserve ordered style references"
+            )
     input_source = run / "input" / f"source{suffix}"
     input_entries = list((run / "input").iterdir())
     if input_entries:
@@ -4259,6 +4319,13 @@ def _verify_source_contract(run: Path, state: Mapping[str, Any]) -> dict[str, An
             raise IntegrityError("source contract hash mismatch: source_visuals_sha256")
         visuals = _load_visuals(run)
         _verify_style_reference_registry(run, visuals)
+        persisted_references = manifest.get("reference_images")
+        if (
+            persisted_references is not None
+            and persisted_references
+            != _style_reference_bindings_from_visuals(visuals)
+        ):
+            raise IntegrityError("source style reference request binding is stale")
     if manifest.get("status") != "ready":
         return manifest
     expected = {
