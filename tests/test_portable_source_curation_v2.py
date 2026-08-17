@@ -707,6 +707,49 @@ elif name == "pdfimages":
         with self.assertRaises(core.IntegrityError):
             core.record_source_review(run, context["context_path"], review)
 
+    def test_resume_completes_each_source_review_transaction_boundary(self) -> None:
+        boundaries = (
+            "after_review_staging_write",
+            "after_curation_promotion",
+            "after_curation_pointer_write",
+            "after_curation_event_write",
+        )
+        for boundary in boundaries:
+            with self.subTest(boundary=boundary):
+                run, selection, _ = self._review_source_fixture(
+                    f"review-resume-{boundary}"
+                )
+                context = core.create_source_review_context(run, selection)
+                review = self._review_fixture(context)
+                with self.assertRaises(core.SimulatedCrash):
+                    core.record_source_review(
+                        run,
+                        context["context_path"],
+                        review,
+                        fail_at=boundary,
+                    )
+
+                recovered = core.resume_run(run, skill_root=self.skill)
+
+                self.assertEqual(
+                    (
+                        recovered["state"],
+                        recovered["active_curation_revision"],
+                        recovered["next_action"],
+                    ),
+                    ("curated", 1, "plan"),
+                )
+                self.assertFalse(
+                    any((run / "curations").glob(".curation-staging-*"))
+                )
+                self.assertEqual(
+                    sum(
+                        event.get("event") == "source_review_passed"
+                        for event in _events(run)
+                    ),
+                    1,
+                )
+
     def test_source_review_transactions_serialize_and_v1_rejects_before_locking(self) -> None:
         run, selection, _ = self._review_source_fixture("review-concurrency")
         with ThreadPoolExecutor(max_workers=4) as executor:
@@ -745,6 +788,27 @@ elif name == "pdfimages":
         with self.assertRaises(core.StateError):
             core.record_source_review(v1, "source-reviews/review-deadbeef0000-001/context.json", {})
         self.assertEqual(_tree_snapshot(v1.parent), parent_before)
+
+    def test_task4_v2_apis_reject_v1_before_any_lock_staging_or_event_write(self) -> None:
+        v1 = self.root / "runs" / "task4-v1-rejection"
+        self._initialize(v1)
+        parent_before = _tree_snapshot(v1.parent)
+
+        with self.assertRaises(core.StateError):
+            core.save_plan_revision(v1, {"artifact_type": "poster", "visual_allocations": []})
+        with self.assertRaises(core.StateError):
+            core.load_active_plan(v1)
+        with self.assertRaises(core.StateError):
+            core.load_attempt_plan(v1, "01")
+        with self.assertRaises(core.StateError):
+            core.load_attempt_visual_catalog(v1, "01")
+        with self.assertRaises(core.StateError):
+            core.reopen_curation(v1, {})
+        with self.assertRaises(core.ContractError):
+            core.begin_attempt(v1, fail_at="after_attempt_staging_write")
+
+        self.assertEqual(_tree_snapshot(v1.parent), parent_before)
+        self.assertFalse((v1.parent / f".{v1.name}.v2-init.lock").exists())
 
     def test_source_review_registry_and_committed_history_are_exact_before_append(self) -> None:
         run, selection, _ = self._review_source_fixture("review-registry-extra")
