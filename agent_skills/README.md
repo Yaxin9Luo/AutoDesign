@@ -39,7 +39,7 @@ Then install all four Skills into the shared Codex and DeepSeek Harness user
 directory:
 
 ```bash
-DESTINATION="$HOME/.agents/skills"
+DESTINATION="${DESTINATION:-$HOME/.agents/skills}"
 
 for skill in autodesign-poster autodesign-ppt autodesign-webpage autodesign-video; do
   python3 -I ./package_agent_skills.py install \
@@ -68,9 +68,9 @@ also use `~/.codex/skills`.
 DESTINATION="$HOME/.agents/skills"
 ```
 
-Set this before running the [Quick install](#quick-install) loop. After
-installation, start a new Codex task if the Skills do not appear immediately.
-See the official [Codex Skills documentation](https://developers.openai.com/codex/skills).
+Use this value for `DESTINATION` in the [Quick install](#quick-install) shell.
+After installation, start a new Codex task if the Skills do not appear
+immediately. See the official [Codex Skills documentation](https://developers.openai.com/codex/skills).
 
 ### Claude Code
 
@@ -80,7 +80,8 @@ Claude Code discovers personal Skills under `~/.claude/skills`:
 DESTINATION="$HOME/.claude/skills"
 ```
 
-Set this before running the [Quick install](#quick-install) loop. Claude Code
+Set this in the same shell before running the [Quick install](#quick-install)
+loop; the loop preserves a destination you already selected. Claude Code
 normally detects changes in an existing Skills directory. Restart it if this is
 the first Skill directory on the machine. See the official [Claude Code Skills
 documentation](https://code.claude.com/docs/en/skills).
@@ -95,9 +96,10 @@ installation, use:
 DESTINATION="$HOME/.dsh/skills"
 ```
 
-Set this before running the [Quick install](#quick-install) loop. Use
-`DESTINATION="$HOME/.agents/skills"` instead when you want one shared
-installation for Codex and DeepSeek Harness. See the official
+Set this in the same shell before running the [Quick install](#quick-install)
+loop; the loop preserves a destination you already selected. Use
+`DESTINATION="$HOME/.agents/skills"` instead when you want one shared installation
+for Codex and DeepSeek Harness. See the official
 [DeepSeek Harness Skills subsystem](https://github.com/deepseek-ai/deepseek-harness/blob/master/docs/subsystems/skills.md).
 
 ### Installer details and Windows
@@ -133,6 +135,12 @@ Windows example for all four Skills (change `$Destination` for Codex or
 DeepSeek Harness):
 
 ```powershell
+New-Item -ItemType Directory -Force autodesign-skills-v0.1.0 | Out-Null
+gh release download agent-skills-v0.1.0 `
+  --repo Yaxin9Luo/AutoDesign `
+  --dir autodesign-skills-v0.1.0
+Set-Location autodesign-skills-v0.1.0
+
 $Destination = "$HOME\.claude\skills"
 foreach ($Skill in @("autodesign-poster", "autodesign-ppt", "autodesign-webpage", "autodesign-video")) {
   py -3 -I .\package_agent_skills.py install `

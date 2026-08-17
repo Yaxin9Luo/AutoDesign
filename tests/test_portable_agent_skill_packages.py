@@ -77,10 +77,11 @@ class PortableAgentSkillPackageTests(unittest.TestCase):
             self.assertIn(heading, skills_documentation)
         for marker in (
             "gh release download agent-skills-v0.1.0",
-            'DESTINATION="$HOME/.agents/skills"',
+            'DESTINATION="${DESTINATION:-$HOME/.agents/skills}"',
             'DESTINATION="$HOME/.claude/skills"',
             'DESTINATION="$HOME/.dsh/skills"',
             '--archive "./${skill}-0.1.0.zip"',
+            "Set-Location autodesign-skills-v0.1.0",
             "package_agent_skills.py install",
             "70–80%",
             "future target",
