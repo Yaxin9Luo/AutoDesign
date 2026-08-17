@@ -13,8 +13,9 @@ independently installable, self-contained Agent Skills:
 
 Each Skill carries a lightweight local harness for evidence, attempts,
 deterministic checks, rendering, and delivery. No AutoDesign application server
-is required. Mutable runs, caches, and generated artifacts stay in an output
-directory selected by the user, never inside the installed Skill.
+is required. Run state and generated artifacts stay in an output directory
+selected by the user. Managed runtimes stay in a versioned user cache; the
+workflow never writes generated output into the installed Skill.
 
 > [!IMPORTANT]
 > The Skill edition is the portable, convenient way to use part of AutoDesign
@@ -24,24 +25,33 @@ directory selected by the user, never inside the installed Skill.
 
 ## Quick install
 
-The shortest route is the official GitHub CLI Skill installer. Check that your
-GitHub CLI includes it:
+Download the checksum-verified release bundle with GitHub CLI:
 
 ```bash
-gh skill install --help
+mkdir -p autodesign-skills-v0.1.0
+gh release download agent-skills-v0.1.0 \
+  --repo Yaxin9Luo/AutoDesign \
+  --dir autodesign-skills-v0.1.0
+cd autodesign-skills-v0.1.0
 ```
 
-Install all four Skills for Codex at user scope:
+Then install all four Skills into the shared Codex and DeepSeek Harness user
+directory:
 
 ```bash
-gh skill install Yaxin9Luo/AutoDesign agent_skills/autodesign-poster --agent codex --scope user
-gh skill install Yaxin9Luo/AutoDesign agent_skills/autodesign-ppt --agent codex --scope user
-gh skill install Yaxin9Luo/AutoDesign agent_skills/autodesign-webpage --agent codex --scope user
-gh skill install Yaxin9Luo/AutoDesign agent_skills/autodesign-video --agent codex --scope user
+DESTINATION="$HOME/.agents/skills"
+
+for skill in autodesign-poster autodesign-ppt autodesign-webpage autodesign-video; do
+  python3 -I ./package_agent_skills.py install \
+    --archive "./${skill}-0.1.0.zip" \
+    --checksum "./${skill}-0.1.0.zip.sha256" \
+    --destination "$DESTINATION"
+done
 ```
 
-Install only the artifact types you need. If `gh skill` is unavailable, update
-GitHub CLI or use the checksum-verified release installer below.
+Install only the artifact types you need by running the command for one Skill.
+The installer checks SHA-256, validates the extracted package, promotes it
+atomically, and refuses to overwrite an existing installation.
 
 ## Install by Coding Agent
 
@@ -55,43 +65,42 @@ Codex discovers user Skills under `~/.agents/skills`. Older local setups may
 also use `~/.codex/skills`.
 
 ```bash
-gh skill install Yaxin9Luo/AutoDesign agent_skills/autodesign-poster --agent codex --scope user
+DESTINATION="$HOME/.agents/skills"
 ```
 
-After installation, start a new Codex task if the Skill does not appear
-immediately. See the official [Codex Skills documentation](https://developers.openai.com/codex/skills).
+Set this before running the [Quick install](#quick-install) loop. After
+installation, start a new Codex task if the Skills do not appear immediately.
+See the official [Codex Skills documentation](https://developers.openai.com/codex/skills).
 
 ### Claude Code
 
 Claude Code discovers personal Skills under `~/.claude/skills`:
 
 ```bash
-for skill in autodesign-poster autodesign-ppt autodesign-webpage autodesign-video; do
-  gh skill install Yaxin9Luo/AutoDesign "agent_skills/$skill" --agent claude-code --scope user
-done
+DESTINATION="$HOME/.claude/skills"
 ```
 
-Claude Code normally detects changes in an existing Skills directory. Restart
-it if this is the first Skill directory on the machine. See the official
-[Claude Code Skills documentation](https://code.claude.com/docs/en/skills).
+Set this before running the [Quick install](#quick-install) loop. Claude Code
+normally detects changes in an existing Skills directory. Restart it if this is
+the first Skill directory on the machine. See the official [Claude Code Skills
+documentation](https://code.claude.com/docs/en/skills).
 
 ### DeepSeek Harness
 
 DeepSeek Harness supports project roots `.dsh/skills` and `.agents/skills`, plus
-the user roots `~/.dsh/skills` and `~/.agents/skills`. This command installs all
-four into the user DSH root:
+the user roots `~/.dsh/skills` and `~/.agents/skills`. For a DSH-only user
+installation, use:
 
 ```bash
-for skill in autodesign-poster autodesign-ppt autodesign-webpage autodesign-video; do
-  gh skill install Yaxin9Luo/AutoDesign "agent_skills/$skill" --dir "$HOME/.dsh/skills"
-done
+DESTINATION="$HOME/.dsh/skills"
 ```
 
-Use `--dir "$HOME/.agents/skills"` instead when you want one shared installation
-for Codex and DeepSeek Harness. See the official
+Set this before running the [Quick install](#quick-install) loop. Use
+`DESTINATION="$HOME/.agents/skills"` instead when you want one shared
+installation for Codex and DeepSeek Harness. See the official
 [DeepSeek Harness Skills subsystem](https://github.com/deepseek-ai/deepseek-harness/blob/master/docs/subsystems/skills.md).
 
-### Checksum-verified release installer
+### Installer details and Windows
 
 The [`agent-skills-v0.1.0` release](https://github.com/Yaxin9Luo/AutoDesign/releases/tag/agent-skills-v0.1.0)
 contains four ZIPs, four SHA-256 sidecars, a manifest, and a standalone
@@ -120,13 +129,17 @@ Replace `autodesign-poster` with another Skill name and choose the destination
 for your Coding Agent. The installer verifies SHA-256, validates extracted
 contents, promotes atomically, and refuses to overwrite an existing Skill.
 
-Windows example:
+Windows example for all four Skills (change `$Destination` for Codex or
+DeepSeek Harness):
 
 ```powershell
-py -3 .\package_agent_skills.py install `
-  --archive .\autodesign-poster-0.1.0.zip `
-  --checksum .\autodesign-poster-0.1.0.zip.sha256 `
-  --destination "$HOME\.claude\skills"
+$Destination = "$HOME\.claude\skills"
+foreach ($Skill in @("autodesign-poster", "autodesign-ppt", "autodesign-webpage", "autodesign-video")) {
+  py -3 -I .\package_agent_skills.py install `
+    --archive ".\$Skill-0.1.0.zip" `
+    --checksum ".\$Skill-0.1.0.zip.sha256" `
+    --destination $Destination
+}
 ```
 
 ## First run
@@ -146,8 +159,8 @@ the source evidence, authors bounded attempts, executes deterministic QA, and
 requests a fresh visual review before final delivery. The first browser, PPT,
 or Video run may download pinned runtime dependencies into a user cache.
 
-Generated deliverables live under the run directory you requested. The
-installed Skill remains read-only.
+Generated deliverables live under the run directory you requested. The workflow
+does not write run state, caches, or artifacts into the installed Skill.
 
 ## Requirements
 

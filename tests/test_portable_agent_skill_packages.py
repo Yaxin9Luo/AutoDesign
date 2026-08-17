@@ -65,10 +65,6 @@ class PortableAgentSkillPackageTests(unittest.TestCase):
         for name in APPROVED_SKILLS:
             with self.subTest(skill=name):
                 self.assertIn(name, skills_documentation)
-                self.assertIn(
-                    f"agent_skills/{name} --agent codex --scope user",
-                    skills_documentation,
-                )
         for heading in (
             "## Quick install",
             "## Install by Coding Agent",
@@ -80,9 +76,11 @@ class PortableAgentSkillPackageTests(unittest.TestCase):
         ):
             self.assertIn(heading, skills_documentation)
         for marker in (
-            "gh skill install",
-            "--agent claude-code --scope user",
-            '--dir "$HOME/.dsh/skills"',
+            "gh release download agent-skills-v0.1.0",
+            'DESTINATION="$HOME/.agents/skills"',
+            'DESTINATION="$HOME/.claude/skills"',
+            'DESTINATION="$HOME/.dsh/skills"',
+            '--archive "./${skill}-0.1.0.zip"',
             "package_agent_skills.py install",
             "70–80%",
             "future target",
@@ -94,6 +92,10 @@ class PortableAgentSkillPackageTests(unittest.TestCase):
             "docs/subsystems/skills.md",
         ):
             self.assertIn(marker, skills_documentation)
+        self.assertNotIn(
+            "gh skill install Yaxin9Luo/AutoDesign agent_skills/",
+            skills_documentation,
+        )
 
     def test_public_docs_cover_agent_discovery_interpreters_and_prerequisites(self) -> None:
         skills_documentation = SKILLS_README.read_text(encoding="utf-8")
