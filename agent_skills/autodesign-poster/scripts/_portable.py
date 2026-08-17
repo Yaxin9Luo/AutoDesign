@@ -27,7 +27,7 @@ from collections import Counter
 from contextlib import contextmanager
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from stat import S_ISREG
+from stat import S_ISDIR, S_ISLNK, S_ISREG
 from typing import Any, Iterable, Iterator, Mapping, Sequence
 
 
@@ -431,9 +431,7 @@ def _load_agent_first_run(run_dir: Path | str) -> tuple[Path, dict[str, Any]]:
     if inspect_run_format(run_dir) != AGENT_FIRST_RUN_FORMAT_VERSION:
         raise StateError("version-1 runs do not support Agent-first source APIs")
     run, state = _load_run(run_dir)
-    for path in run.rglob("*"):
-        if path.is_file() and path.stat().st_nlink != 1:
-            raise PathSafetyError(f"Agent-first run must not contain hardlinks: {path}")
+    _regular_tree_inventory(run)
     return run, state
 
 
@@ -536,19 +534,47 @@ def _load_run(run_dir: Path | str) -> tuple[Path, dict[str, Any]]:
     return root, state
 
 
-def _remove_regular_tree(path: Path) -> None:
-    if path.is_symlink() or not path.is_dir():
+def _regular_tree_inventory(path: Path) -> tuple[set[str], set[str]]:
+    """List every regular file and directory, rejecting all other entry types."""
+
+    try:
+        root_details = path.lstat()
+    except OSError as error:
+        raise PathSafetyError(f"unsafe staging directory: {path}") from error
+    if S_ISLNK(root_details.st_mode) or not S_ISDIR(root_details.st_mode):
         raise PathSafetyError(f"unsafe staging directory: {path}")
-    for current, directories, files in os.walk(path, followlinks=False):
-        current_path = Path(current)
-        for name in directories:
-            child = current_path / name
-            if child.is_symlink():
-                raise PathSafetyError(f"unsafe staging directory entry: {child}")
-        for name in files:
-            child = current_path / name
-            if child.is_symlink() or not child.is_file() or child.stat().st_nlink != 1:
-                raise PathSafetyError(f"unsafe staging file: {child}")
+    files: set[str] = set()
+    directories: set[str] = set()
+    pending = [path]
+    while pending:
+        current = pending.pop()
+        try:
+            entries = list(os.scandir(current))
+        except OSError as error:
+            raise PathSafetyError(f"unsafe staging directory: {current}") from error
+        for entry in entries:
+            child = current / entry.name
+            try:
+                details = entry.stat(follow_symlinks=False)
+            except OSError as error:
+                raise PathSafetyError(f"unsafe staging entry: {child}") from error
+            relative = child.relative_to(path).as_posix()
+            if S_ISLNK(details.st_mode):
+                raise PathSafetyError(f"unsafe staging symlink: {child}")
+            if S_ISDIR(details.st_mode):
+                directories.add(relative)
+                pending.append(child)
+            elif S_ISREG(details.st_mode):
+                if details.st_nlink != 1:
+                    raise PathSafetyError(f"hardlinked staging file: {child}")
+                files.add(relative)
+            else:
+                raise PathSafetyError(f"nonregular staging entry: {child}")
+    return files, directories
+
+
+def _remove_regular_tree(path: Path) -> None:
+    _regular_tree_inventory(path)
     shutil.rmtree(path)
 
 
@@ -695,11 +721,7 @@ def _validate_agent_first_initialization(
             for entry in manifest["files"]
         ),
     }
-    actual_files = {
-        path.relative_to(run).as_posix()
-        for path in run.rglob("*")
-        if path.is_file()
-    }
+    actual_files, actual_directories = _regular_tree_inventory(run)
     if actual_files != expected_files:
         raise IntegrityError("Agent-first initialization staging file set is not exact")
     expected_directories: set[str] = set(_AGENT_FIRST_INITIAL_DIRECTORIES)
@@ -708,11 +730,6 @@ def _validate_agent_first_initialization(
         while parent != Path("."):
             expected_directories.add(parent.as_posix())
             parent = parent.parent
-    actual_directories = {
-        path.relative_to(run).as_posix()
-        for path in run.rglob("*")
-        if path.is_dir()
-    }
     if actual_directories != expected_directories:
         raise IntegrityError(
             "Agent-first initialization staging directory set is not exact"
@@ -1286,12 +1303,60 @@ def _run_relative_diagnostic(run: Path, text: str, *additional_roots: Path) -> s
 def _png_dimensions(path: Path) -> tuple[int, int]:
     """Validate one complete PNG stream and return its bound dimensions."""
 
+    maximum_file_bytes = 256 * 1024 * 1024
     maximum_chunk_bytes = 256 * 1024 * 1024
     maximum_image_bytes = 512 * 1024 * 1024
     try:
-        data = path.read_bytes()
+        published = path.lstat()
     except OSError as error:
         raise IntegrityError(f"cannot read rendered page: {path}") from error
+    if (
+        S_ISLNK(published.st_mode)
+        or not S_ISREG(published.st_mode)
+        or published.st_nlink != 1
+    ):
+        raise PathSafetyError(f"rendered page must be a single-link regular file: {path}")
+    if published.st_size > maximum_file_bytes:
+        raise IntegrityError(f"rendered PNG file is too large: {path}")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise IntegrityError(f"cannot read rendered page: {path}") from error
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or (opened.st_dev, opened.st_ino) != (published.st_dev, published.st_ino)
+        ):
+            raise PathSafetyError(
+                f"rendered page identity changed before validation: {path}"
+            )
+        if opened.st_size != published.st_size or opened.st_size > maximum_file_bytes:
+            raise IntegrityError(f"rendered PNG file size changed before validation: {path}")
+        remaining = opened.st_size
+        parts: list[bytes] = []
+        while remaining:
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                raise IntegrityError(f"rendered PNG was truncated while reading: {path}")
+            parts.append(chunk)
+            remaining -= len(chunk)
+        if os.read(descriptor, 1):
+            raise IntegrityError(f"rendered PNG grew while reading: {path}")
+        final = os.fstat(descriptor)
+        if (
+            final.st_size != opened.st_size
+            or final.st_nlink != 1
+            or (final.st_dev, final.st_ino) != (opened.st_dev, opened.st_ino)
+        ):
+            raise IntegrityError(f"rendered PNG changed while reading: {path}")
+        data = b"".join(parts)
+    except OSError as error:
+        raise IntegrityError(f"cannot read rendered page: {path}") from error
+    finally:
+        os.close(descriptor)
     if not data.startswith(b"\x89PNG\r\n\x1a\n"):
         raise IntegrityError(f"rendered page is not a canonical PNG: {path}")
 
@@ -1718,35 +1783,63 @@ _SOURCE_SINGLE_FILES = {
     "evidence/source_visuals.json",
     "evidence/source_manifest.json",
 }
+_SOURCE_STAGE_DIRECTORIES = {
+    "input",
+    "evidence",
+    "evidence/pages",
+    "evidence/assets",
+    "evidence/reference_images",
+}
+
+
+def _source_pretransaction_file_is_expected(relative: str) -> bool:
+    return (
+        relative in {"run.json", "events.jsonl"}
+        or relative in _SOURCE_SINGLE_FILES
+        or re.fullmatch(r"input/source(?:\.md|\.markdown|\.txt|\.pdf)", relative)
+        is not None
+        or re.fullmatch(r"evidence/pages/page-\d+\.png", relative) is not None
+        or re.fullmatch(r"evidence/assets/pdf-image[^/]+", relative) is not None
+    )
+
+
+def _discard_incomplete_source_stage(stage: Path) -> None:
+    files, directories = _regular_tree_inventory(stage)
+    unexpected_files = {
+        relative for relative in files if not _source_pretransaction_file_is_expected(relative)
+    }
+    if unexpected_files or not directories.issubset(_SOURCE_STAGE_DIRECTORIES):
+        raise IntegrityError("incomplete source staging tree is not process-owned")
+    _remove_regular_tree(stage)
 
 
 def _source_stage_files(stage: Path) -> dict[str, str]:
+    staged_files, _directories = _regular_tree_inventory(stage)
     files: dict[str, str] = {}
-    for root in (stage / "input", stage / "evidence"):
-        for path in sorted(root.rglob("*")):
-            if path.is_symlink():
-                raise PathSafetyError(f"unsafe source staging path: {path}")
-            if path.is_file():
-                if path.stat().st_nlink != 1:
-                    raise PathSafetyError(f"hardlinked source staging file: {path}")
-                relative = path.relative_to(stage).as_posix()
-                if (
-                    relative not in _SOURCE_SINGLE_FILES
-                    and not relative.startswith("input/")
-                    and re.fullmatch(r"evidence/pages/page-\d{4}\.png", relative)
-                    is None
-                    and re.fullmatch(r"evidence/assets/pdf-image[^/]+", relative)
-                    is None
-                ):
-                    raise IntegrityError(f"unexpected source staging file: {relative}")
-                files[relative] = sha256_file(path)
-            elif not path.is_dir():
-                raise PathSafetyError(f"unsafe source staging entry: {path}")
+    for relative in sorted(staged_files):
+        if not relative.startswith(("input/", "evidence/")):
+            continue
+        if (
+            relative not in _SOURCE_SINGLE_FILES
+            and not relative.startswith("input/")
+            and re.fullmatch(r"evidence/pages/page-\d{4}\.png", relative) is None
+            and re.fullmatch(r"evidence/assets/pdf-image[^/]+", relative) is None
+        ):
+            raise IntegrityError(f"unexpected source staging file: {relative}")
+        files[relative] = sha256_file(stage / relative)
     return files
 
 
-def _seed_source_stage(run: Path, state: Mapping[str, Any], stage: Path) -> None:
+def _seed_source_stage(
+    run: Path,
+    state: Mapping[str, Any],
+    stage: Path,
+    *,
+    fail_at: str | None,
+) -> None:
     stage.mkdir()
+    if fail_at == "after_source_stage_mkdir":
+        raise SimulatedCrash("after source staging directory creation")
     for relative in (
         "input",
         "evidence/pages",
@@ -1808,8 +1901,7 @@ def _validate_source_transaction(
     stage: Path,
     source: Path,
 ) -> dict[str, Any]:
-    if stage.is_symlink() or not stage.is_dir():
-        raise PathSafetyError(f"unsafe source staging directory: {stage}")
+    actual_stage_files, actual_stage_directories = _regular_tree_inventory(stage)
     transaction_path = stage / "transaction.json"
     transaction = _read_json(transaction_path)
     if transaction_path.read_bytes() != _stored_json_bytes(transaction):
@@ -1840,30 +1932,14 @@ def _validate_source_transaction(
         "events.jsonl",
         "transaction.json",
     }
-    actual_stage_files = {
-        path.relative_to(stage).as_posix()
-        for path in stage.rglob("*")
-        if path.is_file()
-    }
     if actual_stage_files != expected_stage_files:
         raise IntegrityError("source staging file set is not exact")
-    expected_stage_directories = {
-        "input",
-        "evidence",
-        "evidence/pages",
-        "evidence/assets",
-        "evidence/reference_images",
-    }
+    expected_stage_directories = set(_SOURCE_STAGE_DIRECTORIES)
     for relative in expected_stage_files:
         parent = Path(relative).parent
         while parent != Path("."):
             expected_stage_directories.add(parent.as_posix())
             parent = parent.parent
-    actual_stage_directories = {
-        path.relative_to(stage).as_posix()
-        for path in stage.rglob("*")
-        if path.is_dir()
-    }
     if actual_stage_directories != expected_stage_directories:
         raise IntegrityError("source staging directory set is not exact")
     live_input = safe_path(run, input_paths[0], must_exist=True)
@@ -1994,9 +2070,10 @@ def _prepare_source_v2_transaction(
         raise PathSafetyError(f"source must be a regular non-symlink file: {source}")
     stage = run / ".source-prep-staging"
     if stage.exists() or stage.is_symlink():
-        return _commit_source_transaction(
-            run, stage, source, fail_at=fail_at
-        )
+        staged_files, _staged_directories = _regular_tree_inventory(stage)
+        if "transaction.json" in staged_files:
+            return _commit_source_transaction(run, stage, source, fail_at=fail_at)
+        _discard_incomplete_source_stage(stage)
     manifest_path = run / "evidence" / "source_manifest.json"
     if sha256_file(manifest_path) != state.get("source_manifest_sha256"):
         raise IntegrityError("source manifest hash mismatch")
@@ -2023,8 +2100,8 @@ def _prepare_source_v2_transaction(
     else:
         atomic_write_bytes(input_source, source.read_bytes())
     previous_events = _read_event_log(run / "events.jsonl")
-    _seed_source_stage(run, state, stage)
     try:
+        _seed_source_stage(run, state, stage, fail_at=fail_at)
         _prepare_source_v2(
             stage,
             dict(state),
@@ -2041,6 +2118,8 @@ def _prepare_source_v2_transaction(
             previous_state=state,
             previous_events=previous_events,
         )
+    except SimulatedCrash:
+        raise
     except Exception:
         if stage.exists() and not stage.is_symlink():
             _remove_regular_tree(stage)
@@ -2063,6 +2142,7 @@ def prepare_source(
 
     allowed_failures = {
         None,
+        "after_source_stage_mkdir",
         "after_source_outputs_staged",
         "after_source_manifest_promotion",
         "after_source_run_update",

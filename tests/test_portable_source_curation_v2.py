@@ -785,6 +785,36 @@ elif name == "pdfimages":
             self._initialize(init_run, run_format_version=2)
         self.assertFalse(init_run.exists())
 
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "FIFO creation is unavailable")
+    def test_v2_initialization_staging_rejects_special_entries(self) -> None:
+        run = self.root / "runs" / "init-stage-fifo"
+        with self.assertRaises(core.SimulatedCrash):
+            core.initialize_run(
+                run,
+                self.skill,
+                release_version="0.1.0",
+                archive_sha256="a" * 64,
+                run_format_version=2,
+                fail_at="after_init_event_append",
+            )
+        stage = run.parent / f".{run.name}.v2-init-staging"
+        os.mkfifo(stage / "rogue.pipe")
+
+        with self.assertRaises(core.PathSafetyError):
+            self._initialize(run, run_format_version=2)
+
+        self.assertFalse(run.exists())
+        self.assertTrue((stage / "rogue.pipe").exists())
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "FIFO creation is unavailable")
+    def test_v2_initialization_live_run_rejects_special_entries(self) -> None:
+        run = self.root / "runs" / "init-live-fifo"
+        self._initialize(run, run_format_version=2)
+        os.mkfifo(run / "rogue.pipe")
+
+        with self.assertRaises(core.PathSafetyError):
+            self._initialize(run, run_format_version=2)
+
     def test_v2_source_staging_rejects_a_nonexact_file_set(self) -> None:
         source_run = self.root / "runs" / "source-stage-extra"
         self._initialize(source_run, run_format_version=2)
@@ -804,6 +834,60 @@ elif name == "pdfimages":
             (source_run / "evidence" / "source_manifest.json").read_text(encoding="utf-8")
         )
         self.assertEqual((state["state"], manifest["status"]), ("initialized", "not_prepared"))
+
+    def test_v2_source_stage_mkdir_crash_recovers_exactly_once(self) -> None:
+        run = self.root / "runs" / "source-stage-mkdir-crash"
+        self._initialize(run, run_format_version=2)
+        source = self.root / "source-stage-mkdir-crash.md"
+        source.write_text("# Recover an incomplete source transaction\n", encoding="utf-8")
+
+        with self.assertRaises(core.SimulatedCrash):
+            core.prepare_source(run, source, fail_at="after_source_stage_mkdir")
+        stage = run / ".source-prep-staging"
+        self.assertTrue(stage.is_dir())
+        self.assertEqual(list(stage.iterdir()), [])
+
+        manifest = core.prepare_source(run, source)
+
+        self.assertEqual(manifest["status"], "ready")
+        self.assertFalse(stage.exists())
+        self.assertEqual(
+            sum(event.get("event") == "source_prepared" for event in _events(run)),
+            1,
+        )
+
+    def test_v2_source_empty_staging_is_discarded_and_reseeded(self) -> None:
+        run = self.root / "runs" / "source-empty-stage"
+        self._initialize(run, run_format_version=2)
+        source = self.root / "source-empty-stage.md"
+        source.write_text("# Recover a pre-transaction stage\n", encoding="utf-8")
+        stage = run / ".source-prep-staging"
+        stage.mkdir()
+
+        manifest = core.prepare_source(run, source)
+
+        self.assertEqual(manifest["status"], "ready")
+        self.assertFalse(stage.exists())
+        self.assertEqual(
+            sum(event.get("event") == "source_prepared" for event in _events(run)),
+            1,
+        )
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "FIFO creation is unavailable")
+    def test_v2_source_incomplete_staging_rejects_special_entries(self) -> None:
+        run = self.root / "runs" / "source-stage-fifo"
+        self._initialize(run, run_format_version=2)
+        source = self.root / "source-stage-fifo.md"
+        source.write_text("# Reject an unsafe source transaction\n", encoding="utf-8")
+        stage = run / ".source-prep-staging"
+        stage.mkdir()
+        os.mkfifo(stage / "rogue.pipe")
+        before = _tree_snapshot(run)
+
+        with self.assertRaises(core.PathSafetyError):
+            core.prepare_source(run, source)
+
+        self.assertEqual(_tree_snapshot(run), before)
 
     def test_inspect_run_format_rejects_ambiguous_or_noncanonical_contracts(self) -> None:
         accepted = (
@@ -885,6 +969,37 @@ elif name == "pdfimages":
                 self.assertEqual(list((run / "evidence" / "pages").iterdir()), [])
                 self.assertFalse((run / "evidence" / "page-manifest.json").exists())
                 self.assertFalse((run / ".source-prep-staging").exists())
+
+    def test_png_input_identity_and_size_are_checked_before_reading(self) -> None:
+        oversized = self.root / "oversized.png"
+        oversized.touch()
+        os.truncate(oversized, 512 * 1024 * 1024 + 1)
+        with (
+            mock.patch.object(
+                Path,
+                "read_bytes",
+                side_effect=AssertionError("oversized PNG reached the allocation path"),
+            ),
+            mock.patch.object(
+                os,
+                "open",
+                side_effect=AssertionError("oversized PNG was opened before rejection"),
+            ),
+        ):
+            with self.assertRaises(core.IntegrityError):
+                core._png_dimensions(oversized)
+
+        valid = self.root / "valid.png"
+        valid.write_bytes(_png(1, 1, 90))
+        hardlink = self.root / "hardlinked.png"
+        os.link(valid, hardlink)
+        with self.assertRaises(core.PathSafetyError):
+            core._png_dimensions(hardlink)
+
+        symlink = self.root / "symlinked.png"
+        symlink.symlink_to(valid)
+        with self.assertRaises(core.PathSafetyError):
+            core._png_dimensions(symlink)
 
 
 if __name__ == "__main__":
