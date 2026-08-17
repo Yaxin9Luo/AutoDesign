@@ -8,6 +8,7 @@
 
 | 日期 | 更新 |
 | :--- | :--- |
+| **2026-08-17** | [可独立安装的 Poster、PPT、Webpage 与 Video Agent Skills 现已发布](./agent_skills/README.zh-CN.md) |
 | **2026-08-15** | [正式支持 DeepSeek Harness 作为 Coding Agent](https://github.com/Yaxin9Luo/AutoDesign/pull/2) |
 | **2026-08-14** | [首次公开发布](https://github.com/Yaxin9Luo/AutoDesign/commit/55586f66fa4a126997f0d252e070701c4ae68920) |
 
@@ -37,6 +38,7 @@
 
 <p align="center">
   <a href="#user-content-demos"><strong>Demo</strong></a> ·
+  <a href="#user-content-agent-skills">Agent Skills</a> ·
   <a href="#user-content-quickstart">快速开始</a> ·
   <a href="#user-content-paper-suite">论文套件</a> ·
   <a href="#user-content-methodology">方法</a> ·
@@ -82,6 +84,16 @@
     </td>
   </tr>
 </table>
+
+<a id="agent-skills"></a>
+
+## <img src="./assets/readme/icons/blocks.svg" width="26" alt="" align="absmiddle"> Agent Skills · 无需服务器也能使用 AutoDesign
+
+可将独立的 Poster、PPT、Webpage 或 Video Skill 直接安装到 Codex、Claude Code
+或 DeepSeek Harness。每个 Skill 都带有轻量级本地 harness，并将可编辑成果、证据、
+多轮尝试和评审状态保存在用户指定的输出目录中，无需运行 AutoDesign 应用服务器。
+
+[打开 Agent Skills 中文安装指南 →](./agent_skills/README.zh-CN.md)
 
 <a id="quickstart"></a>
 

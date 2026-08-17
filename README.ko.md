@@ -8,6 +8,7 @@
 
 | 날짜 | 업데이트 |
 | :--- | :--- |
+| **2026-08-17** | [Poster, PPT, Webpage, Video용 독립형 Agent Skills 설치 지원](./agent_skills/README.md) |
 | **2026-08-15** | [코딩 에이전트를 위한 공식 DeepSeek Harness 지원 추가](https://github.com/Yaxin9Luo/AutoDesign/pull/2) |
 | **2026-08-14** | [첫 공개 릴리스](https://github.com/Yaxin9Luo/AutoDesign/commit/55586f66fa4a126997f0d252e070701c4ae68920) |
 
@@ -37,6 +38,7 @@
 
 <p align="center">
   <a href="#user-content-demos"><strong>Demo</strong></a> ·
+  <a href="#user-content-agent-skills">Agent Skills</a> ·
   <a href="#user-content-quickstart">빠른 시작</a> ·
   <a href="#user-content-paper-suite">논문 패키지</a> ·
   <a href="#user-content-methodology">방법론</a> ·
@@ -83,6 +85,17 @@ Figure 2 포스터, 24장짜리 정식 학술 발표 자료, 완전한 에디토
     </td>
   </tr>
 </table>
+
+<a id="agent-skills"></a>
+
+## <img src="./assets/readme/icons/blocks.svg" width="26" alt="" align="absmiddle"> Agent Skills · 서버 없이 AutoDesign 사용하기
+
+독립형 Poster, PPT, Webpage, Video Skill을 Codex, Claude Code 또는 DeepSeek
+Harness에 직접 설치할 수 있습니다. 각 Skill에는 가벼운 로컬 하니스가 포함되며,
+편집 가능한 결과물, 근거, 시도 기록, 검토 상태를 사용자가 지정한 출력 디렉터리에
+보관합니다. AutoDesign 애플리케이션 서버는 필요하지 않습니다.
+
+[Agent Skills 설치 가이드 열기 →](./agent_skills/README.md)
 
 <a id="quickstart"></a>
 

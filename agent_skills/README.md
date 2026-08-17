@@ -1,3 +1,8 @@
+<p align="center">
+  <strong>English</strong> ·
+  <a href="./README.zh-CN.md">简体中文</a>
+</p>
+
 # AutoDesign Agent Skills
 
 Turn one research paper into an editable poster, slide deck, project webpage,
