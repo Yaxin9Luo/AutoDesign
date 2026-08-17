@@ -22,6 +22,7 @@ import subprocess
 import tempfile
 import threading
 import unicodedata
+import zlib
 from collections import Counter
 from contextlib import contextmanager
 from decimal import Decimal, InvalidOperation
@@ -331,14 +332,30 @@ def inspect_run_format(run_dir: Path | str) -> int:
     if state_path.stat().st_nlink != 1:
         raise PathSafetyError(f"run contract must not be hardlinked: {state_path}")
     state = _read_json(state_path)
-    version = state.get("run_format_version", state.get("format_version"))
+    artifact_version = state.get("format_version")
+    if "run_format_version" not in state:
+        if (
+            isinstance(artifact_version, int)
+            and not isinstance(artifact_version, bool)
+            and artifact_version == FORMAT_VERSION
+        ):
+            return RELEASED_RUN_FORMAT_VERSION
+        raise IntegrityError(
+            f"unknown or missing legacy format version: {artifact_version!r}"
+        )
+    run_version = state.get("run_format_version")
     if (
-        not isinstance(version, int)
-        or isinstance(version, bool)
-        or version not in {RELEASED_RUN_FORMAT_VERSION, AGENT_FIRST_RUN_FORMAT_VERSION}
+        isinstance(run_version, int)
+        and not isinstance(run_version, bool)
+        and run_version == AGENT_FIRST_RUN_FORMAT_VERSION
+        and isinstance(artifact_version, int)
+        and not isinstance(artifact_version, bool)
+        and artifact_version == FORMAT_VERSION
     ):
-        raise IntegrityError(f"unknown or missing run format version: {version!r}")
-    return version
+        return AGENT_FIRST_RUN_FORMAT_VERSION
+    raise IntegrityError(
+        "Agent-first run contract requires run_format_version=2 and format_version=1"
+    )
 
 
 def diagnose_v1_run(run_dir: Path | str) -> dict[str, Any]:
@@ -450,17 +467,17 @@ def _open_run_lock(path: Path) -> int:
         raise
 
 
-def _thread_run_lock(run: Path) -> threading.Lock:
-    key = str(run)
+def _thread_run_lock(lock_path: Path) -> threading.Lock:
+    key = str(lock_path)
     with _THREAD_RUN_LOCKS_GUARD:
         return _THREAD_RUN_LOCKS.setdefault(key, threading.Lock())
 
 
 @contextmanager
-def _run_lock(run: Path) -> Iterator[None]:
-    thread_lock = _thread_run_lock(run)
+def _advisory_lock(lock_path: Path) -> Iterator[None]:
+    thread_lock = _thread_run_lock(lock_path)
     with thread_lock:
-        descriptor = _open_run_lock(run / ".run.lock")
+        descriptor = _open_run_lock(lock_path)
         try:
             if os.name == "nt":
                 import msvcrt
@@ -483,6 +500,12 @@ def _run_lock(run: Path) -> Iterator[None]:
 
                     fcntl.flock(descriptor, fcntl.LOCK_UN)
             os.close(descriptor)
+
+
+@contextmanager
+def _run_lock(run: Path) -> Iterator[None]:
+    with _advisory_lock(run / ".run.lock"):
+        yield
 
 
 def _event(run_dir: Path, event: str, **payload: Any) -> None:
@@ -513,6 +536,270 @@ def _load_run(run_dir: Path | str) -> tuple[Path, dict[str, Any]]:
     return root, state
 
 
+def _remove_regular_tree(path: Path) -> None:
+    if path.is_symlink() or not path.is_dir():
+        raise PathSafetyError(f"unsafe staging directory: {path}")
+    for current, directories, files in os.walk(path, followlinks=False):
+        current_path = Path(current)
+        for name in directories:
+            child = current_path / name
+            if child.is_symlink():
+                raise PathSafetyError(f"unsafe staging directory entry: {child}")
+        for name in files:
+            child = current_path / name
+            if child.is_symlink() or not child.is_file() or child.stat().st_nlink != 1:
+                raise PathSafetyError(f"unsafe staging file: {child}")
+    shutil.rmtree(path)
+
+
+def _read_event_log(path: Path) -> list[dict[str, Any]]:
+    if path.is_symlink() or not path.is_file() or path.stat().st_nlink != 1:
+        raise PathSafetyError(f"unsafe event log: {path}")
+    events: list[dict[str, Any]] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError as error:
+            raise IntegrityError(f"invalid event log: {path}") from error
+        if not isinstance(event, dict):
+            raise IntegrityError(f"event log entry must be an object: {path}")
+        events.append(event)
+    return events
+
+
+def _agent_first_initial_state(stage: Path) -> dict[str, Any]:
+    return {
+        "format_version": FORMAT_VERSION,
+        "run_format_version": AGENT_FIRST_RUN_FORMAT_VERSION,
+        "state": "initialized",
+        "active_attempt": None,
+        "attempt_count": 0,
+        "active_curation_revision": None,
+        "active_curation_sha256": None,
+        "active_plan_revision": None,
+        "active_plan_sha256": None,
+        "skill_snapshot_manifest_sha256": sha256_file(
+            stage / "skill_snapshot" / "manifest.json"
+        ),
+        "source_manifest_sha256": sha256_file(
+            stage / "evidence" / "source_manifest.json"
+        ),
+    }
+
+
+_AGENT_FIRST_INITIAL_DIRECTORIES = (
+    "input",
+    "evidence/pages",
+    "evidence/assets",
+    "evidence/reference_images",
+    "skill_snapshot/files",
+    "attempts",
+    "provenance",
+    "source-assets/files",
+    "source-assets/receipts",
+    "source-reviews",
+    "curations",
+    "plans",
+)
+
+
+def _populate_agent_first_run(
+    stage: Path,
+    skill: Path,
+    *,
+    release_version: str,
+    archive_sha256: str | None,
+    fail_at: str | None,
+) -> None:
+    stage.mkdir()
+    for relative in _AGENT_FIRST_INITIAL_DIRECTORIES:
+        safe_path(stage, relative).mkdir(parents=True, exist_ok=True)
+    entries: list[dict[str, Any]] = []
+    for source in _runtime_files(skill):
+        relative = source.relative_to(skill).as_posix()
+        target = safe_path(stage / "skill_snapshot" / "files", relative)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_bytes(target, source.read_bytes())
+        entries.append(
+            {
+                "path": relative,
+                "sha256": sha256_file(source),
+                "size": source.stat().st_size,
+            }
+        )
+    atomic_write_json(
+        stage / "skill_snapshot" / "manifest.json",
+        {
+            "format_version": FORMAT_VERSION,
+            "release_version": release_version,
+            "archive_sha256": archive_sha256,
+            "files": entries,
+        },
+    )
+    atomic_write_json(
+        stage / "evidence" / "source_manifest.json",
+        {"format_version": FORMAT_VERSION, "status": "not_prepared"},
+    )
+    atomic_write_bytes(stage / "evidence" / "evidence.jsonl", b"")
+    atomic_write_json(
+        stage / "evidence" / "source_visuals.json",
+        {"format_version": FORMAT_VERSION, "visuals": []},
+    )
+    atomic_write_bytes(stage / "provenance" / "supersessions.jsonl", b"")
+    atomic_write_bytes(stage / "events.jsonl", b"")
+    atomic_write_bytes(stage / ".run.lock", b"\0")
+    if fail_at == "after_init_outputs_staged":
+        raise SimulatedCrash("after Agent-first initialization outputs staged")
+    _write_run(stage, _agent_first_initial_state(stage))
+    if fail_at == "after_init_run_write":
+        raise SimulatedCrash("after Agent-first initialization run contract write")
+
+
+def _validate_agent_first_initialization(
+    run: Path,
+    skill: Path,
+    *,
+    release_version: str,
+    archive_sha256: str | None,
+) -> dict[str, Any]:
+    run, state = _load_agent_first_run(run)
+    manifest = verify_skill_snapshot(run, skill_root=skill)
+    if manifest.get("release_version") != release_version:
+        raise IntegrityError("requested release version differs from the run snapshot")
+    if manifest.get("archive_sha256") != archive_sha256:
+        raise IntegrityError("requested archive hash differs from the run snapshot")
+    expected = _agent_first_initial_state(run)
+    if state != expected:
+        raise IntegrityError("Agent-first initialized run state is noncanonical")
+    source_manifest = _read_json(run / "evidence" / "source_manifest.json")
+    if source_manifest != {"format_version": FORMAT_VERSION, "status": "not_prepared"}:
+        raise IntegrityError("Agent-first initial source manifest is noncanonical")
+    if (run / "evidence" / "evidence.jsonl").read_bytes() != b"":
+        raise IntegrityError("Agent-first initial evidence log is not empty")
+    if _read_json(run / "evidence" / "source_visuals.json") != {
+        "format_version": FORMAT_VERSION,
+        "visuals": [],
+    }:
+        raise IntegrityError("Agent-first initial source visuals are noncanonical")
+    expected_files = {
+        ".run.lock",
+        "run.json",
+        "events.jsonl",
+        "skill_snapshot/manifest.json",
+        "evidence/source_manifest.json",
+        "evidence/evidence.jsonl",
+        "evidence/source_visuals.json",
+        "provenance/supersessions.jsonl",
+        *(
+            f"skill_snapshot/files/{entry['path']}"
+            for entry in manifest["files"]
+        ),
+    }
+    actual_files = {
+        path.relative_to(run).as_posix()
+        for path in run.rglob("*")
+        if path.is_file()
+    }
+    if actual_files != expected_files:
+        raise IntegrityError("Agent-first initialization staging file set is not exact")
+    expected_directories: set[str] = set(_AGENT_FIRST_INITIAL_DIRECTORIES)
+    for relative in (*_AGENT_FIRST_INITIAL_DIRECTORIES, *expected_files):
+        parent = Path(relative).parent
+        while parent != Path("."):
+            expected_directories.add(parent.as_posix())
+            parent = parent.parent
+    actual_directories = {
+        path.relative_to(run).as_posix()
+        for path in run.rglob("*")
+        if path.is_dir()
+    }
+    if actual_directories != expected_directories:
+        raise IntegrityError(
+            "Agent-first initialization staging directory set is not exact"
+        )
+    return state
+
+
+def _initialize_agent_first_run(
+    run: Path,
+    skill: Path,
+    *,
+    release_version: str,
+    archive_sha256: str | None,
+    fail_at: str | None,
+) -> dict[str, Any]:
+    run.parent.mkdir(parents=True, exist_ok=True)
+    if run.parent.is_symlink() or not run.parent.is_dir():
+        raise PathSafetyError(f"run parent must be a regular directory: {run.parent}")
+    stage = run.parent / f".{run.name}.v2-init-staging"
+    lock_path = run.parent / f".{run.name}.v2-init.lock"
+    with _advisory_lock(lock_path):
+        if run.is_symlink():
+            raise PathSafetyError(f"run directory must not be a symlink: {run}")
+        if run.exists():
+            if not run.is_dir():
+                raise PathSafetyError(f"run path must be a directory: {run}")
+            run, state = _load_agent_first_run(run)
+            manifest = verify_skill_snapshot(run, skill_root=skill)
+            if manifest.get("release_version") != release_version:
+                raise IntegrityError(
+                    "requested release version differs from the run snapshot"
+                )
+            if manifest.get("archive_sha256") != archive_sha256:
+                raise IntegrityError(
+                    "requested archive hash differs from the run snapshot"
+                )
+            events = _read_event_log(run / "events.jsonl")
+            if sum(event.get("event") == "run_initialized" for event in events) != 1:
+                raise IntegrityError("Agent-first initialization event is not exact-once")
+            return state
+        if stage.exists() or stage.is_symlink():
+            if stage.is_symlink() or not stage.is_dir():
+                raise PathSafetyError(f"unsafe initialization staging path: {stage}")
+            if not (stage / "run.json").is_file():
+                _remove_regular_tree(stage)
+            else:
+                state = _validate_agent_first_initialization(
+                    stage,
+                    skill,
+                    release_version=release_version,
+                    archive_sha256=archive_sha256,
+                )
+                events = _read_event_log(stage / "events.jsonl")
+                if events not in ([], [{"event": "run_initialized", "state": "initialized"}]):
+                    raise IntegrityError("Agent-first initialization event log is noncanonical")
+                if not events:
+                    _event(stage, "run_initialized", state="initialized")
+                if fail_at == "after_init_event_append":
+                    raise SimulatedCrash("after Agent-first initialization event append")
+                os.replace(stage, run)
+                _fsync_directory(run.parent)
+                if fail_at == "after_init_promotion":
+                    raise SimulatedCrash("after Agent-first initialization promotion")
+                return state
+        _populate_agent_first_run(
+            stage,
+            skill,
+            release_version=release_version,
+            archive_sha256=archive_sha256,
+            fail_at=fail_at,
+        )
+        state = _validate_agent_first_initialization(
+            stage,
+            skill,
+            release_version=release_version,
+            archive_sha256=archive_sha256,
+        )
+        _event(stage, "run_initialized", state="initialized")
+        if fail_at == "after_init_event_append":
+            raise SimulatedCrash("after Agent-first initialization event append")
+        os.replace(stage, run)
+        _fsync_directory(run.parent)
+        if fail_at == "after_init_promotion":
+            raise SimulatedCrash("after Agent-first initialization promotion")
+        return state
+
+
 def initialize_run(
     run_dir: Path | str,
     skill_root: Path | str,
@@ -520,6 +807,7 @@ def initialize_run(
     release_version: str,
     archive_sha256: str | None = None,
     run_format_version: int = RELEASED_RUN_FORMAT_VERSION,
+    fail_at: str | None = None,
 ) -> dict[str, Any]:
     """Create a run and immutable snapshot of all bundled runtime inputs."""
 
@@ -539,6 +827,25 @@ def initialize_run(
         pass
     else:
         raise PathSafetyError("run directory must be outside the installed Skill")
+    allowed_failures = {
+        None,
+        "after_init_outputs_staged",
+        "after_init_run_write",
+        "after_init_event_append",
+        "after_init_promotion",
+    }
+    if fail_at not in allowed_failures:
+        raise ContractError(f"unknown initialization crash boundary: {fail_at}")
+    if run_format_version == AGENT_FIRST_RUN_FORMAT_VERSION:
+        return _initialize_agent_first_run(
+            run,
+            skill,
+            release_version=release_version,
+            archive_sha256=archive_sha256,
+            fail_at=fail_at,
+        )
+    if fail_at is not None:
+        raise ContractError("initialization crash boundaries require run format 2")
     if run.exists():
         if (run / "run.json").is_file():
             if inspect_run_format(run) != run_format_version:
@@ -966,32 +1273,166 @@ def _route_poppler(
     }
 
 
-def _run_relative_diagnostic(run: Path, text: str) -> str:
+def _run_relative_diagnostic(run: Path, text: str, *additional_roots: Path) -> str:
     redacted = str(redact_secrets(text))
-    for prefix in {str(run), run.as_posix()}:
-        redacted = redacted.replace(f"{prefix}{os.sep}", "")
-        redacted = redacted.replace(f"{prefix}/", "")
-        redacted = redacted.replace(prefix, ".")
+    for root in (run, *additional_roots):
+        for prefix in {str(root), root.as_posix()}:
+            redacted = redacted.replace(f"{prefix}{os.sep}", "")
+            redacted = redacted.replace(f"{prefix}/", "")
+            redacted = redacted.replace(prefix, ".")
     return redacted
 
 
 def _png_dimensions(path: Path) -> tuple[int, int]:
-    """Read only the fixed PNG signature and IHDR dimensions."""
+    """Validate one complete PNG stream and return its bound dimensions."""
 
+    maximum_chunk_bytes = 256 * 1024 * 1024
+    maximum_image_bytes = 512 * 1024 * 1024
     try:
-        header = path.read_bytes()[:24]
+        data = path.read_bytes()
     except OSError as error:
         raise IntegrityError(f"cannot read rendered page: {path}") from error
-    if (
-        len(header) != 24
-        or header[:8] != b"\x89PNG\r\n\x1a\n"
-        or header[8:12] != b"\x00\x00\x00\r"
-        or header[12:16] != b"IHDR"
-    ):
+    if not data.startswith(b"\x89PNG\r\n\x1a\n"):
         raise IntegrityError(f"rendered page is not a canonical PNG: {path}")
-    width, height = struct.unpack(">II", header[16:24])
-    if width < 1 or height < 1:
-        raise IntegrityError(f"rendered page has invalid dimensions: {path}")
+
+    offset = 8
+    chunk_index = 0
+    header: tuple[int, int, int, int, int, int, int] | None = None
+    palette_entries: int | None = None
+    seen_idat = False
+    idat_closed = False
+    seen_iend = False
+    compressed_parts: list[bytes] = []
+    compressed_size = 0
+    while offset < len(data):
+        if len(data) - offset < 12:
+            raise IntegrityError(f"rendered PNG has a truncated chunk: {path}")
+        length = struct.unpack(">I", data[offset : offset + 4])[0]
+        if length > maximum_chunk_bytes or length > len(data) - offset - 12:
+            raise IntegrityError(f"rendered PNG has an invalid chunk length: {path}")
+        kind = data[offset + 4 : offset + 8]
+        payload_start = offset + 8
+        payload_end = payload_start + length
+        payload = data[payload_start:payload_end]
+        stored_crc = struct.unpack(">I", data[payload_end : payload_end + 4])[0]
+        if (
+            len(kind) != 4
+            or any(not (65 <= byte <= 90 or 97 <= byte <= 122) for byte in kind)
+            or kind[2] & 0x20
+        ):
+            raise IntegrityError(f"rendered PNG has an invalid chunk type: {path}")
+        if zlib.crc32(kind + payload) & 0xFFFFFFFF != stored_crc:
+            raise IntegrityError(f"rendered PNG has a chunk CRC mismatch: {path}")
+        offset = payload_end + 4
+
+        if chunk_index == 0 and kind != b"IHDR":
+            raise IntegrityError(f"rendered PNG does not start with IHDR: {path}")
+        if kind == b"IHDR":
+            if chunk_index != 0 or header is not None or length != 13:
+                raise IntegrityError(f"rendered PNG has an invalid IHDR: {path}")
+            header = struct.unpack(">IIBBBBB", payload)
+            width, height, bit_depth, color_type, compression, filtering, interlace = header
+            valid_depths = {
+                0: {1, 2, 4, 8, 16},
+                2: {8, 16},
+                3: {1, 2, 4, 8},
+                4: {8, 16},
+                6: {8, 16},
+            }
+            if (
+                width < 1
+                or height < 1
+                or color_type not in valid_depths
+                or bit_depth not in valid_depths[color_type]
+                or compression != 0
+                or filtering != 0
+                or interlace not in {0, 1}
+            ):
+                raise IntegrityError(f"rendered PNG has invalid IHDR parameters: {path}")
+        elif header is None:
+            raise IntegrityError(f"rendered PNG is missing IHDR: {path}")
+        elif kind == b"PLTE":
+            if seen_idat or palette_entries is not None or length == 0 or length % 3:
+                raise IntegrityError(f"rendered PNG has an invalid palette: {path}")
+            palette_entries = length // 3
+            if (
+                palette_entries > 256
+                or header[3] in {0, 4}
+                or (header[3] == 3 and palette_entries > 2 ** header[2])
+            ):
+                raise IntegrityError(f"rendered PNG has an invalid palette: {path}")
+        elif kind == b"IDAT":
+            if idat_closed or (header[3] == 3 and palette_entries is None):
+                raise IntegrityError(f"rendered PNG has out-of-order image data: {path}")
+            seen_idat = True
+            compressed_size += length
+            if compressed_size > maximum_chunk_bytes:
+                raise IntegrityError(f"rendered PNG image data is too large: {path}")
+            compressed_parts.append(payload)
+        elif kind == b"IEND":
+            if length != 0 or not seen_idat:
+                raise IntegrityError(f"rendered PNG has an invalid IEND: {path}")
+            seen_iend = True
+            if offset != len(data):
+                raise IntegrityError(f"rendered PNG has trailing data: {path}")
+            break
+        else:
+            if seen_idat:
+                idat_closed = True
+            if kind[0] & 0x20 == 0:
+                raise IntegrityError(f"rendered PNG has an unknown critical chunk: {path}")
+        chunk_index += 1
+
+    if header is None or not seen_iend or (header[3] == 3 and palette_entries is None):
+        raise IntegrityError(f"rendered PNG is structurally incomplete: {path}")
+    width, height, bit_depth, color_type, _compression, _filtering, interlace = header
+    channels = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}[color_type]
+    bits_per_pixel = channels * bit_depth
+    passes = (
+        ((0, 0, 1, 1),)
+        if interlace == 0
+        else (
+            (0, 0, 8, 8),
+            (4, 0, 8, 8),
+            (0, 4, 4, 8),
+            (2, 0, 4, 4),
+            (0, 2, 2, 4),
+            (1, 0, 2, 2),
+            (0, 1, 1, 2),
+        )
+    )
+    rows: list[tuple[int, int]] = []
+    expected_size = 0
+    for x_start, y_start, x_step, y_step in passes:
+        pass_width = 0 if width <= x_start else (width - x_start + x_step - 1) // x_step
+        pass_height = 0 if height <= y_start else (height - y_start + y_step - 1) // y_step
+        if pass_width == 0 or pass_height == 0:
+            continue
+        row_bytes = (pass_width * bits_per_pixel + 7) // 8
+        rows.append((pass_height, row_bytes))
+        expected_size += pass_height * (row_bytes + 1)
+        if expected_size > maximum_image_bytes:
+            raise IntegrityError(f"rendered PNG expands beyond the safety bound: {path}")
+    try:
+        decompressor = zlib.decompressobj()
+        raw = decompressor.decompress(b"".join(compressed_parts), expected_size + 1)
+        if decompressor.unconsumed_tail:
+            raise IntegrityError(f"rendered PNG expands beyond its dimensions: {path}")
+        raw += decompressor.flush()
+    except zlib.error as error:
+        raise IntegrityError(f"rendered PNG has invalid compressed image data: {path}") from error
+    if (
+        not decompressor.eof
+        or decompressor.unused_data
+        or len(raw) != expected_size
+    ):
+        raise IntegrityError(f"rendered PNG image data does not match its dimensions: {path}")
+    raw_offset = 0
+    for row_count, row_bytes in rows:
+        for _row in range(row_count):
+            if raw[raw_offset] > 4:
+                raise IntegrityError(f"rendered PNG has an invalid row filter: {path}")
+            raw_offset += row_bytes + 1
     return width, height
 
 
@@ -1067,6 +1508,7 @@ def _prepare_source_v2(
     extra_assets: Sequence[Path | str],
     reference_images: Sequence[Path | str],
     tool_paths: Mapping[str, str | Path | None] | None,
+    poppler_input: Path | None = None,
 ) -> dict[str, Any]:
     if state.get("state") not in {"initialized", "blocked"}:
         raise StateError("source preparation must occur before curation")
@@ -1152,7 +1594,9 @@ def _prepare_source_v2(
             )
             return manifest
         routed = {name: path for name, path in resolved.items() if path is not None}
-        text_path, commands = _route_poppler(run, input_source, routed)
+        text_path, commands = _route_poppler(
+            run, poppler_input if poppler_input is not None else input_source, routed
+        )
         failed = sorted(
             name for name, result in commands.items() if result.returncode != 0
         )
@@ -1160,10 +1604,15 @@ def _prepare_source_v2(
             failed.append("pdftoppm_output")
         if not text_path.is_file():
             failed.append("pdftotext_output")
+        diagnostic_roots = (
+            () if poppler_input is None else (poppler_input.parent.parent,)
+        )
         manifest["commands"] = {
             name: {
                 "returncode": result.returncode,
-                "stderr": _run_relative_diagnostic(run, result.stderr),
+                "stderr": _run_relative_diagnostic(
+                    run, result.stderr, *diagnostic_roots
+                ),
             }
             for name, result in commands.items()
         }
@@ -1245,6 +1694,362 @@ def _prepare_source_v2(
     return manifest
 
 
+_SOURCE_TRANSACTION_KEYS = {
+    "format_version",
+    "operation",
+    "previous_run_sha256",
+    "previous_source_manifest_sha256",
+    "source_sha256",
+    "source_suffix",
+    "files",
+    "final_run_sha256",
+    "final_source_manifest_sha256",
+    "previous_events",
+    "new_events",
+    "transaction_sha256",
+}
+_SOURCE_SINGLE_FILES = {
+    "evidence/source.txt",
+    "evidence/pdfinfo.txt",
+    "evidence/pdfimages-list.txt",
+    "evidence/page-manifest.json",
+    "evidence/pdfimages-hints.json",
+    "evidence/evidence.jsonl",
+    "evidence/source_visuals.json",
+    "evidence/source_manifest.json",
+}
+
+
+def _source_stage_files(stage: Path) -> dict[str, str]:
+    files: dict[str, str] = {}
+    for root in (stage / "input", stage / "evidence"):
+        for path in sorted(root.rglob("*")):
+            if path.is_symlink():
+                raise PathSafetyError(f"unsafe source staging path: {path}")
+            if path.is_file():
+                if path.stat().st_nlink != 1:
+                    raise PathSafetyError(f"hardlinked source staging file: {path}")
+                relative = path.relative_to(stage).as_posix()
+                if (
+                    relative not in _SOURCE_SINGLE_FILES
+                    and not relative.startswith("input/")
+                    and re.fullmatch(r"evidence/pages/page-\d{4}\.png", relative)
+                    is None
+                    and re.fullmatch(r"evidence/assets/pdf-image[^/]+", relative)
+                    is None
+                ):
+                    raise IntegrityError(f"unexpected source staging file: {relative}")
+                files[relative] = sha256_file(path)
+            elif not path.is_dir():
+                raise PathSafetyError(f"unsafe source staging entry: {path}")
+    return files
+
+
+def _seed_source_stage(run: Path, state: Mapping[str, Any], stage: Path) -> None:
+    stage.mkdir()
+    for relative in (
+        "input",
+        "evidence/pages",
+        "evidence/assets",
+        "evidence/reference_images",
+    ):
+        safe_path(stage, relative).mkdir(parents=True, exist_ok=True)
+    for source in sorted((run / "input").iterdir()):
+        if source.is_symlink() or not source.is_file() or source.stat().st_nlink != 1:
+            raise PathSafetyError(f"unsafe Agent-first source input: {source}")
+        atomic_write_bytes(stage / "input" / source.name, source.read_bytes())
+    for relative in (
+        "evidence/source_manifest.json",
+        "evidence/evidence.jsonl",
+        "evidence/source_visuals.json",
+    ):
+        source = safe_path(run, relative, must_exist=True)
+        atomic_write_bytes(safe_path(stage, relative), source.read_bytes())
+    _write_run(stage, dict(state))
+    atomic_write_bytes(stage / "events.jsonl", (run / "events.jsonl").read_bytes())
+
+
+def _create_source_transaction(
+    run: Path,
+    stage: Path,
+    source: Path,
+    *,
+    previous_state: Mapping[str, Any],
+    previous_events: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    staged_events = _read_event_log(stage / "events.jsonl")
+    previous = [dict(event) for event in previous_events]
+    if staged_events[: len(previous)] != previous:
+        raise IntegrityError("source staging event prefix changed")
+    transaction: dict[str, Any] = {
+        "format_version": FORMAT_VERSION,
+        "operation": "prepare_source",
+        "previous_run_sha256": sha256_file(run / "run.json"),
+        "previous_source_manifest_sha256": previous_state[
+            "source_manifest_sha256"
+        ],
+        "source_sha256": sha256_file(source),
+        "source_suffix": source.suffix.lower(),
+        "files": _source_stage_files(stage),
+        "final_run_sha256": sha256_file(stage / "run.json"),
+        "final_source_manifest_sha256": sha256_file(
+            stage / "evidence" / "source_manifest.json"
+        ),
+        "previous_events": previous,
+        "new_events": staged_events[len(previous) :],
+    }
+    transaction["transaction_sha256"] = _canonical_hash(transaction)
+    atomic_write_json(stage / "transaction.json", transaction)
+    return transaction
+
+
+def _validate_source_transaction(
+    run: Path,
+    stage: Path,
+    source: Path,
+) -> dict[str, Any]:
+    if stage.is_symlink() or not stage.is_dir():
+        raise PathSafetyError(f"unsafe source staging directory: {stage}")
+    transaction_path = stage / "transaction.json"
+    transaction = _read_json(transaction_path)
+    if transaction_path.read_bytes() != _stored_json_bytes(transaction):
+        raise IntegrityError("source transaction is not canonical JSON")
+    if set(transaction) != _SOURCE_TRANSACTION_KEYS:
+        raise IntegrityError("source transaction has invalid keys")
+    stored_hash = transaction.get("transaction_sha256")
+    unsigned = dict(transaction)
+    unsigned.pop("transaction_sha256", None)
+    if not isinstance(stored_hash, str) or stored_hash != _canonical_hash(unsigned):
+        raise IntegrityError("source transaction hash mismatch")
+    if (
+        transaction.get("format_version") != FORMAT_VERSION
+        or transaction.get("operation") != "prepare_source"
+        or transaction.get("source_suffix") != source.suffix.lower()
+        or transaction.get("source_sha256") != sha256_file(source)
+    ):
+        raise IntegrityError("source transaction request binding mismatch")
+    files = transaction.get("files")
+    if not isinstance(files, dict) or files != _source_stage_files(stage):
+        raise IntegrityError("source transaction staged file set mismatch")
+    input_paths = sorted(relative for relative in files if relative.startswith("input/"))
+    if input_paths != [f"input/source{transaction['source_suffix']}"]:
+        raise IntegrityError("source transaction must bind one immutable input")
+    expected_stage_files = {
+        *files,
+        "run.json",
+        "events.jsonl",
+        "transaction.json",
+    }
+    actual_stage_files = {
+        path.relative_to(stage).as_posix()
+        for path in stage.rglob("*")
+        if path.is_file()
+    }
+    if actual_stage_files != expected_stage_files:
+        raise IntegrityError("source staging file set is not exact")
+    expected_stage_directories = {
+        "input",
+        "evidence",
+        "evidence/pages",
+        "evidence/assets",
+        "evidence/reference_images",
+    }
+    for relative in expected_stage_files:
+        parent = Path(relative).parent
+        while parent != Path("."):
+            expected_stage_directories.add(parent.as_posix())
+            parent = parent.parent
+    actual_stage_directories = {
+        path.relative_to(stage).as_posix()
+        for path in stage.rglob("*")
+        if path.is_dir()
+    }
+    if actual_stage_directories != expected_stage_directories:
+        raise IntegrityError("source staging directory set is not exact")
+    live_input = safe_path(run, input_paths[0], must_exist=True)
+    if sha256_file(live_input) != transaction.get("source_sha256"):
+        raise IntegrityError("live immutable source input changed")
+    if transaction.get("final_run_sha256") != sha256_file(stage / "run.json"):
+        raise IntegrityError("source transaction final run hash mismatch")
+    if transaction.get("final_source_manifest_sha256") != sha256_file(
+        stage / "evidence" / "source_manifest.json"
+    ):
+        raise IntegrityError("source transaction final manifest hash mismatch")
+    previous_events = transaction.get("previous_events")
+    new_events = transaction.get("new_events")
+    if (
+        not isinstance(previous_events, list)
+        or not all(isinstance(event, dict) for event in previous_events)
+        or not isinstance(new_events, list)
+        or not all(isinstance(event, dict) for event in new_events)
+        or _read_event_log(stage / "events.jsonl") != previous_events + new_events
+    ):
+        raise IntegrityError("source transaction event sequence mismatch")
+    _stage_run, final_state = _load_agent_first_run(stage)
+    if final_state.get("source_manifest_sha256") != transaction.get(
+        "final_source_manifest_sha256"
+    ):
+        raise IntegrityError("source transaction final state pointer mismatch")
+    _verify_source_contract(stage, final_state)
+    live_run_hash = sha256_file(run / "run.json")
+    live_manifest_hash = sha256_file(run / "evidence" / "source_manifest.json")
+    if live_run_hash not in {
+        transaction.get("previous_run_sha256"),
+        transaction.get("final_run_sha256"),
+    }:
+        raise IntegrityError("live run changed outside the source transaction")
+    if live_manifest_hash not in {
+        transaction.get("previous_source_manifest_sha256"),
+        transaction.get("final_source_manifest_sha256"),
+    }:
+        raise IntegrityError("live source manifest changed outside the transaction")
+    if (
+        live_run_hash == transaction.get("final_run_sha256")
+        and live_manifest_hash != transaction.get("final_source_manifest_sha256")
+    ):
+        raise IntegrityError("source transaction state precedes its manifest")
+    live_events = _read_event_log(run / "events.jsonl")
+    expected_events = previous_events + new_events
+    if live_events != expected_events[: len(live_events)]:
+        raise IntegrityError("live source events are not a transaction prefix")
+    return transaction
+
+
+def _remove_stale_live_source_outputs(run: Path, expected: set[str]) -> None:
+    for root_relative in ("input", "evidence/pages", "evidence/assets"):
+        root = safe_path(run, root_relative, must_exist=True)
+        for path in list(root.iterdir()):
+            relative = path.relative_to(run).as_posix()
+            if path.is_symlink():
+                raise PathSafetyError(f"unsafe live source output: {path}")
+            if path.is_dir():
+                shutil.rmtree(path)
+            elif relative not in expected:
+                path.unlink()
+    for relative in _SOURCE_SINGLE_FILES:
+        path = safe_path(run, relative)
+        if relative not in expected:
+            path.unlink(missing_ok=True)
+
+
+def _commit_source_transaction(
+    run: Path,
+    stage: Path,
+    source: Path,
+    *,
+    fail_at: str | None,
+) -> dict[str, Any]:
+    transaction = _validate_source_transaction(run, stage, source)
+    files = transaction["files"]
+    expected = set(files)
+    _remove_stale_live_source_outputs(run, expected)
+    for relative in sorted(expected - {"evidence/source_manifest.json"}):
+        staged = safe_path(stage, relative, must_exist=True)
+        target = safe_path(run, relative)
+        atomic_write_bytes(target, staged.read_bytes())
+    manifest_source = stage / "evidence" / "source_manifest.json"
+    atomic_write_bytes(
+        run / "evidence" / "source_manifest.json", manifest_source.read_bytes()
+    )
+    if fail_at == "after_source_manifest_promotion":
+        raise SimulatedCrash("after source manifest promotion")
+    atomic_write_bytes(run / "run.json", (stage / "run.json").read_bytes())
+    if fail_at == "after_source_run_update":
+        raise SimulatedCrash("after source run pointer update")
+
+    previous_events = transaction["previous_events"]
+    new_events = transaction["new_events"]
+    live_events = _read_event_log(run / "events.jsonl")
+    if live_events != (previous_events + new_events)[: len(live_events)]:
+        raise IntegrityError("live source events changed during commit")
+    for event in (previous_events + new_events)[len(live_events) :]:
+        append_jsonl(run / "events.jsonl", event)
+        if (
+            event.get("event") == "source_blocker_resolved"
+            and fail_at == "after_source_blocker_resolved_event"
+        ):
+            raise SimulatedCrash("after source blocker-resolved event")
+        if (
+            event.get("event") == "source_prepared"
+            and fail_at == "after_source_prepared_event"
+        ):
+            raise SimulatedCrash("after source-prepared event")
+    manifest = _read_json(run / "evidence" / "source_manifest.json")
+    _remove_regular_tree(stage)
+    return manifest
+
+
+def _prepare_source_v2_transaction(
+    run: Path,
+    state: Mapping[str, Any],
+    source_path: Path | str,
+    *,
+    extra_assets: Sequence[Path | str],
+    reference_images: Sequence[Path | str],
+    tool_paths: Mapping[str, str | Path | None] | None,
+    fail_at: str | None,
+) -> dict[str, Any]:
+    source = Path(source_path).absolute()
+    if source.is_symlink() or not source.is_file() or source.stat().st_nlink != 1:
+        raise PathSafetyError(f"source must be a regular non-symlink file: {source}")
+    stage = run / ".source-prep-staging"
+    if stage.exists() or stage.is_symlink():
+        return _commit_source_transaction(
+            run, stage, source, fail_at=fail_at
+        )
+    manifest_path = run / "evidence" / "source_manifest.json"
+    if sha256_file(manifest_path) != state.get("source_manifest_sha256"):
+        raise IntegrityError("source manifest hash mismatch")
+    if state.get("state") not in {"initialized", "blocked"}:
+        raise StateError("source preparation must occur before curation")
+    if _read_json(manifest_path).get("status") == "ready":
+        raise StateError("a ready source cannot be replaced; initialize a new run")
+    suffix = source.suffix.lower()
+    if suffix not in {".md", ".markdown", ".txt", ".pdf"}:
+        raise ContractError(f"unsupported source type: {suffix or '<none>'}")
+    if extra_assets or reference_images:
+        raise ContractError("Agent-first source preparation accepts only the primary source")
+    input_source = run / "input" / f"source{suffix}"
+    input_entries = list((run / "input").iterdir())
+    if input_entries:
+        if (
+            input_entries != [input_source]
+            or input_source.is_symlink()
+            or not input_source.is_file()
+            or input_source.stat().st_nlink != 1
+            or sha256_file(input_source) != sha256_file(source)
+        ):
+            raise StateError("an Agent-first run cannot replace its immutable source")
+    else:
+        atomic_write_bytes(input_source, source.read_bytes())
+    previous_events = _read_event_log(run / "events.jsonl")
+    _seed_source_stage(run, state, stage)
+    try:
+        _prepare_source_v2(
+            stage,
+            dict(state),
+            source,
+            extra_assets=extra_assets,
+            reference_images=reference_images,
+            tool_paths=tool_paths,
+            poppler_input=input_source if suffix == ".pdf" else None,
+        )
+        _create_source_transaction(
+            run,
+            stage,
+            source,
+            previous_state=state,
+            previous_events=previous_events,
+        )
+    except Exception:
+        if stage.exists() and not stage.is_symlink():
+            _remove_regular_tree(stage)
+        raise
+    if fail_at == "after_source_outputs_staged":
+        raise SimulatedCrash("after source outputs staged")
+    return _commit_source_transaction(run, stage, source, fail_at=fail_at)
+
+
 def prepare_source(
     run_dir: Path | str,
     source_path: Path | str,
@@ -1252,19 +2057,36 @@ def prepare_source(
     extra_assets: Sequence[Path | str] = (),
     reference_images: Sequence[Path | str] = (),
     tool_paths: Mapping[str, str | Path | None] | None = None,
+    fail_at: str | None = None,
 ) -> dict[str, Any]:
     """Hash and index text/Markdown, or route verified PDF ingest via Poppler."""
 
+    allowed_failures = {
+        None,
+        "after_source_outputs_staged",
+        "after_source_manifest_promotion",
+        "after_source_run_update",
+        "after_source_blocker_resolved_event",
+        "after_source_prepared_event",
+    }
+    if fail_at not in allowed_failures:
+        raise ContractError(f"unknown source-preparation crash boundary: {fail_at}")
+    if inspect_run_format(run_dir) == AGENT_FIRST_RUN_FORMAT_VERSION:
+        run = Path(run_dir).absolute()
+        with _run_lock(run):
+            run, state = _load_agent_first_run(run)
+            return _prepare_source_v2_transaction(
+                run,
+                state,
+                source_path,
+                extra_assets=extra_assets,
+                reference_images=reference_images,
+                tool_paths=tool_paths,
+                fail_at=fail_at,
+            )
+    if fail_at is not None:
+        raise ContractError("source-preparation crash boundaries require run format 2")
     run, state = _load_run(run_dir)
-    if state.get("run_format_version") == AGENT_FIRST_RUN_FORMAT_VERSION:
-        return _prepare_source_v2(
-            run,
-            state,
-            source_path,
-            extra_assets=extra_assets,
-            reference_images=reference_images,
-            tool_paths=tool_paths,
-        )
     if state.get("state") not in {"initialized", "blocked"}:
         raise StateError("source preparation must occur before planning")
     existing_manifest = _read_json(run / "evidence" / "source_manifest.json")

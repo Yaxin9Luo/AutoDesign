@@ -54,6 +54,13 @@ def _tree_snapshot(root: Path) -> dict[str, tuple[int, int, bytes | str | None]]
     return snapshot
 
 
+def _events(run: Path) -> list[dict[str, object]]:
+    return [
+        json.loads(line)
+        for line in (run / "events.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+
+
 class PortableSourceCurationV2Tests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -591,6 +598,293 @@ elif name == "pdfimages":
             sum(event.get("event") == "source_crop_registered" for event in process_events),
             2,
         )
+
+    def test_v2_prepare_validates_the_run_tree_and_source_cas_before_writes(self) -> None:
+        source = self.root / "safety.md"
+        source.write_text("# Safe source\n", encoding="utf-8")
+
+        hardlink_run = self.root / "runs" / "prepare-hardlink"
+        self._initialize(hardlink_run, run_format_version=2)
+        events_path = hardlink_run / "events.jsonl"
+        outside_events = self.root / "outside-events.jsonl"
+        outside_events.write_bytes(events_path.read_bytes())
+        events_path.unlink()
+        os.link(outside_events, events_path)
+        before_outside = outside_events.read_bytes()
+        with self.assertRaises(core.PathSafetyError):
+            core.prepare_source(hardlink_run, source)
+        self.assertEqual(outside_events.read_bytes(), before_outside)
+        self.assertFalse((hardlink_run / "input" / "source.md").exists())
+
+        cas_run = self.root / "runs" / "prepare-source-cas"
+        self._initialize(cas_run, run_format_version=2)
+        source_manifest = cas_run / "evidence" / "source_manifest.json"
+        source_manifest.write_text(
+            '{"format_version":1,"status":"tampered"}\n', encoding="utf-8"
+        )
+        before_run = _tree_snapshot(cas_run)
+        with self.assertRaises(core.IntegrityError):
+            core.prepare_source(cas_run, source)
+        self.assertEqual(_tree_snapshot(cas_run), before_run)
+
+    def test_v2_prepare_recovers_every_commit_boundary_with_exactly_one_event(self) -> None:
+        source = self.root / "recovery.md"
+        source.write_text("# Recoverable source\n\nOne grounded claim.\n", encoding="utf-8")
+        boundaries = (
+            "after_source_outputs_staged",
+            "after_source_manifest_promotion",
+            "after_source_run_update",
+            "after_source_prepared_event",
+        )
+        for boundary in boundaries:
+            with self.subTest(boundary=boundary):
+                run = self.root / "runs" / f"prepare-crash-{boundary}"
+                self._initialize(run, run_format_version=2)
+                with self.assertRaises(core.SimulatedCrash):
+                    core.prepare_source(run, source, fail_at=boundary)
+                recovered = core.prepare_source(run, source)
+                state = json.loads((run / "run.json").read_text(encoding="utf-8"))
+                self.assertEqual((recovered["status"], state["state"]), ("ready", "curating"))
+                self.assertEqual(
+                    state["source_manifest_sha256"],
+                    core.sha256_file(run / "evidence" / "source_manifest.json"),
+                )
+                self.assertFalse((run / ".source-prep-staging").exists())
+                self.assertEqual(
+                    sum(event.get("event") == "source_prepared" for event in _events(run)),
+                    1,
+                )
+                before_rejected_retry = _tree_snapshot(run)
+                with self.assertRaises(core.StateError):
+                    core.prepare_source(run, source)
+                self.assertEqual(_tree_snapshot(run), before_rejected_retry)
+
+        blocked_run = self.root / "runs" / "prepare-blocker-event-crash"
+        self._initialize(blocked_run, run_format_version=2)
+        pdf = self.root / "recover-blocked.pdf"
+        pdf.write_bytes(b"%PDF-1.4\nblocked then ready\n")
+        blocked = core.prepare_source(
+            blocked_run,
+            pdf,
+            tool_paths={name: None for name in ("pdftotext", "pdfinfo", "pdftoppm", "pdfimages")},
+        )
+        self.assertEqual(blocked["status"], "blocked")
+        tools, _calls = self._fake_poppler("recover-blocked-poppler")
+        with self.assertRaises(core.SimulatedCrash):
+            core.prepare_source(
+                blocked_run,
+                pdf,
+                tool_paths=tools,
+                fail_at="after_source_blocker_resolved_event",
+            )
+        recovered = core.prepare_source(blocked_run, pdf, tool_paths=tools)
+        self.assertEqual(recovered["status"], "ready")
+        names = [event.get("event") for event in _events(blocked_run)]
+        self.assertEqual(names.count("source_blocker_resolved"), 1)
+        self.assertEqual(names.count("source_prepared"), 1)
+        self.assertFalse((blocked_run / ".source-prep-staging").exists())
+
+    def test_v2_initialization_recovers_crashes_without_a_partial_live_run(self) -> None:
+        boundaries = (
+            "after_init_outputs_staged",
+            "after_init_run_write",
+            "after_init_event_append",
+            "after_init_promotion",
+        )
+        for boundary in boundaries:
+            with self.subTest(boundary=boundary):
+                run = self.root / "runs" / f"init-crash-{boundary}"
+                with self.assertRaises(core.SimulatedCrash):
+                    core.initialize_run(
+                        run,
+                        self.skill,
+                        release_version="0.1.0",
+                        archive_sha256="a" * 64,
+                        run_format_version=2,
+                        fail_at=boundary,
+                    )
+                if boundary == "after_init_promotion":
+                    self.assertTrue(run.is_dir())
+                else:
+                    self.assertFalse(run.exists())
+                recovered = self._initialize(run, run_format_version=2)
+                self.assertEqual(core.inspect_run_format(run), 2)
+                self.assertEqual(recovered["format_version"], 1)
+                self.assertEqual(
+                    recovered["skill_snapshot_manifest_sha256"],
+                    core.sha256_file(run / "skill_snapshot" / "manifest.json"),
+                )
+                self.assertEqual(
+                    sum(event.get("event") == "run_initialized" for event in _events(run)),
+                    1,
+                )
+                self.assertFalse(
+                    (run.parent / f".{run.name}.v2-init-staging").exists()
+                )
+
+    def test_v2_initialization_serializes_threads_and_processes(self) -> None:
+        thread_run = self.root / "runs" / "init-threads"
+        with ThreadPoolExecutor(max_workers=6) as executor:
+            states = list(
+                executor.map(
+                    lambda _index: self._initialize(thread_run, run_format_version=2),
+                    range(6),
+                )
+            )
+        self.assertTrue(all(state == states[0] for state in states))
+        self.assertEqual(
+            sum(event.get("event") == "run_initialized" for event in _events(thread_run)),
+            1,
+        )
+        core.verify_skill_snapshot(thread_run, skill_root=self.skill)
+
+        process_run = self.root / "runs" / "init-processes"
+        code = (
+            "import json,sys; from agent_skills._shared import portable_core as c; "
+            "print(json.dumps(c.initialize_run(sys.argv[1], sys.argv[2], "
+            "release_version='0.1.0', archive_sha256='a'*64, run_format_version=2)))"
+        )
+        processes = [
+            subprocess.Popen(
+                [sys.executable, "-c", code, str(process_run), str(self.skill)],
+                cwd=Path(__file__).resolve().parents[1],
+                env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            for _index in range(3)
+        ]
+        process_states = []
+        for process in processes:
+            stdout, stderr = process.communicate(timeout=30)
+            self.assertEqual(process.returncode, 0, stderr)
+            process_states.append(json.loads(stdout))
+        self.assertTrue(all(state == process_states[0] for state in process_states))
+        self.assertEqual(
+            sum(event.get("event") == "run_initialized" for event in _events(process_run)),
+            1,
+        )
+        self.assertEqual(core.inspect_run_format(process_run), 2)
+        core.verify_skill_snapshot(process_run, skill_root=self.skill)
+
+    def test_v2_initialization_staging_rejects_a_nonexact_file_set(self) -> None:
+        init_run = self.root / "runs" / "init-stage-extra"
+        with self.assertRaises(core.SimulatedCrash):
+            core.initialize_run(
+                init_run,
+                self.skill,
+                release_version="0.1.0",
+                archive_sha256="a" * 64,
+                run_format_version=2,
+                fail_at="after_init_event_append",
+            )
+        init_stage = init_run.parent / f".{init_run.name}.v2-init-staging"
+        (init_stage / "unexpected.bin").write_bytes(b"not part of the transaction")
+        with self.assertRaises(core.IntegrityError):
+            self._initialize(init_run, run_format_version=2)
+        self.assertFalse(init_run.exists())
+
+    def test_v2_source_staging_rejects_a_nonexact_file_set(self) -> None:
+        source_run = self.root / "runs" / "source-stage-extra"
+        self._initialize(source_run, run_format_version=2)
+        source = self.root / "source-stage-extra.md"
+        source.write_text("# Exact staged source\n", encoding="utf-8")
+        with self.assertRaises(core.SimulatedCrash):
+            core.prepare_source(
+                source_run, source, fail_at="after_source_outputs_staged"
+            )
+        (source_run / ".source-prep-staging" / "unexpected.bin").write_bytes(
+            b"not part of the transaction"
+        )
+        with self.assertRaises(core.IntegrityError):
+            core.prepare_source(source_run, source)
+        state = json.loads((source_run / "run.json").read_text(encoding="utf-8"))
+        manifest = json.loads(
+            (source_run / "evidence" / "source_manifest.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual((state["state"], manifest["status"]), ("initialized", "not_prepared"))
+
+    def test_inspect_run_format_rejects_ambiguous_or_noncanonical_contracts(self) -> None:
+        accepted = (
+            ({"format_version": 1}, 1),
+            ({"format_version": 1, "run_format_version": 2}, 2),
+        )
+        for index, (contract, expected) in enumerate(accepted):
+            with self.subTest(accepted=contract):
+                run = self.root / "format-contracts" / f"accepted-{index}"
+                run.mkdir(parents=True)
+                (run / "run.json").write_text(json.dumps(contract), encoding="utf-8")
+                self.assertEqual(core.inspect_run_format(run), expected)
+
+        rejected = (
+            {},
+            {"format_version": 2},
+            {"run_format_version": 2},
+            {"format_version": 2, "run_format_version": 1},
+            {"format_version": 1, "run_format_version": 1},
+            {"format_version": True},
+            {"format_version": 1, "run_format_version": True},
+            {"format_version": 1, "run_format_version": 3},
+        )
+        for index, contract in enumerate(rejected):
+            with self.subTest(rejected=contract):
+                run = self.root / "format-contracts" / f"rejected-{index}"
+                run.mkdir(parents=True)
+                (run / "run.json").write_text(json.dumps(contract), encoding="utf-8")
+                with self.assertRaises(core.IntegrityError):
+                    core.inspect_run_format(run)
+
+    def test_v2_pdf_rejects_structurally_incomplete_png_pages_before_publication(self) -> None:
+        valid = _png(2, 2, 40)
+        header = struct.pack(">IIBBBBB", 2, 2, 8, 6, 0, 0, 0)
+        raw = b"\0" + bytes([40, 40, 40, 255]) * 2
+        malformed = {
+            "truncated-after-ihdr-prefix": valid[:24],
+            "bad-crc": valid[:-1] + bytes([valid[-1] ^ 1]),
+            "missing-iend": valid[:-12],
+            "trailing-data": valid + b"trailing",
+            "incomplete-idat-stream": (
+                PNG_SIGNATURE
+                + _chunk(b"IHDR", header)
+                + _chunk(b"IDAT", zlib.compress(raw * 2)[:-1])
+                + _chunk(b"IEND", b"")
+            ),
+            "dimension-data-mismatch": (
+                PNG_SIGNATURE
+                + _chunk(b"IHDR", header)
+                + _chunk(b"IDAT", zlib.compress(raw))
+                + _chunk(b"IEND", b"")
+            ),
+            "invalid-filter": (
+                PNG_SIGNATURE
+                + _chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 6, 0, 0, 0))
+                + _chunk(b"IDAT", zlib.compress(b"\5" + bytes([1, 2, 3, 255])))
+                + _chunk(b"IEND", b"")
+            ),
+        }
+        for name, page_bytes in malformed.items():
+            with self.subTest(name=name):
+                run = self.root / "runs" / f"bad-png-{name}"
+                self._initialize(run, run_format_version=2)
+                source = self.root / f"bad-png-{name}.pdf"
+                source.write_bytes(b"%PDF-1.4\ninvalid rendered page\n")
+                tools, _calls = self._fake_poppler(f"bad-png-tools-{name}")
+                (tools["pdftoppm"].parent / "first-page.png").write_bytes(page_bytes)
+                with self.assertRaises(core.IntegrityError):
+                    core.prepare_source(run, source, tool_paths=tools)
+                state = json.loads((run / "run.json").read_text(encoding="utf-8"))
+                manifest = json.loads(
+                    (run / "evidence" / "source_manifest.json").read_text(encoding="utf-8")
+                )
+                self.assertEqual((state["state"], manifest["status"]), ("initialized", "not_prepared"))
+                self.assertEqual(
+                    state["source_manifest_sha256"],
+                    core.sha256_file(run / "evidence" / "source_manifest.json"),
+                )
+                self.assertEqual(list((run / "evidence" / "pages").iterdir()), [])
+                self.assertFalse((run / "evidence" / "page-manifest.json").exists())
+                self.assertFalse((run / ".source-prep-staging").exists())
 
 
 if __name__ == "__main__":
