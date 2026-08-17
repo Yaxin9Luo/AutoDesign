@@ -4083,7 +4083,6 @@ def _validate_source_review_value(
     selected_ids = {
         item["asset_id"] for item in context["selection"]["assets"]
     }
-    bound_evidence = set(context["evidence_ids"])
     asset_findings = value["asset_findings"]
     if not isinstance(asset_findings, list):
         raise ContractError("source review asset_findings must be a list")
@@ -4120,13 +4119,17 @@ def _validate_source_review_value(
         evidence_ids = _unique_nonempty_strings(
             finding["evidence_ids"], label="source review coverage evidence_ids"
         )
-        if finding["story_key"] not in _SOURCE_STORY_KEYS or not set(
-            evidence_ids
-        ).issubset(bound_evidence):
+        story_key = finding["story_key"]
+        if story_key not in _SOURCE_STORY_KEYS:
+            raise ContractError("source review coverage finding is not context-bound")
+        story_evidence = set(
+            context["selection"]["source_story"][story_key]["evidence_ids"]
+        )
+        if not evidence_ids or not set(evidence_ids).issubset(story_evidence):
             raise ContractError("source review coverage finding is not context-bound")
         clean_coverage_findings.append(
             {
-                "story_key": finding["story_key"],
+                "story_key": story_key,
                 "evidence_ids": evidence_ids,
                 "finding": _canonical_review_string(
                     finding["finding"], label="source review coverage finding"
@@ -4217,33 +4220,53 @@ def _review_operation_id(
     )
 
 
+def _source_review_jsonl_suffix(
+    run: Path,
+    binding: Any,
+    *,
+    label: str,
+) -> list[dict[str, Any]]:
+    if not isinstance(binding, Mapping) or set(binding) != {
+        "path", "sha256", "size", "entry_count"
+    }:
+        raise IntegrityError(f"{label} binding is invalid")
+    relative = binding["path"]
+    if not isinstance(relative, str):
+        raise IntegrityError(f"{label} path binding is invalid")
+    _canonical_jsonl_binding(run, relative)
+    path = safe_path(run, relative, must_exist=True)
+    data = path.read_bytes()
+    size = binding["size"]
+    entry_count = binding["entry_count"]
+    if (
+        not isinstance(size, int)
+        or isinstance(size, bool)
+        or size < 0
+        or not isinstance(entry_count, int)
+        or isinstance(entry_count, bool)
+        or entry_count < 0
+        or len(data) < size
+        or sha256_bytes(data[:size]) != binding["sha256"]
+        or (size > 0 and data[size - 1:size] != b"\n")
+        or len(data[:size].splitlines()) != entry_count
+    ):
+        raise IntegrityError(f"{label} bound prefix was rewritten")
+    return [json.loads(raw) for raw in data[size:].splitlines()]
+
+
 def _review_event_phase(
     run: Path,
     context: Mapping[str, Any],
     event: Mapping[str, Any],
 ) -> str:
-    binding = context["event_log_parent"]
-    if not isinstance(binding, dict) or set(binding) != {
-        "path", "sha256", "size", "entry_count"
-    }:
-        raise IntegrityError("source review event parent binding is invalid")
-    path = safe_path(run, binding["path"], must_exist=True)
-    if path.is_symlink() or not path.is_file() or path.stat().st_nlink != 1:
-        raise PathSafetyError(f"unsafe source review event log: {path}")
-    data = path.read_bytes()
-    size = binding["size"]
-    if (
-        not isinstance(size, int)
-        or isinstance(size, bool)
-        or size < 0
-        or len(data) < size
-        or sha256_bytes(data[:size]) != binding["sha256"]
-    ):
-        raise IntegrityError("source review event log parent was rewritten")
-    suffix = data[size:]
-    if not suffix:
+    entries = _source_review_jsonl_suffix(
+        run,
+        context["event_log_parent"],
+        label="source review event log",
+    )
+    if not entries:
         return "parent"
-    if suffix != _canonical_json_bytes(redact_secrets(event)):
+    if entries != [redact_secrets(dict(event))]:
         raise IntegrityError("source review event log has a conflicting suffix")
     return "committed"
 
@@ -4349,11 +4372,61 @@ def _curation_documents(
     }
 
 
+def _validate_committed_curation_lineage(
+    run: Path,
+    revision: int,
+    manifest: Mapping[str, Any],
+    context: Mapping[str, Any],
+    review: Mapping[str, Any],
+    *,
+    allow_missing_pass_event: bool = False,
+) -> None:
+    review_relative = Path(str(context["context_path"])).with_name(
+        "review.json"
+    ).as_posix()
+    original_path = safe_path(run, review_relative)
+    if (
+        original_path.is_symlink()
+        or not original_path.is_file()
+        or original_path.stat().st_nlink != 1
+    ):
+        raise IntegrityError("committed curation original review is missing or unsafe")
+    original_review = _read_json(original_path)
+    if (
+        not isinstance(original_review, dict)
+        or original_path.read_bytes() != _stored_json_bytes(original_review)
+        or original_review != review
+        or sha256_file(original_path) != manifest["review_sha256"]
+    ):
+        raise IntegrityError("committed curation original review does not match")
+    _source_review_jsonl_suffix(
+        run,
+        context["supersession_ledger"],
+        label="source review supersession ledger",
+    )
+    event = {
+        "event": "source_review_passed",
+        "operation_id": manifest["operation_id"],
+        "revision": revision,
+    }
+    events = _source_review_jsonl_suffix(
+        run,
+        context["event_log_parent"],
+        label="source review event log",
+    )
+    if not events and allow_missing_pass_event:
+        return
+    if not events or events[0] != event or events.count(event) != 1:
+        raise IntegrityError("committed curation pass event lineage is invalid")
+
+
 def _load_curation_revision(
     run: Path,
     revision: int,
     *,
     directory: Path | None = None,
+    require_committed_lineage: bool = True,
+    allow_missing_pass_event: bool = False,
 ) -> dict[str, dict[str, Any]]:
     root = directory or (run / "curations" / f"{revision:03d}")
     files, directories = _regular_tree_inventory(root)
@@ -4419,12 +4492,23 @@ def _load_curation_revision(
         values[name] != document for name, document in expected.items()
     ):
         raise IntegrityError("curation revision provenance binding is stale")
+    if require_committed_lineage:
+        _validate_committed_curation_lineage(
+            run,
+            revision,
+            manifest,
+            context,
+            review,
+            allow_missing_pass_event=allow_missing_pass_event,
+        )
     return values
 
 
 def _curation_registry(
     run: Path,
     state: Mapping[str, Any],
+    *,
+    allow_incomplete_active_event: bool = False,
 ) -> tuple[list[int], list[Path]]:
     root = run / "curations"
     immediate = list(root.iterdir())
@@ -4461,7 +4545,16 @@ def _curation_registry(
     previous_revision: int | None = None
     previous_hash: str | None = None
     for revision in revisions:
-        values = _load_curation_revision(run, revision)
+        values = _load_curation_revision(
+            run,
+            revision,
+            require_committed_lineage=(
+                active is not None and revision <= active
+            ),
+            allow_missing_pass_event=(
+                allow_incomplete_active_event and revision == active
+            ),
+        )
         manifest = values["manifest.json"]
         if (
             manifest["parent_revision"] != previous_revision
@@ -4483,7 +4576,12 @@ def _curation_documents_match(
     directory: Path | None = None,
 ) -> bool:
     root = directory or (run / "curations" / f"{revision:03d}")
-    actual = _load_curation_revision(run, revision, directory=root)
+    actual = _load_curation_revision(
+        run,
+        revision,
+        directory=root,
+        require_committed_lineage=False,
+    )
     return all(actual[name] == value for name, value in documents.items())
 
 
@@ -4536,7 +4634,11 @@ def record_source_review(
     run = Path(run_dir).absolute()
     with _agent_first_mutation_lock(run):
         run, state = _load_agent_first_run(run)
-        revisions, stages = _curation_registry(run, state)
+        revisions, stages = _curation_registry(
+            run,
+            state,
+            allow_incomplete_active_event=True,
+        )
         context = _load_source_review_context(run, state, context_path)
         _source_review_registry_sequences(
             run, state, str(context["operation_id"])[:12]
@@ -4647,12 +4749,21 @@ def record_source_review(
                 stage.mkdir()
                 for name, document in documents.items():
                     atomic_write_json(stage / name, document)
-                _load_curation_revision(run, revision, directory=stage)
+                _load_curation_revision(
+                    run,
+                    revision,
+                    directory=stage,
+                    require_committed_lineage=False,
+                )
                 if fail_at == "after_review_staging_write":
                     raise SimulatedCrash("after source review curation staging write")
             os.replace(stage, target)
             _fsync_directory(target.parent)
-            _load_curation_revision(run, revision)
+            _load_curation_revision(
+                run,
+                revision,
+                require_committed_lineage=False,
+            )
             if fail_at == "after_curation_promotion":
                 raise SimulatedCrash("after source review curation promotion")
 

@@ -253,6 +253,23 @@ elif name == "pdfimages":
         ).encode("utf-8")
         return hashlib.sha256(encoded).hexdigest()
 
+    def _committed_review_fixture(
+        self,
+        name: str,
+        *,
+        supersession_entry: dict[str, object] | None = None,
+    ) -> tuple[Path, dict[str, object], dict[str, object]]:
+        run, selection, _ = self._review_source_fixture(name)
+        if supersession_entry is not None:
+            core.append_jsonl(
+                run / "provenance" / "supersessions.jsonl",
+                supersession_entry,
+            )
+        context = core.create_source_review_context(run, selection)
+        review = self._review_fixture(context)
+        core.record_source_review(run, context["context_path"], review)
+        return run, context, review
+
     def test_source_review_context_binds_the_complete_selected_source_set(self) -> None:
         run, selection, crops = self._review_source_fixture("review-context")
 
@@ -485,6 +502,73 @@ elif name == "pdfimages":
         self.assertEqual(
             sum(event.get("event") == "source_review_failed" for event in _events(run)),
             1,
+        )
+
+    def test_source_review_coverage_findings_require_story_local_evidence(self) -> None:
+        invalid_cases = (
+            ("empty", []),
+            ("cross-story", ["ev-002"]),
+        )
+        for label, evidence_ids in invalid_cases:
+            with self.subTest(label=label):
+                run, selection, _ = self._review_source_fixture(
+                    f"review-coverage-{label}"
+                )
+                context = core.create_source_review_context(run, selection)
+                review = self._review_fixture(
+                    context,
+                    verdict="fail",
+                    coverage_findings=[{
+                        "story_key": "central_method",
+                        "evidence_ids": evidence_ids,
+                        "finding": "The central method needs clearer coverage.",
+                    }],
+                    localized_repairs=[{
+                        "target": "central_method",
+                        "instruction": "Select a clearer method crop.",
+                    }],
+                )
+                before = _tree_snapshot(run)
+
+                with self.assertRaises(core.ContractError):
+                    core.record_source_review(
+                        run,
+                        context["context_path"],
+                        review,
+                    )
+
+                self.assertEqual(_tree_snapshot(run), before)
+
+        run, selection, _ = self._review_source_fixture("review-coverage-local")
+        context = core.create_source_review_context(run, selection)
+        review = self._review_fixture(
+            context,
+            verdict="fail",
+            coverage_findings=[{
+                "story_key": "central_method",
+                "evidence_ids": ["ev-001"],
+                "finding": "The central method needs clearer coverage.",
+            }],
+            localized_repairs=[{
+                "target": "central_method",
+                "instruction": "Select a clearer method crop.",
+            }],
+        )
+
+        result = core.record_source_review(
+            run,
+            context["context_path"],
+            review,
+        )
+
+        self.assertEqual((result["verdict"], result["state"]), ("fail", "curating"))
+        self.assertEqual(
+            json.loads(
+                (run / context["context_path"])
+                .with_name("review.json")
+                .read_text(encoding="utf-8")
+            ),
+            review,
         )
 
     def test_passing_source_review_commits_one_immutable_catalog_with_cas(self) -> None:
@@ -820,6 +904,88 @@ elif name == "pdfimages":
             core.record_source_review(run, context["context_path"], review)
 
         self.assertEqual(_tree_snapshot(run), before)
+
+    def test_committed_curation_load_requires_the_original_review(self) -> None:
+        for mutation in ("modify", "delete"):
+            with self.subTest(mutation=mutation):
+                run, context, _ = self._committed_review_fixture(
+                    f"curation-original-review-{mutation}"
+                )
+                review_path = (run / context["context_path"]).with_name(
+                    "review.json"
+                )
+                if mutation == "modify":
+                    changed = json.loads(review_path.read_text(encoding="utf-8"))
+                    changed["reviewer_kind"] = "host_fresh_pass"
+                    core.atomic_write_json(review_path, changed)
+                else:
+                    review_path.unlink()
+                before = _tree_snapshot(run)
+
+                with self.assertRaises(core.IntegrityError):
+                    core._load_curation_revision(run, 1)
+
+                self.assertEqual(_tree_snapshot(run), before)
+
+    def test_committed_curation_load_requires_one_boundary_pass_event(self) -> None:
+        for mutation in ("truncate", "duplicate"):
+            with self.subTest(mutation=mutation):
+                run, context, _ = self._committed_review_fixture(
+                    f"curation-pass-event-{mutation}"
+                )
+                event_path = run / "events.jsonl"
+                if mutation == "truncate":
+                    event_path.write_bytes(
+                        event_path.read_bytes()[: context["event_log_parent"]["size"]]
+                    )
+                else:
+                    pass_events = [
+                        event
+                        for event in _events(run)
+                        if event.get("event") == "source_review_passed"
+                    ]
+                    self.assertEqual(len(pass_events), 1)
+                    core.append_jsonl(event_path, pass_events[0])
+                before = _tree_snapshot(run)
+
+                with self.assertRaises(core.IntegrityError):
+                    core._load_curation_revision(run, 1)
+
+                self.assertEqual(_tree_snapshot(run), before)
+
+    def test_committed_curation_load_checks_supersession_prefix_and_allows_later_events(self) -> None:
+        run, _context, _ = self._committed_review_fixture(
+            "curation-later-events",
+            supersession_entry={"event": "baseline", "revision": 0},
+        )
+        core.append_jsonl(
+            run / "events.jsonl",
+            {"event": "later_unrelated", "sequence": 1},
+        )
+        core.append_jsonl(
+            run / "provenance" / "supersessions.jsonl",
+            {"event": "later_supersession", "revision": 1},
+        )
+
+        loaded = core._load_curation_revision(run, 1)
+
+        self.assertEqual(loaded["manifest.json"]["revision"], 1)
+
+        run2, _context2, _ = self._committed_review_fixture(
+            "curation-supersession-rewrite",
+            supersession_entry={"event": "baseline", "revision": 0},
+        )
+        supersessions = run2 / "provenance" / "supersessions.jsonl"
+        original = supersessions.read_bytes()
+        rewritten = original.replace(b'"revision":0', b'"revision":9')
+        self.assertNotEqual(rewritten, original)
+        supersessions.write_bytes(rewritten)
+        before = _tree_snapshot(run2)
+
+        with self.assertRaises(core.IntegrityError):
+            core._load_curation_revision(run2, 1)
+
+        self.assertEqual(_tree_snapshot(run2), before)
 
     def test_v2_initialization_is_explicit_and_v1_default_is_unchanged(self) -> None:
         v1 = self.root / "runs" / "v1"
