@@ -507,6 +507,17 @@ def _run_lock(run: Path) -> Iterator[None]:
         yield
 
 
+def _agent_first_initialization_lock(run: Path) -> Path:
+    return run.parent / f".{run.name}.v2-init.lock"
+
+
+@contextmanager
+def _agent_first_mutation_lock(run: Path) -> Iterator[None]:
+    with _advisory_lock(_agent_first_initialization_lock(run)):
+        with _run_lock(run):
+            yield
+
+
 def _event(run_dir: Path, event: str, **payload: Any) -> None:
     append_jsonl(run_dir / "events.jsonl", redact_secrets({"event": event, **payload}))
 
@@ -863,12 +874,13 @@ def _promote_agent_first_initialization(
         if _read_event_log(run / "events.jsonl") != events:
             raise IntegrityError("promoted initialization event log changed")
     except Exception:
-        if quarantine.exists() or quarantine.is_symlink():
-            raise IntegrityError(
-                f"conflicting initialization quarantine: {quarantine}"
+        quarantine_target = quarantine
+        if quarantine_target.exists() or quarantine_target.is_symlink():
+            quarantine_target = _unused_sibling(
+                run.parent, f".{run.name}.v2-init-quarantine"
             )
         try:
-            os.replace(run, quarantine)
+            os.replace(run, quarantine_target)
             _fsync_directory(run.parent)
         except OSError as error:
             raise PathSafetyError(
@@ -892,8 +904,7 @@ def _initialize_agent_first_run(
     if run.parent.is_symlink() or not run.parent.is_dir():
         raise PathSafetyError(f"run parent must be a regular directory: {run.parent}")
     stage = run.parent / f".{run.name}.v2-init-staging"
-    lock_path = run.parent / f".{run.name}.v2-init.lock"
-    with _advisory_lock(lock_path):
+    with _advisory_lock(_agent_first_initialization_lock(run)):
         if run.is_symlink():
             raise PathSafetyError(f"run directory must not be a symlink: {run}")
         if run.exists():
@@ -2470,7 +2481,7 @@ def prepare_source(
         raise ContractError(f"unknown source-preparation crash boundary: {fail_at}")
     if inspect_run_format(run_dir) == AGENT_FIRST_RUN_FORMAT_VERSION:
         run = Path(run_dir).absolute()
-        with _run_lock(run):
+        with _agent_first_mutation_lock(run):
             run, state = _load_agent_first_run(run)
             return _prepare_source_v2_transaction(
                 run,
@@ -3265,8 +3276,10 @@ def crop_source(
         "after_asset_promotion",
     }:
         raise ContractError(f"unknown crop crash boundary: {fail_at}")
-    run, _state = _load_agent_first_run(run_dir)
-    with _run_lock(run):
+    if inspect_run_format(run_dir) != AGENT_FIRST_RUN_FORMAT_VERSION:
+        raise StateError("version-1 runs do not support Agent-first source APIs")
+    run = Path(run_dir).absolute()
+    with _agent_first_mutation_lock(run):
         run, state = _load_agent_first_run(run)
         if state.get("state") != "curating":
             raise StateError("source cropping requires curating state")

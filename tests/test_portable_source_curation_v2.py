@@ -8,6 +8,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 import zlib
 from concurrent.futures import ThreadPoolExecutor
@@ -268,8 +269,10 @@ elif name == "pdfimages":
         snapshot.symlink_to(outside_snapshot, target_is_directory=True)
         with self.assertRaises(core.StateError):
             core.inspect_source(v1)
+        before_crop_rejection = _tree_snapshot(v1.parent)
         with self.assertRaises(core.StateError):
             core.crop_source(v1, {})
+        self.assertEqual(_tree_snapshot(v1.parent), before_crop_rejection)
 
         cases = {
             "missing": None,
@@ -866,7 +869,6 @@ elif name == "pdfimages":
             [],
         )
 
-    @unittest.skipUnless(hasattr(os, "mkfifo"), "FIFO creation is unavailable")
     def test_v2_initialization_never_overwrites_a_conflicting_quarantine(self) -> None:
         run = self.root / "runs" / "init-quarantine-conflict"
         stage = run.parent / f".{run.name}.v2-init-staging"
@@ -884,7 +886,9 @@ elif name == "pdfimages":
                 )
                 quarantine.mkdir()
                 (quarantine / "owner.txt").write_text("do not overwrite\n", encoding="utf-8")
-                os.mkfifo(stage / "late.pipe")
+                state = json.loads((stage / "run.json").read_text(encoding="utf-8"))
+                state["state"] = "curating"
+                (stage / "run.json").write_bytes(core._stored_json_bytes(state))
             real_replace(source, target)
 
         with mock.patch.object(core.os, "replace", side_effect=replace_with_conflict):
@@ -897,14 +901,93 @@ elif name == "pdfimages":
             (quarantine / "owner.txt").read_text(encoding="utf-8"),
             "do not overwrite\n",
         )
-        with self.assertRaises(core.PathSafetyError):
-            core.inspect_source(run)
-        with self.assertRaises(core.PathSafetyError):
-            self._initialize(run, run_format_version=2)
         self.assertFalse(run.exists())
+        quarantines = list(
+            run.parent.glob(f".{run.name}.v2-init-quarantine-*")
+        )
+        self.assertEqual(len(quarantines), 2)
+        fresh_quarantine = next(path for path in quarantines if path != quarantine)
+        self.assertEqual(
+            json.loads(
+                (fresh_quarantine / "run.json").read_text(encoding="utf-8")
+            )["state"],
+            "curating",
+        )
 
         state = self._initialize(run, run_format_version=2)
         self.assertEqual(state["state"], "initialized")
+
+    def test_v2_prepare_waits_for_initialization_promotion_validation(self) -> None:
+        run = self.root / "runs" / "init-prepare-lock-order"
+        stage = run.parent / f".{run.name}.v2-init-staging"
+        source = self.root / "init-prepare-lock-order.md"
+        source.write_text("# Serialized after initialization\n", encoding="utf-8")
+        real_replace = os.replace
+        real_prepare = core._prepare_source_v2_transaction
+        promoted = threading.Event()
+        release_initialization = threading.Event()
+        prepare_called = threading.Event()
+        prepare_entered = threading.Event()
+
+        def replace_and_pause(source_path: object, target_path: object) -> None:
+            real_replace(source_path, target_path)
+            if Path(source_path) == stage and Path(target_path) == run:
+                promoted.set()
+                if not release_initialization.wait(timeout=10):
+                    raise AssertionError("initialization promotion pause timed out")
+
+        def mark_prepare_entry(*args: object, **kwargs: object) -> dict[str, object]:
+            prepare_entered.set()
+            return real_prepare(*args, **kwargs)
+
+        def prepare() -> dict[str, object]:
+            prepare_called.set()
+            return core.prepare_source(run, source)
+
+        initialization_state: dict[str, object] | None = None
+        prepared_manifest: dict[str, object] | None = None
+        initialization_error: BaseException | None = None
+        prepare_error: BaseException | None = None
+        with mock.patch.object(core.os, "replace", side_effect=replace_and_pause), mock.patch.object(
+            core,
+            "_prepare_source_v2_transaction",
+            side_effect=mark_prepare_entry,
+        ):
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                initialization = executor.submit(
+                    self._initialize, run, run_format_version=2
+                )
+                self.assertTrue(promoted.wait(timeout=5))
+                preparation = executor.submit(prepare)
+                self.assertTrue(prepare_called.wait(timeout=5))
+                prepare_was_blocked = not prepare_entered.wait(timeout=1)
+                release_initialization.set()
+                try:
+                    initialization_state = initialization.result(timeout=10)
+                except BaseException as error:
+                    initialization_error = error
+                try:
+                    prepared_manifest = preparation.result(timeout=10)
+                except BaseException as error:
+                    prepare_error = error
+
+        self.assertTrue(
+            prepare_was_blocked,
+            "prepare_source entered its transaction before initialization validation",
+        )
+        if initialization_error is not None:
+            raise initialization_error
+        if prepare_error is not None:
+            raise prepare_error
+        assert initialization_state is not None
+        assert prepared_manifest is not None
+        self.assertEqual(initialization_state["state"], "initialized")
+        self.assertEqual(prepared_manifest["status"], "ready")
+        self.assertEqual(core.inspect_source(run)["next_action"], "curate_source")
+        self.assertEqual(
+            json.loads((run / "run.json").read_text(encoding="utf-8"))["state"],
+            "curating",
+        )
 
     def test_v2_source_staging_rejects_a_nonexact_file_set(self) -> None:
         source_run = self.root / "runs" / "source-stage-extra"
