@@ -2067,6 +2067,309 @@ elif name == "pdfimages":
 
         self.assertEqual(_tree_snapshot(run), before)
 
+    def test_v2_style_references_are_transaction_bound_and_style_only(self) -> None:
+        run = self.root / "runs" / "style-references"
+        self._initialize(run, run_format_version=2)
+        source = self.root / "style-references.md"
+        source.write_text("# Style references\n", encoding="utf-8")
+        first = self.root / "first-reference.png"
+        second = self.root / "second-reference.png"
+        first.write_bytes(_png(3, 2, 41))
+        second.write_bytes(_png(4, 3, 82))
+
+        manifest = core.prepare_source(
+            run,
+            source,
+            reference_images=[first, second],
+        )
+
+        self.assertEqual(manifest["status"], "ready")
+        self.assertEqual(manifest["visual_count"], 2)
+        visuals = json.loads(
+            (run / "evidence" / "source_visuals.json").read_text(encoding="utf-8")
+        )["visuals"]
+        self.assertEqual(
+            [item["path"] for item in visuals],
+            [
+                "reference_images/reference-001.png",
+                "reference_images/reference-002.png",
+            ],
+        )
+        for index, (visual, original) in enumerate(
+            zip(visuals, (first, second), strict=True), start=1
+        ):
+            copied = run / "evidence" / "reference_images" / f"reference-{index:03d}.png"
+            self.assertEqual(copied.read_bytes(), original.read_bytes())
+            self.assertEqual(visual["sha256"], core.sha256_file(copied))
+            self.assertEqual(visual["origin"], "style_reference")
+            self.assertEqual(visual["eligibility"], "style_only")
+            self.assertEqual(visual["allowed_content_roles"], [])
+        self.assertEqual(core.list_source_assets(run)["derived_assets"], [])
+        persisted = b"".join(
+            path.read_bytes()
+            for path in (
+                run / "evidence" / "source_manifest.json",
+                run / "evidence" / "source_visuals.json",
+                run / "events.jsonl",
+            )
+        )
+        self.assertNotIn(str(first).encode(), persisted)
+        self.assertNotIn(str(second).encode(), persisted)
+
+    def test_v2_style_reference_recovery_requires_the_identical_ordered_request(self) -> None:
+        for boundary in ("after_source_seed_input", "after_source_outputs_staged"):
+            with self.subTest(boundary=boundary):
+                run = self.root / "runs" / f"style-reference-{boundary}"
+                self._initialize(run, run_format_version=2)
+                source = self.root / f"style-reference-{boundary}.md"
+                source.write_text("# Recover style references\n", encoding="utf-8")
+                first = self.root / f"{boundary}-first.png"
+                second = self.root / f"{boundary}-second.png"
+                first_bytes = _png(2, 2, 11)
+                second_bytes = _png(2, 3, 22)
+                first.write_bytes(first_bytes)
+                second.write_bytes(second_bytes)
+
+                with self.assertRaises(core.SimulatedCrash):
+                    core.prepare_source(
+                        run,
+                        source,
+                        reference_images=[first, second],
+                        fail_at=boundary,
+                    )
+                stage = run / ".source-prep-staging"
+                claim = json.loads(
+                    (stage / "source-seed-claim.json").read_text(encoding="utf-8")
+                )
+                self.assertEqual(
+                    [item["path"] for item in claim["reference_images"]],
+                    [
+                        "evidence/reference_images/reference-001.png",
+                        "evidence/reference_images/reference-002.png",
+                    ],
+                )
+                self.assertNotIn(str(first), json.dumps(claim))
+                before_mismatch = _tree_snapshot(run)
+                with self.assertRaises(core.IntegrityError):
+                    core.prepare_source(
+                        run,
+                        source,
+                        reference_images=[second, first],
+                    )
+                self.assertEqual(_tree_snapshot(run), before_mismatch)
+
+                first.write_bytes(_png(2, 2, 99))
+                before_changed = _tree_snapshot(run)
+                with self.assertRaises(core.IntegrityError):
+                    core.prepare_source(
+                        run,
+                        source,
+                        reference_images=[first, second],
+                    )
+                self.assertEqual(_tree_snapshot(run), before_changed)
+                first.write_bytes(first_bytes)
+
+                second.unlink()
+                before_missing = _tree_snapshot(run)
+                with self.assertRaises(core.PathSafetyError):
+                    core.prepare_source(
+                        run,
+                        source,
+                        reference_images=[first, second],
+                    )
+                self.assertEqual(_tree_snapshot(run), before_missing)
+                second.write_bytes(second_bytes)
+
+                recovered = core.prepare_source(
+                    run,
+                    source,
+                    reference_images=[first, second],
+                )
+                self.assertEqual(recovered["status"], "ready")
+                self.assertFalse(stage.exists())
+                self.assertEqual(
+                    sum(
+                        event.get("event") == "source_prepared"
+                        for event in _events(run)
+                    ),
+                    1,
+                )
+
+    def test_v2_style_references_reject_invalid_inputs_before_live_source_write(self) -> None:
+        cases: list[tuple[str, object, type[Exception], bool]] = []
+        unsupported = self.root / "unsupported-reference.txt"
+        unsupported.write_bytes(_png(1, 1, 10))
+        cases.append(("unsupported", unsupported, core.ContractError, False))
+        non_image = self.root / "not-an-image.png"
+        non_image.write_bytes(b"not an image")
+        cases.append(("non-image", non_image, core.ContractError, False))
+        unsupported_bmp = self.root / "unsupported-reference.bmp"
+        unsupported_bmp.write_bytes(b"BM" + b"\0" * 32)
+        cases.append(("unsupported-bmp", unsupported_bmp, core.ContractError, False))
+        unsupported_tiff = self.root / "unsupported-reference.tiff"
+        unsupported_tiff.write_bytes(b"II*\0" + b"\0" * 32)
+        cases.append(("unsupported-tiff", unsupported_tiff, core.ContractError, False))
+        regular = self.root / "regular-reference.png"
+        regular.write_bytes(_png(1, 1, 20))
+        symlink = self.root / "symlink-reference.png"
+        symlink.symlink_to(regular)
+        cases.append(("symlink", symlink, core.PathSafetyError, False))
+        hardlink = self.root / "hardlink-reference.png"
+        os.link(regular, hardlink)
+        cases.append(("hardlink", hardlink, core.PathSafetyError, False))
+        cases.append(("extra-asset", regular, core.ContractError, True))
+
+        for name, reference, error, as_asset in cases:
+            with self.subTest(name=name):
+                run = self.root / "runs" / f"invalid-reference-{name}"
+                self._initialize(run, run_format_version=2)
+                source = self.root / f"invalid-reference-{name}.md"
+                source.write_text("# Reject before mutation\n", encoding="utf-8")
+                before = _tree_snapshot(run)
+                arguments = (
+                    {"extra_assets": [reference]}
+                    if as_asset
+                    else {"reference_images": [reference]}
+                )
+                with self.assertRaises(error):
+                    core.prepare_source(run, source, **arguments)
+                self.assertEqual(_tree_snapshot(run), before)
+                self.assertFalse((run / "input" / "source.md").exists())
+
+    def test_v2_style_reference_suffixes_match_released_set_and_blocked_pdf_binds_refs(self) -> None:
+        accepted = {
+            "gif": b"GIF89a" + b"\0" * 16,
+            "jpeg": b"\xff\xd8\xff" + b"jpeg" + b"\xff\xd9",
+            "jpg": b"\xff\xd8\xff" + b"jpg" + b"\xff\xd9",
+            "png": _png(1, 1, 33),
+            "svg": b'<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"/>',
+            "webp": b"RIFF\x04\x00\x00\x00WEBP",
+        }
+        references = []
+        for suffix, data in accepted.items():
+            path = self.root / f"released-reference.{suffix}"
+            path.write_bytes(data)
+            references.append(path)
+        run = self.root / "runs" / "released-reference-suffixes"
+        self._initialize(run, run_format_version=2)
+        source = self.root / "released-reference-suffixes.md"
+        source.write_text("# Released style reference suffixes\n", encoding="utf-8")
+
+        core.prepare_source(run, source, reference_images=references)
+
+        self.assertEqual(
+            [path.suffix for path in sorted((run / "evidence" / "reference_images").iterdir())],
+            [".gif", ".jpeg", ".jpg", ".png", ".svg", ".webp"],
+        )
+
+        blocked_run = self.root / "runs" / "blocked-pdf-style-reference"
+        self._initialize(blocked_run, run_format_version=2)
+        pdf = self.root / "blocked-pdf-style-reference.pdf"
+        pdf.write_bytes(b"%PDF-1.4\nblocked style reference\n")
+        reference = self.root / "blocked-style.png"
+        reference.write_bytes(_png(2, 2, 55))
+        blocked = core.prepare_source(
+            blocked_run,
+            pdf,
+            reference_images=[reference],
+            tool_paths={
+                name: None
+                for name in ("pdftotext", "pdfinfo", "pdftoppm", "pdfimages")
+            },
+        )
+        source_visuals = blocked_run / "evidence" / "source_visuals.json"
+        self.assertEqual(blocked["status"], "blocked")
+        self.assertEqual(blocked["visual_count"], 1)
+        self.assertEqual(blocked["source_visuals_sha256"], core.sha256_file(source_visuals))
+        core.inspect_source(blocked_run)
+        stale = blocked_run / "evidence" / "reference_images" / "reference-999.png"
+        stale.write_bytes(_png(1, 1, 99))
+        tools, _calls = self._fake_poppler("blocked-style-poppler")
+
+        ready = core.prepare_source(
+            blocked_run,
+            pdf,
+            reference_images=[reference],
+            tool_paths=tools,
+        )
+
+        self.assertEqual(ready["status"], "ready")
+        self.assertEqual(
+            [path.name for path in (blocked_run / "evidence" / "reference_images").iterdir()],
+            ["reference-001.png"],
+        )
+
+    def test_v2_plan_reuse_honors_catalog_limit_with_one_attempt_binding(self) -> None:
+        run, selection, crops = self._review_source_fixture("plan-reuse")
+        selection["assets"][1]["max_reuse"] = 2
+        context = core.create_source_review_context(run, selection)
+        core.record_source_review(
+            run,
+            context["context_path"],
+            self._review_fixture(context),
+        )
+        result_id = crops["result"]["asset_id"]
+        plan = {
+            "artifact_type": "poster",
+            "visual_allocations": [
+                {"visual_id": result_id, "role": "result-primary"},
+                {"visual_id": result_id, "role": "result-detail"},
+            ],
+        }
+
+        core.save_plan_revision(run, plan)
+        attempt = core.begin_attempt(run)
+
+        snapshot = core.load_attempt_plan(run, attempt)
+        attempt_context = json.loads(
+            (run / "attempts" / attempt / "attempt-context.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        catalog = core.load_attempt_visual_catalog(run, attempt)
+        result = next(item for item in catalog["assets"] if item["asset_id"] == result_id)
+        self.assertEqual(snapshot["visual_allocations"], plan["visual_allocations"])
+        self.assertEqual(
+            attempt_context["authorized_assets"],
+            [{"asset_id": result_id, "sha256": result["sha256"]}],
+        )
+
+        over_limit = dict(plan)
+        over_limit["visual_allocations"] = [*plan["visual_allocations"], plan["visual_allocations"][0]]
+        with self.assertRaises(core.ContractError):
+            core._plan_authorized_assets(over_limit, catalog)
+        malformed = json.loads(json.dumps(catalog))
+        next(item for item in malformed["assets"] if item["asset_id"] == result_id)[
+            "max_reuse"
+        ] = True
+        with self.assertRaises(core.IntegrityError):
+            core._plan_authorized_assets(plan, malformed)
+
+    def test_public_active_catalog_loader_and_exports_are_v2_only(self) -> None:
+        run, _context, _review = self._committed_review_fixture("active-catalog")
+
+        loaded = core.load_active_visual_catalog(run)
+
+        expected = json.loads(
+            (run / "curations" / "001" / "catalog.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(loaded, expected)
+        for name in (
+            "create_source_review_context",
+            "record_source_review",
+            "load_active_visual_catalog",
+        ):
+            self.assertIn(name, core.__all__)
+
+        v1 = self.root / "runs" / "active-catalog-v1"
+        self._initialize(v1)
+        before = _tree_snapshot(v1)
+        with self.assertRaises(core.StateError):
+            core.load_active_visual_catalog(v1)
+        self.assertEqual(_tree_snapshot(v1), before)
+
     def test_inspect_run_format_rejects_ambiguous_or_noncanonical_contracts(self) -> None:
         accepted = (
             ({"format_version": 1}, 1),

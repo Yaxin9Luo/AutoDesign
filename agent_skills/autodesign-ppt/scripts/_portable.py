@@ -23,6 +23,7 @@ import subprocess
 import tempfile
 import threading
 import unicodedata
+import xml.etree.ElementTree as ElementTree
 import zlib
 from collections import Counter
 from contextlib import contextmanager
@@ -1274,19 +1275,23 @@ def _plan_authorized_assets(
     for item in catalog_assets:
         asset_id = item.get("asset_id")
         digest = item.get("sha256")
+        max_reuse = item.get("max_reuse")
         if (
             not isinstance(asset_id, str)
             or not asset_id
             or asset_id in by_id
             or not isinstance(digest, str)
             or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+            or not isinstance(max_reuse, int)
+            or isinstance(max_reuse, bool)
+            or max_reuse < 1
             or item.get("trust") != "reviewed"
             or item.get("eligible") is not True
         ):
             raise IntegrityError("reviewed catalog asset binding is invalid")
         by_id[asset_id] = item
     authorized: list[dict[str, str]] = []
-    seen: set[str] = set()
+    counts: Counter[str] = Counter()
     for raw in allocations:
         if not isinstance(raw, Mapping):
             raise ContractError("plan revision visual allocation must be an object")
@@ -1295,16 +1300,18 @@ def _plan_authorized_assets(
             not isinstance(asset_id, str)
             or not asset_id
             or asset_id != asset_id.strip()
-            or asset_id in seen
         ):
-            raise ContractError(
-                "plan revision visual IDs must be unique canonical strings"
-            )
+            raise ContractError("plan revision visual IDs must be canonical strings")
         asset = by_id.get(asset_id)
         if asset is None:
             raise ContractError("plan revision references an unreviewed source asset")
-        seen.add(asset_id)
-        authorized.append({"asset_id": asset_id, "sha256": str(asset["sha256"])})
+        counts[asset_id] += 1
+        if counts[asset_id] > int(asset["max_reuse"]):
+            raise ContractError("plan revision exceeds a reviewed asset reuse limit")
+        if counts[asset_id] == 1:
+            authorized.append(
+                {"asset_id": asset_id, "sha256": str(asset["sha256"])}
+            )
     return authorized
 
 
@@ -2718,6 +2725,143 @@ def _visual_record(
     }
 
 
+def _is_svg_image(data: bytes) -> bool:
+    try:
+        root = ElementTree.fromstring(data.decode("utf-8-sig"))
+    except (UnicodeDecodeError, ElementTree.ParseError):
+        return False
+    return root.tag.rsplit("}", 1)[-1].lower() == "svg"
+
+
+_REFERENCE_IMAGE_SIGNATURES = {
+    ".gif": lambda data: data.startswith((b"GIF87a", b"GIF89a")),
+    ".jpeg": lambda data: data.startswith(b"\xff\xd8\xff") and data.endswith(b"\xff\xd9"),
+    ".jpg": lambda data: data.startswith(b"\xff\xd8\xff") and data.endswith(b"\xff\xd9"),
+    ".png": lambda data: data.startswith(b"\x89PNG\r\n\x1a\n"),
+    ".svg": _is_svg_image,
+    ".webp": lambda data: len(data) >= 12
+    and data.startswith(b"RIFF")
+    and data[8:12] == b"WEBP",
+}
+
+
+def _read_reference_image(path: Path) -> bytes:
+    try:
+        published = path.lstat()
+    except OSError as error:
+        raise PathSafetyError(f"reference image is missing or unsafe: {path}") from error
+    if (
+        S_ISLNK(published.st_mode)
+        or not S_ISREG(published.st_mode)
+        or published.st_nlink != 1
+    ):
+        raise PathSafetyError(
+            f"reference image must be a single-link regular file: {path}"
+        )
+    if published.st_size > 256 * 1024 * 1024:
+        raise ContractError(f"reference image is too large: {path.name}")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise PathSafetyError(f"reference image is missing or unsafe: {path}") from error
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or (opened.st_dev, opened.st_ino)
+            != (published.st_dev, published.st_ino)
+            or opened.st_size != published.st_size
+        ):
+            raise PathSafetyError(
+                f"reference image identity changed before reading: {path}"
+            )
+        remaining = opened.st_size
+        parts: list[bytes] = []
+        while remaining:
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                raise IntegrityError(f"reference image was truncated while reading: {path}")
+            parts.append(chunk)
+            remaining -= len(chunk)
+        if os.read(descriptor, 1):
+            raise IntegrityError(f"reference image grew while reading: {path}")
+        final = os.fstat(descriptor)
+        if (
+            final.st_size != opened.st_size
+            or final.st_nlink != 1
+            or (final.st_dev, final.st_ino) != (opened.st_dev, opened.st_ino)
+        ):
+            raise IntegrityError(f"reference image changed while reading: {path}")
+        return b"".join(parts)
+    finally:
+        os.close(descriptor)
+
+
+def _reference_image_requests(
+    reference_images: Sequence[Path | str],
+) -> list[dict[str, Any]]:
+    requests: list[dict[str, Any]] = []
+    for index, value in enumerate(reference_images, start=1):
+        source = Path(value).absolute()
+        suffix = source.suffix.lower()
+        validator = _REFERENCE_IMAGE_SIGNATURES.get(suffix)
+        if validator is None:
+            raise ContractError(
+                f"unsupported reference image type: {suffix or '<none>'}"
+            )
+        data = _read_reference_image(source)
+        if not validator(data):
+            raise ContractError(
+                f"reference image content does not match its suffix: {source.name}"
+            )
+        requests.append(
+            {
+                "path": f"evidence/reference_images/reference-{index:03d}{suffix}",
+                "suffix": suffix,
+                "sha256": sha256_bytes(data),
+                "data": data,
+            }
+        )
+    return requests
+
+
+def _reference_image_bindings(
+    requests: Sequence[Mapping[str, Any]],
+) -> list[dict[str, str]]:
+    return [
+        {
+            "path": str(request["path"]),
+            "suffix": str(request["suffix"]),
+            "sha256": str(request["sha256"]),
+        }
+        for request in requests
+    ]
+
+
+def _write_v2_style_references(
+    run: Path,
+    requests: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    visuals: list[dict[str, Any]] = []
+    for index, request in enumerate(requests, start=1):
+        relative = str(request["path"])
+        target = safe_path(run, relative)
+        atomic_write_bytes(target, bytes(request["data"]))
+        if sha256_file(target) != request["sha256"]:
+            raise IntegrityError("style reference copy hash mismatch")
+        visuals.append(
+            _visual_record(
+                f"vis-{index:03d}",
+                target.relative_to(run / "evidence").as_posix(),
+                str(request["sha256"]),
+                origin="style_reference",
+            )
+        )
+    return visuals
+
+
 def _clear_stale_source_outputs(run: Path) -> None:
     for directory, pattern in (
         (run / "evidence" / "pages", "*"),
@@ -3100,7 +3244,7 @@ def _prepare_source_v2(
     source_path: Path | str,
     *,
     extra_assets: Sequence[Path | str],
-    reference_images: Sequence[Path | str],
+    reference_requests: Sequence[Mapping[str, Any]],
     tool_paths: Mapping[str, str | Path | None] | None,
     poppler_input: Path | None = None,
 ) -> dict[str, Any]:
@@ -3121,8 +3265,8 @@ def _prepare_source_v2(
     }.get(suffix)
     if source_type is None:
         raise ContractError(f"unsupported source type: {suffix or '<none>'}")
-    if extra_assets or reference_images:
-        raise ContractError("Agent-first source preparation accepts only the primary source")
+    if extra_assets:
+        raise ContractError("Agent-first source preparation rejects extra content assets")
     input_name = f"source{suffix}"
     input_source = run / "input" / input_name
     input_entries = list((run / "input").iterdir())
@@ -3154,6 +3298,19 @@ def _prepare_source_v2(
         "source_size": input_source.stat().st_size,
         "tools": {},
     }
+    visuals = _write_v2_style_references(run, reference_requests)
+    atomic_write_json(
+        run / "evidence" / "source_visuals.json",
+        {"format_version": FORMAT_VERSION, "visuals": visuals},
+    )
+    manifest.update(
+        {
+            "source_visuals_sha256": sha256_file(
+                run / "evidence" / "source_visuals.json"
+            ),
+            "visual_count": len(visuals),
+        }
+    )
 
     if source_type in {"markdown", "text"}:
         text = input_source.read_text(encoding="utf-8")
@@ -3176,10 +3333,6 @@ def _prepare_source_v2(
         if missing:
             manifest.update({"status": "blocked", "missing_tools": missing})
             _write_evidence(run, [])
-            atomic_write_json(
-                run / "evidence" / "source_visuals.json",
-                {"format_version": FORMAT_VERSION, "visuals": []},
-            )
             _persist_source_manifest(run, manifest)
             mark_side_state(
                 run,
@@ -3213,10 +3366,6 @@ def _prepare_source_v2(
         if failed:
             manifest.update({"status": "blocked", "failed_commands": sorted(set(failed))})
             _write_evidence(run, [])
-            atomic_write_json(
-                run / "evidence" / "source_visuals.json",
-                {"format_version": FORMAT_VERSION, "visuals": []},
-            )
             _persist_source_manifest(run, manifest)
             mark_side_state(
                 run,
@@ -3257,7 +3406,7 @@ def _prepare_source_v2(
     _write_evidence(run, evidence)
     atomic_write_json(
         run / "evidence" / "source_visuals.json",
-        {"format_version": FORMAT_VERSION, "visuals": []},
+        {"format_version": FORMAT_VERSION, "visuals": visuals},
     )
     manifest.update(
         {
@@ -3267,7 +3416,7 @@ def _prepare_source_v2(
                 run / "evidence" / "source_visuals.json"
             ),
             "evidence_count": len(evidence),
-            "visual_count": 0,
+            "visual_count": len(visuals),
         }
     )
     _persist_source_manifest(run, manifest)
@@ -3283,7 +3432,7 @@ def _prepare_source_v2(
         "source_prepared",
         source_type=source_type,
         evidence_count=len(evidence),
-        visual_count=0,
+        visual_count=len(visuals),
     )
     return manifest
 
@@ -3295,6 +3444,7 @@ _SOURCE_TRANSACTION_KEYS = {
     "previous_source_manifest_sha256",
     "source_sha256",
     "source_suffix",
+    "reference_images",
     "files",
     "final_run_sha256",
     "final_source_manifest_sha256",
@@ -3328,6 +3478,7 @@ _SOURCE_SEED_CLAIM_KEYS = {
     "previous_source_manifest_sha256",
     "source_sha256",
     "source_suffix",
+    "reference_images",
     "claim_sha256",
 }
 
@@ -3340,6 +3491,11 @@ def _source_pretransaction_file_is_expected(relative: str) -> bool:
         is not None
         or re.fullmatch(r"evidence/pages/page-\d+\.png", relative) is not None
         or re.fullmatch(r"evidence/assets/pdf-image[^/]+", relative) is not None
+        or re.fullmatch(
+            r"evidence/reference_images/reference-\d{3}(?:\.gif|\.jpe?g|\.png|\.svg|\.webp)",
+            relative,
+        )
+        is not None
     )
 
 
@@ -3347,6 +3503,7 @@ def _source_seed_claim(
     run: Path,
     state: Mapping[str, Any],
     source: Path,
+    reference_requests: Sequence[Mapping[str, Any]],
 ) -> dict[str, Any]:
     claim: dict[str, Any] = {
         "format_version": FORMAT_VERSION,
@@ -3356,6 +3513,7 @@ def _source_seed_claim(
         "previous_source_manifest_sha256": state["source_manifest_sha256"],
         "source_sha256": sha256_file(source),
         "source_suffix": source.suffix.lower(),
+        "reference_images": _reference_image_bindings(reference_requests),
     }
     claim["claim_sha256"] = _canonical_hash(claim)
     return claim
@@ -3364,6 +3522,7 @@ def _source_seed_claim(
 def _validate_source_seed_claim(
     stage: Path,
     source: Path,
+    reference_requests: Sequence[Mapping[str, Any]],
     *,
     previous_run_sha256: str,
     previous_source_manifest_sha256: str,
@@ -3388,6 +3547,8 @@ def _validate_source_seed_claim(
         != previous_source_manifest_sha256
         or claim.get("source_suffix") != source.suffix.lower()
         or claim.get("source_sha256") != sha256_file(source)
+        or claim.get("reference_images")
+        != _reference_image_bindings(reference_requests)
     ):
         raise IntegrityError("source seed claim does not match its request")
     return claim
@@ -3398,6 +3559,7 @@ def _discard_incomplete_source_stage(
     state: Mapping[str, Any],
     stage: Path,
     source: Path,
+    reference_requests: Sequence[Mapping[str, Any]],
 ) -> None:
     files, directories = _regular_tree_inventory(stage)
     if not files and not directories:
@@ -3414,6 +3576,7 @@ def _discard_incomplete_source_stage(
     claim = _validate_source_seed_claim(
         stage,
         source,
+        reference_requests,
         previous_run_sha256=sha256_file(run / "run.json"),
         previous_source_manifest_sha256=state["source_manifest_sha256"],
     )
@@ -3431,6 +3594,7 @@ def _discard_incomplete_source_stage(
     _validate_source_seed_claim(
         quarantine,
         source,
+        reference_requests,
         previous_run_sha256=sha256_file(run / "run.json"),
         previous_source_manifest_sha256=state["source_manifest_sha256"],
     )
@@ -3458,6 +3622,11 @@ def _source_stage_files(stage: Path) -> dict[str, str]:
             and not relative.startswith("input/")
             and re.fullmatch(r"evidence/pages/page-\d{4}\.png", relative) is None
             and re.fullmatch(r"evidence/assets/pdf-image[^/]+", relative) is None
+            and re.fullmatch(
+                r"evidence/reference_images/reference-\d{3}(?:\.gif|\.jpe?g|\.png|\.svg|\.webp)",
+                relative,
+            )
+            is None
         ):
             raise IntegrityError(f"unexpected source staging file: {relative}")
         files[relative] = sha256_file(stage / relative)
@@ -3469,13 +3638,17 @@ def _seed_source_stage(
     state: Mapping[str, Any],
     stage: Path,
     source: Path,
+    reference_requests: Sequence[Mapping[str, Any]],
     *,
     fail_at: str | None,
 ) -> None:
     stage.mkdir()
     if fail_at == "after_source_stage_mkdir":
         raise SimulatedCrash("after source staging directory creation")
-    atomic_write_json(stage / _SOURCE_SEED_CLAIM, _source_seed_claim(run, state, source))
+    atomic_write_json(
+        stage / _SOURCE_SEED_CLAIM,
+        _source_seed_claim(run, state, source, reference_requests),
+    )
     for relative in (
         "input",
         "evidence/pages",
@@ -3504,6 +3677,7 @@ def _create_source_transaction(
     run: Path,
     stage: Path,
     source: Path,
+    reference_requests: Sequence[Mapping[str, Any]],
     *,
     previous_state: Mapping[str, Any],
     previous_events: Sequence[Mapping[str, Any]],
@@ -3511,6 +3685,7 @@ def _create_source_transaction(
     _validate_source_seed_claim(
         stage,
         source,
+        reference_requests,
         previous_run_sha256=sha256_file(run / "run.json"),
         previous_source_manifest_sha256=previous_state[
             "source_manifest_sha256"
@@ -3529,6 +3704,7 @@ def _create_source_transaction(
         ],
         "source_sha256": sha256_file(source),
         "source_suffix": source.suffix.lower(),
+        "reference_images": _reference_image_bindings(reference_requests),
         "files": _source_stage_files(stage),
         "final_run_sha256": sha256_file(stage / "run.json"),
         "final_source_manifest_sha256": sha256_file(
@@ -3546,6 +3722,7 @@ def _validate_source_transaction(
     run: Path,
     stage: Path,
     source: Path,
+    reference_requests: Sequence[Mapping[str, Any]],
 ) -> dict[str, Any]:
     actual_stage_files, actual_stage_directories = _regular_tree_inventory(stage)
     transaction_path = stage / "transaction.json"
@@ -3564,11 +3741,14 @@ def _validate_source_transaction(
         or transaction.get("operation") != "prepare_source"
         or transaction.get("source_suffix") != source.suffix.lower()
         or transaction.get("source_sha256") != sha256_file(source)
+        or transaction.get("reference_images")
+        != _reference_image_bindings(reference_requests)
     ):
         raise IntegrityError("source transaction request binding mismatch")
     _validate_source_seed_claim(
         stage,
         source,
+        reference_requests,
         previous_run_sha256=transaction["previous_run_sha256"],
         previous_source_manifest_sha256=transaction[
             "previous_source_manifest_sha256"
@@ -3580,6 +3760,16 @@ def _validate_source_transaction(
     input_paths = sorted(relative for relative in files if relative.startswith("input/"))
     if input_paths != [f"input/source{transaction['source_suffix']}"]:
         raise IntegrityError("source transaction must bind one immutable input")
+    reference_paths = sorted(
+        relative
+        for relative in files
+        if relative.startswith("evidence/reference_images/")
+    )
+    expected_references = _reference_image_bindings(reference_requests)
+    if reference_paths != [item["path"] for item in expected_references] or any(
+        files[item["path"]] != item["sha256"] for item in expected_references
+    ):
+        raise IntegrityError("source transaction style reference binding mismatch")
     expected_stage_files = {
         *files,
         "run.json",
@@ -3647,7 +3837,12 @@ def _validate_source_transaction(
 
 
 def _remove_stale_live_source_outputs(run: Path, expected: set[str]) -> None:
-    for root_relative in ("input", "evidence/pages", "evidence/assets"):
+    for root_relative in (
+        "input",
+        "evidence/pages",
+        "evidence/assets",
+        "evidence/reference_images",
+    ):
         root = safe_path(run, root_relative, must_exist=True)
         for path in list(root.iterdir()):
             relative = path.relative_to(run).as_posix()
@@ -3667,10 +3862,13 @@ def _commit_source_transaction(
     run: Path,
     stage: Path,
     source: Path,
+    reference_requests: Sequence[Mapping[str, Any]],
     *,
     fail_at: str | None,
 ) -> dict[str, Any]:
-    transaction = _validate_source_transaction(run, stage, source)
+    transaction = _validate_source_transaction(
+        run, stage, source, reference_requests
+    )
     files = transaction["files"]
     expected = set(files)
     _remove_stale_live_source_outputs(run, expected)
@@ -3723,12 +3921,23 @@ def _prepare_source_v2_transaction(
     source = Path(source_path).absolute()
     if source.is_symlink() or not source.is_file() or source.stat().st_nlink != 1:
         raise PathSafetyError(f"source must be a regular non-symlink file: {source}")
+    if extra_assets:
+        raise ContractError("Agent-first source preparation rejects extra content assets")
     stage = run / ".source-prep-staging"
     if stage.exists() or stage.is_symlink():
+        reference_requests = _reference_image_requests(reference_images)
         staged_files, _staged_directories = _regular_tree_inventory(stage)
         if "transaction.json" in staged_files:
-            return _commit_source_transaction(run, stage, source, fail_at=fail_at)
-        _discard_incomplete_source_stage(run, state, stage, source)
+            return _commit_source_transaction(
+                run,
+                stage,
+                source,
+                reference_requests,
+                fail_at=fail_at,
+            )
+        _discard_incomplete_source_stage(
+            run, state, stage, source, reference_requests
+        )
     manifest_path = run / "evidence" / "source_manifest.json"
     if sha256_file(manifest_path) != state.get("source_manifest_sha256"):
         raise IntegrityError("source manifest hash mismatch")
@@ -3739,8 +3948,7 @@ def _prepare_source_v2_transaction(
     suffix = source.suffix.lower()
     if suffix not in {".md", ".markdown", ".txt", ".pdf"}:
         raise ContractError(f"unsupported source type: {suffix or '<none>'}")
-    if extra_assets or reference_images:
-        raise ContractError("Agent-first source preparation accepts only the primary source")
+    reference_requests = _reference_image_requests(reference_images)
     input_source = run / "input" / f"source{suffix}"
     input_entries = list((run / "input").iterdir())
     if input_entries:
@@ -3756,13 +3964,20 @@ def _prepare_source_v2_transaction(
         atomic_write_bytes(input_source, source.read_bytes())
     previous_events = _read_event_log(run / "events.jsonl")
     try:
-        _seed_source_stage(run, state, stage, source, fail_at=fail_at)
+        _seed_source_stage(
+            run,
+            state,
+            stage,
+            source,
+            reference_requests,
+            fail_at=fail_at,
+        )
         _prepare_source_v2(
             stage,
             dict(state),
             source,
             extra_assets=extra_assets,
-            reference_images=reference_images,
+            reference_requests=reference_requests,
             tool_paths=tool_paths,
             poppler_input=input_source if suffix == ".pdf" else None,
         )
@@ -3770,6 +3985,7 @@ def _prepare_source_v2_transaction(
             run,
             stage,
             source,
+            reference_requests,
             previous_state=state,
             previous_events=previous_events,
         )
@@ -3777,11 +3993,15 @@ def _prepare_source_v2_transaction(
         raise
     except Exception:
         if stage.exists() and not stage.is_symlink():
-            _discard_incomplete_source_stage(run, state, stage, source)
+            _discard_incomplete_source_stage(
+                run, state, stage, source, reference_requests
+            )
         raise
     if fail_at == "after_source_outputs_staged":
         raise SimulatedCrash("after source outputs staged")
-    return _commit_source_transaction(run, stage, source, fail_at=fail_at)
+    return _commit_source_transaction(
+        run, stage, source, reference_requests, fail_at=fail_at
+    )
 
 
 def prepare_source(
@@ -3994,6 +4214,30 @@ def _persist_source_manifest(run: Path, manifest: Mapping[str, Any]) -> None:
     _write_run(run, state)
 
 
+def _verify_style_reference_registry(
+    run: Path, visuals: Mapping[str, Any]
+) -> None:
+    expected: set[str] = set()
+    for visual in visuals.get("visuals", []):
+        if not isinstance(visual, Mapping) or visual.get("origin") != "style_reference":
+            continue
+        relative = visual.get("path")
+        if not isinstance(relative, str):
+            raise IntegrityError("style reference has no canonical path")
+        path = safe_path(run / "evidence", relative, must_exist=True)
+        if path.parent != run / "evidence" / "reference_images":
+            raise IntegrityError("style reference is outside its registry")
+        expected.add(path.name)
+    reference_root = run / "evidence" / "reference_images"
+    actual = set()
+    for path in reference_root.iterdir():
+        if path.is_symlink() or not path.is_file() or path.stat().st_nlink != 1:
+            raise PathSafetyError(f"unsafe style reference registry entry: {path}")
+        actual.add(path.name)
+    if actual != expected:
+        raise IntegrityError("style reference registry is not an exact set")
+
+
 def _verify_source_contract(run: Path, state: Mapping[str, Any]) -> dict[str, Any]:
     manifest_path = run / "evidence" / "source_manifest.json"
     if sha256_file(manifest_path) != state.get("source_manifest_sha256"):
@@ -4007,6 +4251,14 @@ def _verify_source_contract(run: Path, state: Mapping[str, Any]) -> dict[str, An
     source = safe_path(run, input_path, must_exist=True)
     if sha256_file(source) != manifest.get("source_sha256"):
         raise IntegrityError("source input hash mismatch")
+    visuals: dict[str, Any] | None = None
+    source_visuals_sha256 = manifest.get("source_visuals_sha256")
+    if source_visuals_sha256 is not None:
+        visuals_path = run / "evidence" / "source_visuals.json"
+        if sha256_file(visuals_path) != source_visuals_sha256:
+            raise IntegrityError("source contract hash mismatch: source_visuals_sha256")
+        visuals = _load_visuals(run)
+        _verify_style_reference_registry(run, visuals)
     if manifest.get("status") != "ready":
         return manifest
     expected = {
@@ -4036,7 +4288,8 @@ def _verify_source_contract(run: Path, state: Mapping[str, Any]) -> dict[str, An
             if page.parent != pages_root or sha256_file(page) != digest:
                 raise IntegrityError(f"PDF rendered page hash mismatch: {relative}")
     load_evidence(run)
-    visuals = _load_visuals(run)
+    visuals = visuals or _load_visuals(run)
+    _verify_style_reference_registry(run, visuals)
     for visual in visuals["visuals"]:
         relative = visual.get("path")
         if not isinstance(relative, str):
@@ -6157,6 +6410,23 @@ def record_source_review(
         )
 
 
+def load_active_visual_catalog(run_dir: Path | str) -> dict[str, Any]:
+    """Load the immutable active reviewed catalog for a v2 run."""
+
+    if inspect_run_format(run_dir) != AGENT_FIRST_RUN_FORMAT_VERSION:
+        raise StateError("version-1 runs do not support Agent-first visual catalogs")
+    run, state = _load_agent_first_run(run_dir)
+    _curation_registry(run, state)
+    revision = state.get("active_curation_revision")
+    digest = state.get("active_curation_sha256")
+    if not isinstance(revision, int) or isinstance(revision, bool):
+        raise StateError("run has no active reviewed visual catalog")
+    values = _load_curation_revision(run, revision)
+    if values["manifest.json"]["catalog_sha256"] != digest:
+        raise IntegrityError("active reviewed catalog hash pointer is stale")
+    return values["catalog.json"]
+
+
 def load_evidence(run_dir: Path | str) -> list[dict[str, Any]]:
     """Load and validate the append-free evidence JSONL contract."""
 
@@ -8028,11 +8298,13 @@ __all__ = [
     "PathSafetyError", "PortableError", "RELEASED_RUN_FORMAT_VERSION", "REPAIR_ROUTE_ORDER",
     "SIDE_STATES", "SimulatedCrash", "StateError", "append_jsonl", "atomic_write_bytes",
     "atomic_write_json", "begin_attempt", "bind_host_vlm_visuals", "create_review_context",
-    "crop_source", "crop_source_from_file", "diagnose_v1_run", "finalize_attempt",
+    "create_source_review_context", "crop_source", "crop_source_from_file",
+    "diagnose_v1_run", "finalize_attempt",
     "initialize_run", "inspect_run_format", "inspect_source", "lexical_retrieve",
-    "list_source_assets", "load_active_plan", "load_attempt_plan",
+    "list_source_assets", "load_active_plan", "load_active_visual_catalog", "load_attempt_plan",
     "load_attempt_visual_catalog", "load_evidence", "mark_side_state",
-    "prepare_source", "record_deterministic_result", "record_semantic_review", "redact_secrets",
+    "prepare_source", "record_deterministic_result", "record_semantic_review",
+    "record_source_review", "redact_secrets",
     "reopen_curation", "resume_run", "safe_path", "save_plan", "save_plan_revision",
     "sha256_bytes", "sha256_file", "transition_state",
     "tree_hash", "validate_grounding", "validate_visual_plan", "verify_skill_snapshot",
