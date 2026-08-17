@@ -30,6 +30,7 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 import _portable as core  # noqa: E402
+import poster_dom_audit  # noqa: E402
 import setup_browser  # noqa: E402
 
 
@@ -72,6 +73,7 @@ POSTER_FINDING_MINIMUM_ROUTE = {
     "fragmentary_crop": "source_reingest",
     "unreadable_source_visual": "source_reingest",
     "caption_claim_mismatch": "source_reingest",
+    **{code: "layout_repair" for code in poster_dom_audit.STABLE_FINDING_CODES},
 }
 PRESETS: dict[str, dict[str, dict[str, float | int]]] = {
     "cvpr-landscape": {
@@ -1454,7 +1456,9 @@ def _clear_generated_attempt_outputs(attempt: Path) -> None:
         "artifact/preview.png",
         "qa/poster-output.json",
         "qa/deterministic.json",
-        "qa/previews",
+        "qa/previews/audit.json",
+        "qa/previews/poster.png",
+        "qa/previews/poster-print.png",
     ):
         target = core.safe_path(attempt, relative)
         if target.is_dir():
@@ -1686,25 +1690,6 @@ def _render_poster_outputs(
         allow_install=allow_browser_install,
     )
     canvas = plan["canvas"]
-    browser_report = setup_browser.audit_local_html(
-        html,
-        workspace_root=attempt_root,
-        output_dir=preview_dir,
-        viewports=(f"poster:{canvas['width_px']}x{canvas['height_px']}",),
-        runtime=runtime,
-        cache_root=cache_root,
-        allow_install=False,
-        timeout_seconds=180,
-    )
-    preview = preview_dir / "poster.png"
-    browser_check = _check(
-        "browser_geometry",
-        browser_report.get("passed") is True and preview.is_file(),
-        "pinned Chromium geometry and dependency audit passed"
-        if browser_report.get("passed") is True and preview.is_file()
-        else "pinned Chromium found overflow, clipping, blank render, missing assets, or runtime errors",
-        report="qa/previews/audit.json",
-    )
     pdf = artifact / "poster.pdf"
     export_report = _export_pdf(
         runtime,
@@ -1748,16 +1733,14 @@ def _render_poster_outputs(
         height_px=int(canvas["height_px"]),
     )
     core.atomic_write_bytes(artifact / "preview.png", print_preview.read_bytes())
-    checks = [browser_check, typography_check, pdf_check]
+    checks = [typography_check, pdf_check]
     result = {
         "format_version": FORMAT_VERSION,
         "passed": all(check["passed"] for check in checks),
         "checks": checks,
         "preview_paths": {
             "poster_pdf": "qa/previews/poster-print.png",
-            "poster_screen": "qa/previews/poster.png",
         },
-        "browser_report": browser_report,
     }
     core.atomic_write_json(attempt_root / "qa" / "poster-output.json", result)
     return result
@@ -1772,6 +1755,52 @@ def _attempt_artifact_paths(attempt_root: Path) -> list[str]:
         if path.is_file():
             paths.append(f"artifact/{path.relative_to(artifact).as_posix()}")
     return paths
+
+
+def _dom_audit_checks(report: Mapping[str, Any]) -> list[dict[str, Any]]:
+    findings = report.get("findings")
+    if not isinstance(findings, list):
+        raise PosterContractError("Poster DOM audit omitted its deterministic findings")
+    checks: list[dict[str, Any]] = []
+    for finding in findings:
+        if not isinstance(finding, Mapping):
+            raise PosterContractError("Poster DOM audit finding must be an object")
+        code = str(finding.get("code") or "")
+        minimum_route = POSTER_FINDING_MINIMUM_ROUTE.get(code)
+        if code not in poster_dom_audit.STABLE_FINDING_CODES or minimum_route is None:
+            raise PosterContractError(f"unknown Poster DOM finding code: {code}")
+        if finding.get("suggested_repair_route") != "layout_repair":
+            raise PosterContractError(
+                f"Poster DOM finding {code} must suggest layout_repair"
+            )
+        geometry = finding.get("geometry")
+        if not isinstance(geometry, Mapping):
+            raise PosterContractError(f"Poster DOM finding {code} has invalid geometry")
+        checks.append(
+            _check(
+                code,
+                False,
+                str(finding.get("message") or "Rendered Poster DOM defect detected."),
+                code=code,
+                block_id=str(finding.get("block_id") or "paper-poster-root"),
+                severity=str(finding.get("severity") or "P1"),
+                geometry=dict(geometry),
+                minimum_route=minimum_route,
+            )
+        )
+    if checks:
+        return checks
+    passed = report.get("passed") is True and report.get("artifact_unchanged") is True
+    return [
+        _check(
+            "poster_dom_audit",
+            passed,
+            "read-only screen and print DOM audit passed"
+            if passed
+            else "read-only Poster DOM audit reported blocked browser diagnostics",
+            report="qa/dom-audit.json",
+        )
+    ]
 
 
 def validate_poster_attempt(
@@ -1857,6 +1886,31 @@ def validate_poster_attempt(
             for frame_id, relative in rendered.get("preview_paths", {}).items():
                 if (attempt / relative).is_file():
                     preview_paths[str(frame_id)] = str(relative)
+            try:
+                dom_report = run_poster_dom_audit(
+                    run,
+                    attempt_id,
+                    cache_root=cache_root,
+                    allow_browser_install=allow_browser_install,
+                )
+            except (
+                OSError,
+                subprocess.SubprocessError,
+                core.PortableError,
+                setup_browser.BrowserRuntimeError,
+            ) as error:
+                checks.append(
+                    _check(
+                        "poster_dom_audit",
+                        False,
+                        str(core.redact_secrets(str(error))),
+                    )
+                )
+            else:
+                checks.extend(_dom_audit_checks(dom_report))
+                dom_screen = attempt / "qa" / "previews" / "dom-screen.png"
+                if dom_screen.is_file():
+                    preview_paths["poster_screen"] = "qa/previews/dom-screen.png"
     passed = bool(checks) and all(check["passed"] for check in checks)
     required = {"artifact/poster.html", "artifact/poster.pdf", "artifact/preview.png"}
     artifact_paths = _attempt_artifact_paths(attempt)
@@ -2035,19 +2089,19 @@ def record_poster_source_review(
     return core.record_source_review(run_dir, context_path, review)
 
 
-def poster_dom_audit_blocked(
-    run_dir: Path | str, attempt_id: str
+def run_poster_dom_audit(
+    run_dir: Path | str,
+    attempt_id: str,
+    *,
+    cache_root: Path | None = None,
+    allow_browser_install: bool = True,
 ) -> dict[str, Any]:
-    _require_v2_run(run_dir)
-    core.load_attempt_plan(run_dir, attempt_id)
-    core.load_attempt_visual_catalog(run_dir, attempt_id)
-    return {
-        "run_format_version": core.AGENT_FIRST_RUN_FORMAT_VERSION,
-        "attempt_id": attempt_id,
-        "status": "blocked",
-        "reason": "read-only Poster DOM audit is not installed in this build",
-        "next_action": "install the Task 6 read-only DOM audit",
-    }
+    return poster_dom_audit.run_poster_dom_audit(
+        run_dir,
+        attempt_id,
+        cache_root=cache_root,
+        allow_browser_install=allow_browser_install,
+    )
 
 
 def _doctor(*, cache_root: Path | None, install_browser: bool) -> dict[str, Any]:
@@ -2212,7 +2266,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.command == "begin-attempt":
             result = begin_poster_attempt(args.run_dir)
         elif args.command == "dom-audit":
-            result = poster_dom_audit_blocked(args.run_dir, args.attempt)
+            result = run_poster_dom_audit(
+                args.run_dir,
+                args.attempt,
+                cache_root=args.cache_root,
+                allow_browser_install=not args.offline_browser,
+            )
         elif args.command == "validate":
             result = validate_poster_attempt(
                 args.run_dir,

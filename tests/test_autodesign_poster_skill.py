@@ -546,7 +546,7 @@ elif name == "pdfimages" and "-list" in sys.argv:
         self.assertEqual(json.loads(completed.stdout)["status"], "error")
         self.assertFalse(run.exists())
 
-    def test_dom_audit_cli_is_explicitly_blocked_until_read_only_engine_exists(self) -> None:
+    def test_dom_audit_cli_runs_the_read_only_engine_without_mutating_artifacts(self) -> None:
         harness = _load_harness()
         run = self.root / "dom-seam-run"
         source = self.root / "paper.txt"
@@ -555,25 +555,37 @@ elif name == "pdfimages" and "-list" in sys.argv:
         attempt = harness.begin_poster_attempt(run)["attempt_id"]
         artifact = run / "attempts" / attempt / "artifact"
         before = harness.core.tree_hash(artifact)
-        completed = subprocess.run(
-            [
-                sys.executable,
-                str(HARNESS_PATH),
-                "dom-audit",
-                "--run-dir",
-                str(run),
-                "--attempt",
-                attempt,
-                "--offline-browser",
-            ],
-            cwd=self.root,
-            text=True,
-            capture_output=True,
-            check=False,
+        expected = {
+            "run_format_version": 2,
+            "attempt_id": attempt,
+            "passed": True,
+            "artifact_unchanged": True,
+            "findings": [],
+        }
+        with mock.patch.object(
+            harness.poster_dom_audit,
+            "run_poster_dom_audit",
+            return_value=expected,
+        ) as shared, mock.patch("builtins.print") as printed:
+            exit_code = harness.main(
+                [
+                    "dom-audit",
+                    "--run-dir",
+                    str(run),
+                    "--attempt",
+                    attempt,
+                    "--offline-browser",
+                ]
+            )
+        self.assertEqual(exit_code, 0)
+        shared.assert_called_once_with(
+            run,
+            attempt,
+            cache_root=None,
+            allow_browser_install=False,
         )
-        self.assertEqual(completed.returncode, 2, completed.stdout + completed.stderr)
-        result = json.loads(completed.stdout)
-        self.assertEqual(result["status"], "blocked")
+        result = json.loads(str(printed.call_args.args[0]))
+        self.assertEqual(result, expected)
         self.assertEqual(harness.core.tree_hash(artifact), before)
 
     def test_resume_requires_poster_html_not_only_staged_source_assets(self) -> None:
@@ -1767,7 +1779,19 @@ elif name == "pdfimages" and "-list" in sys.argv:
                 },
             }
 
-        with mock.patch.object(harness, "_render_poster_outputs", side_effect=fake_render):
+        def fake_dom(
+            run_dir: Path, audited_attempt: str, **_kwargs: object
+        ) -> dict[str, object]:
+            previews = Path(run_dir) / "attempts" / audited_attempt / "qa" / "previews"
+            (previews / "dom-screen.png").write_bytes(b"dom-screen-preview")
+            (previews / "dom-print.png").write_bytes(b"dom-print-preview")
+            return {"passed": True, "artifact_unchanged": True, "findings": []}
+
+        with mock.patch.object(
+            harness, "_render_poster_outputs", side_effect=fake_render
+        ), mock.patch.object(
+            harness.poster_dom_audit, "run_poster_dom_audit", side_effect=fake_dom
+        ):
             deterministic = harness.validate_poster_attempt(
                 run,
                 attempt_id,
@@ -1866,7 +1890,19 @@ elif name == "pdfimages" and "-list" in sys.argv:
                 },
             }
 
-        with mock.patch.object(harness, "_render_poster_outputs", side_effect=fresh_render):
+        def fake_dom(
+            run_dir: Path, audited_attempt: str, **_kwargs: object
+        ) -> dict[str, object]:
+            previews = Path(run_dir) / "attempts" / audited_attempt / "qa" / "previews"
+            (previews / "dom-screen.png").write_bytes(b"dom-screen-preview")
+            (previews / "dom-print.png").write_bytes(b"dom-print-preview")
+            return {"passed": True, "artifact_unchanged": True, "findings": []}
+
+        with mock.patch.object(
+            harness, "_render_poster_outputs", side_effect=fresh_render
+        ), mock.patch.object(
+            harness.poster_dom_audit, "run_poster_dom_audit", side_effect=fake_dom
+        ):
             deterministic = harness.validate_poster_attempt(
                 run,
                 attempt_id,
@@ -2168,7 +2204,7 @@ elif name == "pdfimages" and "-list" in sys.argv:
         __import__("os").environ.get("AUTODESIGN_SKILL_REAL_BROWSER") == "1",
         "set AUTODESIGN_SKILL_REAL_BROWSER=1 for pinned Chromium/PDF integration",
     )
-    def test_review_context_binds_pdf_raster_when_print_layout_differs(self) -> None:
+    def test_dom_audit_rejects_screen_print_layout_mismatch(self) -> None:
         harness = _load_harness()
         run = self.root / "print-preview-run"
         source = self.root / "paper.txt"
@@ -2192,16 +2228,20 @@ elif name == "pdfimages" and "-list" in sys.argv:
             cache_root=Path(os.environ["AUTODESIGN_SKILL_BROWSER_CACHE"]),
             allow_browser_install=False,
         )
-        self.assertTrue(result["passed"], result)
-        context = harness.create_poster_review_context(run, attempt["attempt_id"])
-        self.assertEqual(set(context["preview_hashes"]), {"poster_pdf", "poster_screen"})
+        self.assertFalse(result["passed"], result)
+        finding = next(
+            check
+            for check in result["checks"]
+            if check["id"] == "poster-dom-screen-print-mismatch"
+        )
+        self.assertEqual(finding["minimum_route"], "layout_repair")
         attempt_root = run / "attempts" / attempt["attempt_id"]
-        print_preview = attempt_root / "qa" / "previews" / "poster-print.png"
-        screen_preview = attempt_root / "qa" / "previews" / "poster.png"
-        self.assertNotEqual(print_preview.read_bytes(), screen_preview.read_bytes())
-        self.assertEqual(
-            (attempt_root / "artifact" / "preview.png").read_bytes(),
-            print_preview.read_bytes(),
+        dom_report = json.loads(
+            (attempt_root / "qa" / "dom-audit.json").read_text(encoding="utf-8")
+        )
+        self.assertIn(
+            "poster-dom-screen-print-mismatch",
+            {item["code"] for item in dom_report["findings"]},
         )
 
 

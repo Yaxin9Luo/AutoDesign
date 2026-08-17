@@ -1999,6 +1999,26 @@ elif name == "pdfimages":
                 },
             }
 
+        def fake_dom(
+            run_dir: Path, attempt_id: str, **_kwargs: object
+        ) -> dict[str, object]:
+            previews = Path(run_dir) / "attempts" / attempt_id / "qa" / "previews"
+            (previews / "dom-screen.png").write_bytes(b"dom-screen-preview")
+            (previews / "dom-print.png").write_bytes(b"dom-print-preview")
+            return {
+                "passed": True,
+                "artifact_unchanged": True,
+                "findings": [],
+                "browser_diagnostics": {
+                    "blocked_requests": [],
+                    "blocked_popups": [],
+                    "blocked_workers": [],
+                    "console_errors": [],
+                    "request_errors": [],
+                    "page_errors": [],
+                },
+            }
+
         def semantic_review(
             attempt_id: str,
             context: dict[str, object],
@@ -2042,6 +2062,8 @@ elif name == "pdfimages":
         )
         with mock.patch.object(
             harness, "_render_poster_outputs", side_effect=fake_render
+        ), mock.patch.object(
+            harness.poster_dom_audit, "run_poster_dom_audit", side_effect=fake_dom
         ):
             deterministic = harness.validate_poster_attempt(
                 run,
@@ -2136,6 +2158,8 @@ elif name == "pdfimages":
         )
         with mock.patch.object(
             harness, "_render_poster_outputs", side_effect=fake_render
+        ), mock.patch.object(
+            harness.poster_dom_audit, "run_poster_dom_audit", side_effect=fake_dom
         ):
             deterministic = harness.validate_poster_attempt(
                 run,
@@ -2172,6 +2196,182 @@ elif name == "pdfimages":
             (run / "final" / "assets" / f"{method['asset_id']}.png").exists()
         )
         self.assertEqual(harness.resume_poster_run(run)["next_action"], "complete")
+
+    def test_poster_dom_audit_wrapper_delegates_to_the_shared_read_only_engine(self) -> None:
+        harness = poster_skill_fixtures._load_harness()
+        expected = {"passed": True, "findings": []}
+        with mock.patch.object(
+            harness.poster_dom_audit,
+            "run_poster_dom_audit",
+            return_value=expected,
+        ) as shared:
+            observed = harness.run_poster_dom_audit(
+                self.root / "run",
+                "01",
+                cache_root=self.root / "browser-cache",
+                allow_browser_install=False,
+            )
+
+        self.assertIs(observed, expected)
+        shared.assert_called_once_with(
+            self.root / "run",
+            "01",
+            cache_root=self.root / "browser-cache",
+            allow_browser_install=False,
+        )
+
+    def test_render_cleanup_preserves_dom_audit_outputs_only(self) -> None:
+        harness = poster_skill_fixtures._load_harness()
+        attempt = self.root / "attempt"
+        (attempt / "artifact").mkdir(parents=True)
+        previews = attempt / "qa" / "previews"
+        previews.mkdir(parents=True)
+        preserved = {
+            attempt / "qa" / "dom-audit.json": b"{}\n",
+            previews / "dom-screen.png": b"screen",
+            previews / "dom-print.png": b"print",
+        }
+        removed = {
+            attempt / "artifact" / "poster.pdf": b"pdf",
+            attempt / "artifact" / "preview.png": b"preview",
+            attempt / "qa" / "poster-output.json": b"{}\n",
+            attempt / "qa" / "deterministic.json": b"{}\n",
+            previews / "audit.json": b"{}\n",
+            previews / "poster.png": b"screen",
+            previews / "poster-print.png": b"print",
+        }
+        for path, payload in {**preserved, **removed}.items():
+            path.write_bytes(payload)
+
+        harness._clear_generated_attempt_outputs(attempt)
+
+        self.assertEqual(
+            {path.relative_to(attempt).as_posix(): path.read_bytes() for path in preserved},
+            {path.relative_to(attempt).as_posix(): payload for path, payload in preserved.items()},
+        )
+        self.assertTrue(all(not path.exists() for path in removed))
+
+    def test_validate_runs_one_shared_dom_engine_after_render_and_routes_findings(self) -> None:
+        harness = poster_skill_fixtures._load_harness()
+        run = self.root / "dom-validate-run"
+        source = self.root / "dom-validate-source.txt"
+        source.write_text(
+            "Grounded poster source reports 85% accuracy and uses two-stage routing. "
+            "The grounded poster retains accuracy.",
+            encoding="utf-8",
+        )
+        fixture = poster_skill_fixtures.AutoDesignPosterSkillTests(methodName="runTest")
+        fixture.root = self.root
+        fixture._initialize_no_visual_run(harness, run, source)
+        attempt = harness.begin_poster_attempt(run)["attempt_id"]
+        attempt_root = run / "attempts" / attempt
+        (attempt_root / "artifact" / "poster.html").write_text(
+            poster_skill_fixtures._poster_html(), encoding="utf-8"
+        )
+        source_map = self.root / "dom-validate-source-map.json"
+        source_map.write_text(
+            json.dumps({"claims": poster_skill_fixtures._claims()}),
+            encoding="utf-8",
+        )
+        events: list[str] = []
+
+        def fake_render(**_kwargs: object) -> dict[str, object]:
+            events.append("render")
+            previews = attempt_root / "qa" / "previews"
+            previews.mkdir(parents=True, exist_ok=True)
+            (previews / "poster-print.png").write_bytes(b"print-preview")
+            (attempt_root / "artifact" / "poster.pdf").write_bytes(b"%PDF-fixture")
+            (attempt_root / "artifact" / "preview.png").write_bytes(b"print-preview")
+            return {
+                "passed": True,
+                "checks": [
+                    {"id": "computed_typography", "passed": True, "detail": "passed"},
+                    {"id": "single_page_pdf", "passed": True, "detail": "passed"},
+                ],
+                "preview_paths": {"poster_pdf": "qa/previews/poster-print.png"},
+            }
+
+        def fake_dom(*_args: object, **_kwargs: object) -> dict[str, object]:
+            events.append("dom")
+            previews = attempt_root / "qa" / "previews"
+            (previews / "dom-screen.png").write_bytes(b"dom-screen")
+            (previews / "dom-print.png").write_bytes(b"dom-print")
+            return {
+                "passed": False,
+                "artifact_unchanged": True,
+                "findings": [
+                    {
+                        "code": "poster-dom-text-clipping",
+                        "block_id": "method-copy",
+                        "severity": "P0",
+                        "geometry": {"clipped_height_px": 18.0},
+                        "message": "Editable text is clipped by a rendered ancestor.",
+                        "suggested_repair_route": "layout_repair",
+                    }
+                ],
+                "browser_diagnostics": {
+                    "blocked_requests": [],
+                    "blocked_popups": [],
+                    "blocked_workers": [],
+                    "console_errors": [],
+                    "request_errors": [],
+                    "page_errors": [],
+                },
+                "screenshots": {
+                    "screen": {"path": "qa/previews/dom-screen.png", "sha256": "a" * 64},
+                    "print": {"path": "qa/previews/dom-print.png", "sha256": "b" * 64},
+                },
+            }
+
+        with mock.patch.object(
+            harness, "_render_poster_outputs", side_effect=fake_render
+        ), mock.patch.object(
+            harness.poster_dom_audit, "run_poster_dom_audit", side_effect=fake_dom
+        ) as shared:
+            deterministic = harness.validate_poster_attempt(
+                run,
+                attempt,
+                source_map_path=source_map,
+                cache_root=self.root / "browser-cache",
+                allow_browser_install=False,
+            )
+
+        self.assertEqual(events, ["render", "dom"])
+        shared.assert_called_once_with(
+            run,
+            attempt,
+            cache_root=self.root / "browser-cache",
+            allow_browser_install=False,
+        )
+        self.assertFalse(deterministic["passed"], deterministic)
+        finding = next(
+            check
+            for check in deterministic["checks"]
+            if check["id"] == "poster-dom-text-clipping"
+        )
+        self.assertEqual(finding["minimum_route"], "layout_repair")
+        self.assertEqual(finding["block_id"], "method-copy")
+        self.assertEqual(
+            deterministic["previews"]["poster_screen"]["path"],
+            "qa/previews/dom-screen.png",
+        )
+
+    def test_all_dom_codes_have_the_layout_repair_minimum_route(self) -> None:
+        harness = poster_skill_fixtures._load_harness()
+        self.assertEqual(
+            {
+                code: harness.POSTER_FINDING_MINIMUM_ROUTE.get(code)
+                for code in harness.poster_dom_audit.STABLE_FINDING_CODES
+            },
+            {
+                code: "layout_repair"
+                for code in harness.poster_dom_audit.STABLE_FINDING_CODES
+            },
+        )
+        self.assertNotIn(
+            "audit_local_html(",
+            __import__("inspect").getsource(harness._render_poster_outputs),
+        )
 
 
 if __name__ == "__main__":
