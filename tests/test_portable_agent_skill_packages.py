@@ -190,6 +190,11 @@ class PortableAgentSkillPackageTests(unittest.TestCase):
                     for marker in forbidden:
                         self.assertNotIn(marker, text, f"{path}: {marker}")
 
+    def test_portable_png_is_vendored_only_with_the_poster_package(self) -> None:
+        self.assertTrue((SKILLS_ROOT / "autodesign-poster" / "scripts" / "portable_png.py").is_file())
+        for name in ("autodesign-ppt", "autodesign-webpage", "autodesign-video"):
+            self.assertFalse((SKILLS_ROOT / name / "scripts" / "portable_png.py").exists())
+
     def test_validator_accepts_repository_packages(self) -> None:
         completed = subprocess.run(
             [

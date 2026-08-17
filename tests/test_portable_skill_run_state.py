@@ -1978,6 +1978,7 @@ elif name == "pdfimages":
         self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
         core_bytes = (REPO_ROOT / "agent_skills" / "_shared" / "portable_core.py").read_bytes()
         grounding_bytes = (REPO_ROOT / "agent_skills" / "_shared" / "source-grounding.md").read_bytes()
+        png_bytes = (REPO_ROOT / "agent_skills" / "_shared" / "portable_png.py").read_bytes()
         for skill_name in SKILLS:
             with self.subTest(skill=skill_name):
                 self.assertEqual(
@@ -1988,6 +1989,10 @@ elif name == "pdfimages":
                     (REPO_ROOT / "agent_skills" / skill_name / "references" / "source-grounding.md").read_bytes(),
                     grounding_bytes,
                 )
+        self.assertEqual(
+            (REPO_ROOT / "agent_skills" / "autodesign-poster" / "scripts" / "portable_png.py").read_bytes(),
+            png_bytes,
+        )
 
     def test_sync_check_reports_drift_without_mutating_target(self) -> None:
         root = self.root / "agent_skills"
@@ -1998,6 +2003,7 @@ elif name == "pdfimages":
         (shared / "browser_worker.py").write_bytes(b"canonical-browser-worker")
         (shared / "setup_browser.py").write_bytes(b"canonical-browser-setup")
         (shared / "requirements-browser.lock").write_bytes(b"canonical-browser-lock")
+        (shared / "portable_png.py").write_bytes(b"canonical-png")
         for skill in SKILLS:
             (root / skill / "scripts").mkdir(parents=True)
             (root / skill / "references").mkdir()
@@ -2005,7 +2011,8 @@ elif name == "pdfimages":
             (root / skill / "references" / "source-grounding.md").write_bytes(
                 b"canonical-grounding"
             )
-        target = root / SKILLS[0] / "scripts" / "_portable.py"
+        target = root / "autodesign-poster" / "scripts" / "portable_png.py"
+        target.write_bytes(b"drifted-png")
         before = target.read_bytes()
         completed = subprocess.run(
             [
@@ -2023,6 +2030,8 @@ elif name == "pdfimages":
         self.assertEqual(completed.returncode, 1)
         self.assertIn("DRIFT:", completed.stdout)
         self.assertEqual(target.read_bytes(), before)
+        for skill_name in ("autodesign-ppt", "autodesign-webpage", "autodesign-video"):
+            self.assertFalse((root / skill_name / "scripts" / "portable_png.py").exists())
 
     def test_sync_rejects_symlinked_packages_directories_and_targets(self) -> None:
         cases = ("package", "scripts", "references", "target")
@@ -2036,6 +2045,7 @@ elif name == "pdfimages":
                 (shared / "browser_worker.py").write_bytes(b"canonical-browser-worker")
                 (shared / "setup_browser.py").write_bytes(b"canonical-browser-setup")
                 (shared / "requirements-browser.lock").write_bytes(b"canonical-browser-lock")
+                (shared / "portable_png.py").write_bytes(b"canonical-png")
                 outside = self.root / f"outside-{case}"
                 outside.mkdir()
                 (outside / "sentinel").write_bytes(b"unchanged")
@@ -2047,6 +2057,9 @@ elif name == "pdfimages":
                     (package / "references" / "source-grounding.md").write_bytes(
                         b"canonical-grounding"
                     )
+                (root / "autodesign-poster" / "scripts" / "portable_png.py").write_bytes(
+                    b"canonical-png"
+                )
                 package = root / SKILLS[0]
                 if case == "package":
                     shutil.rmtree(package)
@@ -2055,8 +2068,8 @@ elif name == "pdfimages":
                     shutil.rmtree(package / case)
                     (package / case).symlink_to(outside, target_is_directory=True)
                 else:
-                    (package / "scripts" / "_portable.py").unlink()
-                    (package / "scripts" / "_portable.py").symlink_to(
+                    (package / "scripts" / "portable_png.py").unlink()
+                    (package / "scripts" / "portable_png.py").symlink_to(
                         outside / "sentinel"
                     )
                 completed = subprocess.run(

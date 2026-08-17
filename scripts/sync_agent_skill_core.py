@@ -45,13 +45,18 @@ def sync(root: Path, *, check: bool = False) -> list[str]:
         Path("scripts/_portable.py"): shared / "portable_core.py",
         Path("references/source-grounding.md"): shared / "source-grounding.md",
     }
+    skill_specific_sources = {
+        "autodesign-poster": {
+            Path("scripts/portable_png.py"): shared / "portable_png.py",
+        },
+    }
     browser_sources = {
         Path("scripts/browser_worker.py"): shared / "browser_worker.py",
         Path("scripts/setup_browser.py"): shared / "setup_browser.py",
         Path("scripts/requirements-browser.lock"): shared / "requirements-browser.lock",
     }
     sources.update(browser_sources)
-    for source in sources.values():
+    for source in (*sources.values(), *(source for entries in skill_specific_sources.values() for source in entries.values())):
         if source.is_symlink():
             raise ValueError(f"canonical source must not be a symlink: {source}")
         if not source.is_file():
@@ -69,7 +74,9 @@ def sync(root: Path, *, check: bool = False) -> list[str]:
                 raise ValueError(f"Skill runtime directory must not be a symlink: {directory}")
             if not directory.is_dir():
                 raise FileNotFoundError(f"missing Skill runtime directory: {directory}")
-        for relative, source in sources.items():
+        package_sources = dict(sources)
+        package_sources.update(skill_specific_sources.get(skill_name, {}))
+        for relative, source in package_sources.items():
             target = package / relative
             if target.is_symlink():
                 raise ValueError(f"vendored target must not be a symlink: {target}")
