@@ -44,6 +44,34 @@ SUPPORTED_SIDECAR_SUFFIXES = SUPPORTED_IMAGE_SUFFIXES | {
     ".woff2",
 }
 SUPPORTED_FONT_SUFFIXES = SUPPORTED_SIDECAR_SUFFIXES - SUPPORTED_IMAGE_SUFFIXES
+POSTER_SOURCE_ROLES = (
+    "method",
+    "overview",
+    "method-overview",
+    "result",
+    "primary-result",
+    "comparison",
+    "context",
+    "supporting",
+)
+POSTER_FINDING_MINIMUM_ROUTE = {
+    "dom_overflow": "layout_repair",
+    "dom_clipping": "layout_repair",
+    "dom_overlap": "layout_repair",
+    "dom_blank_band": "layout_repair",
+    "typography": "layout_repair",
+    "visual_balance": "layout_repair",
+    "narrative_hierarchy": "content_replan",
+    "claim_selection": "content_replan",
+    "section_allocation": "content_replan",
+    "evidence_area_mismatch": "content_replan",
+    "key_visual_missing": "source_reingest",
+    "wrong_visual": "source_reingest",
+    "incomplete_crop": "source_reingest",
+    "fragmentary_crop": "source_reingest",
+    "unreadable_source_visual": "source_reingest",
+    "caption_claim_mismatch": "source_reingest",
+}
 PRESETS: dict[str, dict[str, dict[str, float | int]]] = {
     "cvpr-landscape": {
         "canvas": {"width_px": 3072, "height_px": 1536},
@@ -93,8 +121,6 @@ _PLAN_KEYS = {
     "style_reference_ids",
     "max_attempts",
 }
-_METHOD_VISUAL_ROLES = {"method", "overview"}
-_RESULT_VISUAL_ROLES = {"comparison", "result"}
 _ARC_GROUPS = {
     "problem": {"context", "introduction", "motivation", "problem"},
     "method": {"approach", "architecture", "method", "system"},
@@ -291,6 +317,30 @@ def _read_json_object(path: Path | str) -> dict[str, Any]:
     return value
 
 
+def _read_canonical_json_object(path: Path | str) -> dict[str, Any]:
+    """Read a CLI JSON input once and require the shared stored form."""
+
+    source = Path(path)
+    if (
+        source.is_symlink()
+        or not source.is_file()
+        or source.stat().st_nlink != 1
+    ):
+        raise PosterContractError(f"expected a regular JSON file: {source}")
+    try:
+        data = source.read_bytes()
+        value = json.loads(data.decode("utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise PosterContractError(f"invalid JSON object: {source}") from error
+    if not isinstance(value, dict):
+        raise PosterContractError(f"JSON contract must be an object: {source}")
+    if data != core._stored_json_bytes(value):
+        raise PosterContractError(
+            f"JSON contract must use canonical shared serialization: {source}"
+        )
+    return value
+
+
 def _read_run(run_dir: Path | str) -> dict[str, Any]:
     return _read_json_object(Path(run_dir) / "run.json")
 
@@ -424,11 +474,17 @@ def initialize_poster_run(
     release_version: str = RELEASE_VERSION,
     archive_sha256: str | None = None,
 ) -> dict[str, Any]:
+    if extra_assets:
+        raise PosterContractError(
+            "--asset cannot provide v2 paper evidence; inspect the source PDF and "
+            "derive reviewed crops with crop-source"
+        )
     core.initialize_run(
         run_dir,
         SKILL_ROOT,
         release_version=release_version,
         archive_sha256=archive_sha256,
+        run_format_version=core.AGENT_FIRST_RUN_FORMAT_VERSION,
     )
     manifest = core.prepare_source(
         run_dir,
@@ -437,129 +493,140 @@ def initialize_poster_run(
         reference_images=reference_images,
     )
     return {
-        "run_dir": str(Path(run_dir).absolute()),
+        "run_path": ".",
         "source": manifest,
         "resume": core.resume_run(run_dir, skill_root=SKILL_ROOT),
     }
 
 
-def _eligible_poster_visuals(catalog: Mapping[str, Any]) -> list[dict[str, Any]]:
-    visuals = catalog.get("visuals", [])
-    if not isinstance(visuals, list):
-        raise PosterContractError("source visual catalog requires a visuals list")
-    return [
-        dict(item)
-        for item in visuals
-        if isinstance(item, Mapping)
-        and item.get("eligibility") == "eligible"
-        and Path(str(item.get("path") or "")).suffix.lower()
-        in SUPPORTED_IMAGE_SUFFIXES
-        and isinstance(item.get("allowed_content_roles"), list)
-        and item.get("allowed_content_roles")
-    ]
+def _require_v2_run(run_dir: Path | str) -> None:
+    if core.inspect_run_format(run_dir) != core.AGENT_FIRST_RUN_FORMAT_VERSION:
+        raise PosterContractError(
+            "this command requires a Poster v2 run; use diagnose-v1 for legacy runs"
+        )
 
 
-def _visual_coverage_requirement(
+def _load_active_catalog(run_dir: Path | str) -> dict[str, Any]:
+    _require_v2_run(run_dir)
+    return core.load_active_visual_catalog(run_dir)
+
+
+def _catalog_assets(catalog: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+    assets = catalog.get("assets")
+    if not isinstance(assets, list):
+        raise core.IntegrityError("reviewed catalog requires an assets list")
+    by_id: dict[str, dict[str, Any]] = {}
+    for raw in assets:
+        if not isinstance(raw, Mapping):
+            raise core.IntegrityError("reviewed catalog asset is invalid")
+        asset = dict(raw)
+        asset_id = asset.get("asset_id")
+        if not isinstance(asset_id, str) or not asset_id or asset_id in by_id:
+            raise core.IntegrityError("reviewed catalog asset identity is invalid")
+        if asset.get("trust") != "reviewed" or asset.get("eligible") is not True:
+            raise core.IntegrityError("catalog contains an unreviewed eligible asset")
+        roles = asset.get("roles")
+        if (
+            not isinstance(roles, list)
+            or not roles
+            or any(role not in POSTER_SOURCE_ROLES for role in roles)
+        ):
+            raise PosterContractError(f"catalog asset has invalid Poster roles: {asset_id}")
+        by_id[asset_id] = asset
+    return by_id
+
+
+def _validate_reviewed_plan(
     plan: Mapping[str, Any], catalog: Mapping[str, Any]
 ) -> dict[str, Any]:
-    eligible = _eligible_poster_visuals(catalog)
-    canvas = plan["canvas"]
-    width = int(canvas["width_px"])
-    height = int(canvas["height_px"])
-    aspect_ratio = width / height
-    recommended = 6 if aspect_ratio >= 1.5 else 5
-    if width * height >= 7_000_000:
-        recommended += 1
-    if width * height >= 12_000_000:
-        recommended += 1
-    target = min(len(eligible), min(recommended, 8))
-    method_ids = {
-        str(item.get("id") or "")
-        for item in eligible
-        if set(item.get("allowed_content_roles", [])).intersection(
-            _METHOD_VISUAL_ROLES
-        )
-    }
-    result_ids = {
-        str(item.get("id") or "")
-        for item in eligible
-        if set(item.get("allowed_content_roles", [])).intersection(
-            _RESULT_VISUAL_ROLES
-        )
-    }
-    distinct_method_result_pair = any(
-        method_id != result_id
-        for method_id in method_ids
-        for result_id in result_ids
-    )
-    required_role_groups = (
-        ["method/overview", "result/comparison"]
-        if target >= 2 and distinct_method_result_pair
-        else []
-    )
-    return {
-        "eligible_count": len(eligible),
-        "target_count": target,
-        "recommended_for_canvas": min(recommended, 8),
-        "required_role_groups": required_role_groups,
-    }
-
-
-def _validate_visual_coverage(
-    plan: Mapping[str, Any], catalog: Mapping[str, Any]
-) -> dict[str, Any]:
-    requirement = _visual_coverage_requirement(plan, catalog)
+    by_id = _catalog_assets(catalog)
     allocations = [dict(item) for item in plan["visual_allocations"]]
-    fallback = plan.get("no_visual_fallback")
-    if requirement["eligible_count"] == 0:
-        if fallback is None:
+    counts: dict[str, int] = {}
+    for allocation in allocations:
+        asset_id = allocation["visual_id"]
+        role = allocation["role"]
+        asset = by_id.get(asset_id)
+        if asset is None:
+            raise PosterContractError(f"plan references an unreviewed asset: {asset_id}")
+        if role not in POSTER_SOURCE_ROLES or role not in asset["roles"]:
             raise PosterContractError(
-                "no_visual_fallback is required when the reviewed catalog has "
-                "no eligible source visuals or tables"
+                f"plan role is not permitted by the reviewed catalog: {asset_id}/{role}"
             )
-        return requirement
-    if fallback is not None:
+        suffix = Path(str(asset.get("path") or "")).suffix.lower()
+        if suffix not in SUPPORTED_IMAGE_SUFFIXES:
+            raise PosterContractError(
+                f"unsupported poster visual format: {suffix or '<none>'}"
+            )
+        counts[asset_id] = counts.get(asset_id, 0) + 1
+        max_reuse = asset.get("max_reuse")
+        if (
+            not isinstance(max_reuse, int)
+            or isinstance(max_reuse, bool)
+            or counts[asset_id] > max_reuse
+        ):
+            raise PosterContractError(f"plan exceeds reviewed reuse limit: {asset_id}")
+
+    story = catalog.get("source_story")
+    if not isinstance(story, Mapping):
+        raise core.IntegrityError("reviewed catalog source_story is invalid")
+    allocated_ids = set(counts)
+    statuses: dict[str, str] = {}
+    for category in ("central_method", "primary_result"):
+        item = story.get(category)
+        if not isinstance(item, Mapping):
+            raise core.IntegrityError(f"reviewed source_story is missing {category}")
+        status = item.get("status")
+        statuses[category] = str(status)
+        if status == "covered":
+            asset_ids = item.get("asset_ids")
+            if (
+                not isinstance(asset_ids, list)
+                or not asset_ids
+                or not allocated_ids.intersection(str(value) for value in asset_ids)
+            ):
+                raise PosterContractError(
+                    f"poster plan must retain reviewed source evidence for {category}"
+                )
+        elif status == "not_applicable":
+            if not str(item.get("rationale") or "").strip():
+                raise core.IntegrityError(
+                    f"reviewed not_applicable {category} requires rationale"
+                )
+        else:
+            raise core.IntegrityError(
+                f"reviewed source_story has invalid {category} status"
+            )
+    if not allocations:
+        if set(statuses.values()) != {"not_applicable"}:
+            raise PosterContractError(
+                "a zero-visual plan requires reviewed not_applicable decisions for "
+                "both central_method and primary_result"
+            )
+        if plan.get("no_visual_fallback") is None:
+            raise PosterContractError(
+                "a zero-visual plan requires an explicit native no_visual_fallback"
+            )
+    elif plan.get("no_visual_fallback") is not None:
         raise PosterContractError(
-            "no_visual_fallback is allowed only when no eligible source visuals exist"
+            "no_visual_fallback is allowed only for a reviewed zero-visual plan"
         )
-    allocated_ids = {str(item["visual_id"]) for item in allocations}
-    target = int(requirement["target_count"])
-    if len(allocated_ids) < target:
-        noun = "visual" if target == 1 else "visuals"
-        raise PosterContractError(
-            f"poster plan requires {target} distinct eligible source {noun} for "
-            "this reviewed catalog and canvas"
-        )
-    if requirement["required_role_groups"]:
-        roles = {str(item["role"]) for item in allocations}
-        if not roles.intersection(_METHOD_VISUAL_ROLES):
-            raise PosterContractError(
-                "poster visual coverage requires a method/overview allocation"
-            )
-        if not roles.intersection(_RESULT_VISUAL_ROLES):
-            raise PosterContractError(
-                "poster visual coverage requires a result/comparison allocation"
-            )
-    return requirement
+    return {
+        "reviewed_asset_count": len(by_id),
+        "allocated_asset_count": len(allocated_ids),
+        "source_story": statuses,
+    }
 
 
 def save_poster_plan(run_dir: Path | str, payload: Mapping[str, Any]) -> dict[str, Any]:
     plan = normalize_plan(payload)
-    catalog = _read_json_object(Path(run_dir) / "evidence" / "source_visuals.json")
-    by_id = {str(item.get("id")): item for item in catalog.get("visuals", []) if isinstance(item, dict)}
-    for allocation in plan["visual_allocations"]:
-        item = by_id.get(allocation["visual_id"])
-        suffix = Path(str(item.get("path") or "")).suffix.lower() if item else ""
-        if item is not None and suffix not in SUPPORTED_IMAGE_SUFFIXES:
-            raise PosterContractError(
-                f"unsupported poster visual format: {suffix or '<none>'}"
-            )
-    try:
-        visual_result = core.validate_visual_plan(run_dir, plan["visual_allocations"])
-    except core.ContractError as error:
-        raise PosterContractError(str(error)) from error
-    if not visual_result["valid"]:
-        raise PosterContractError("visual plan contains an unknown or over-reused visual")
+    catalog = _load_active_catalog(run_dir)
+    _validate_reviewed_plan(plan, catalog)
+    source_visuals = _read_json_object(Path(run_dir) / "evidence" / "source_visuals.json")
+    by_id = {
+        str(item.get("id")): item
+        for item in source_visuals.get("visuals", [])
+        if isinstance(item, dict)
+    }
     for reference_id in plan["style_reference_ids"]:
         item = by_id.get(reference_id)
         if item is None or item.get("eligibility") != "style_only":
@@ -568,17 +635,16 @@ def save_poster_plan(run_dir: Path | str, payload: Mapping[str, Any]) -> dict[st
     overlap = allocated.intersection(plan["style_reference_ids"])
     if overlap:
         raise PosterContractError(f"style-only references cannot be content assets: {', '.join(sorted(overlap))}")
-    _validate_visual_coverage(plan, catalog)
-    return core.save_plan(run_dir, plan)
+    return core.save_plan_revision(run_dir, plan)
 
 
 def _load_plan(run_dir: Path | str) -> dict[str, Any]:
-    return normalize_plan(_read_json_object(Path(run_dir) / "plan.json"))
+    return normalize_plan(core.load_active_plan(run_dir))
 
 
 def _safe_catalog_path(run: Path, relative: str) -> Path:
     try:
-        return core.safe_path(run / "evidence", relative, must_exist=True)
+        return core.safe_path(run, relative, must_exist=True)
     except core.PathSafetyError as error:
         raise PosterContractError(str(error)) from error
 
@@ -587,22 +653,53 @@ def begin_poster_attempt(run_dir: Path | str) -> dict[str, Any]:
     run = Path(run_dir).absolute()
     plan = _load_plan(run)
     state = _read_run(run)
-    if state.get("state") != "authoring" and int(state.get("attempt_count", 0)) >= plan["max_attempts"]:
+    runtime_retry = (
+        state.get("state") == "failed"
+        and state.get("failure_origin") != "semantic_review"
+        and isinstance(state.get("active_attempt"), str)
+    )
+    if (
+        state.get("state") != "authoring"
+        and not runtime_retry
+        and int(state.get("attempt_count", 0)) >= plan["max_attempts"]
+    ):
         raise PosterContractError("poster repair attempt budget is exhausted")
     attempt_id = core.begin_attempt(run)
     attempt = run / "attempts" / attempt_id
     artifact = attempt / "artifact"
-    catalog = _read_json_object(run / "evidence" / "source_visuals.json")
-    by_id = {str(item.get("id")): item for item in catalog.get("visuals", []) if isinstance(item, dict)}
-    staged: list[dict[str, str]] = []
+    plan = normalize_plan(core.load_attempt_plan(run, attempt_id))
+    catalog = core.load_attempt_visual_catalog(run, attempt_id)
+    _validate_reviewed_plan(plan, catalog)
+    by_id = _catalog_assets(catalog)
+    attempt_context = _read_json_object(attempt / "attempt-context.json")
+    authorized = {
+        item["asset_id"]: item["sha256"]
+        for item in attempt_context.get("authorized_assets", [])
+        if isinstance(item, Mapping)
+    }
+    allocated_ids = {item["visual_id"] for item in plan["visual_allocations"]}
+    if set(authorized) != allocated_ids:
+        raise core.IntegrityError("attempt authorization differs from the plan snapshot")
+    staged: list[dict[str, Any]] = []
     for allocation in plan["visual_allocations"]:
-        visual = by_id.get(allocation["visual_id"])
-        if visual is None or visual.get("eligibility") != "eligible":
-            raise PosterContractError(f"allocated visual is no longer eligible: {allocation['visual_id']}")
+        visual = by_id[allocation["visual_id"]]
         source = _safe_catalog_path(run, str(visual.get("path") or ""))
+        if source.stat().st_nlink != 1:
+            raise core.PathSafetyError(f"source asset must not be hardlinked: {source}")
         suffix = source.suffix.lower()
         if suffix not in SUPPORTED_IMAGE_SUFFIXES:
             raise PosterContractError(f"unsupported poster visual format: {suffix or '<none>'}")
+        if core.sha256_file(source) != visual.get("sha256") or visual.get("sha256") != authorized[allocation["visual_id"]]:
+            raise core.IntegrityError(f"reviewed source asset hash mismatch: {allocation['visual_id']}")
+        receipt_path = _safe_catalog_path(run, str(visual.get("receipt_path") or ""))
+        if (
+            receipt_path.stat().st_nlink != 1
+            or core.sha256_file(receipt_path) != visual.get("receipt_file_sha256")
+        ):
+            raise core.IntegrityError(f"reviewed crop receipt mismatch: {allocation['visual_id']}")
+        receipt = _read_json_object(receipt_path)
+        if receipt.get("receipt_sha256") != visual.get("receipt_sha256"):
+            raise core.IntegrityError(f"reviewed crop receipt binding mismatch: {allocation['visual_id']}")
         relative = f"assets/{allocation['visual_id']}{suffix}"
         target = core.safe_path(artifact, relative)
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -616,11 +713,25 @@ def begin_poster_attempt(run_dir: Path | str) -> dict[str, Any]:
                 "role": allocation["role"],
                 "artifact_path": relative,
                 "sha256": core.sha256_file(target),
+                "source_path": str(visual["path"]),
+                "receipt_path": str(visual["receipt_path"]),
+                "receipt_sha256": str(visual["receipt_sha256"]),
+                "page_path": str(receipt["page_path"]),
+                "page_sha256": str(receipt["page_sha256"]),
+                "max_reuse": int(visual["max_reuse"]),
             }
         )
+    source_visuals = _read_json_object(run / "evidence" / "source_visuals.json")
+    style_by_id = {
+        str(item.get("id")): item
+        for item in source_visuals.get("visuals", [])
+        if isinstance(item, dict)
+    }
     style_references: list[dict[str, str]] = []
     for reference_id in plan["style_reference_ids"]:
-        visual = by_id[reference_id]
+        visual = style_by_id.get(reference_id)
+        if visual is None or visual.get("eligibility") != "style_only":
+            raise PosterContractError(f"style reference is not style-only: {reference_id}")
         style_references.append(
             {
                 "visual_id": reference_id,
@@ -628,21 +739,39 @@ def begin_poster_attempt(run_dir: Path | str) -> dict[str, Any]:
                 "transfer": "style_only",
             }
         )
+    source_manifest = _read_json_object(run / "evidence" / "source_manifest.json")
     context = {
         "format_version": FORMAT_VERSION,
         "attempt_id": attempt_id,
         "poster_path": "artifact/poster.html",
+        "run_format_version": core.AGENT_FIRST_RUN_FORMAT_VERSION,
+        "source_path": source_manifest["input_path"],
+        "source_manifest_path": "evidence/source_manifest.json",
+        "source_manifest_sha256": attempt_context["source_manifest_sha256"],
+        "catalog_revision": attempt_context["catalog_revision"],
+        "catalog_sha256": attempt_context["catalog_sha256"],
+        "plan_revision": attempt_context["plan_revision"],
+        "plan_sha256": attempt_context["plan_sha256"],
         "plan": plan,
-        "visual_coverage": _visual_coverage_requirement(plan, catalog),
+        "reviewed_coverage": _validate_reviewed_plan(plan, catalog),
         "staged_content_visuals": staged,
         "style_references": style_references,
+        "source_flow_guidance": (
+            "Keep each reviewed source image, its caption, and its explanatory "
+            "text in one .source-flow-unit with a visible gutter; native diagrams "
+            "or tables may explain but must not replace essential source evidence."
+        ),
+        "next_command": (
+            "python3 scripts/poster_harness.py validate --run-dir RUN "
+            f"--attempt {attempt_id} --source-map SOURCE_MAP.json"
+        ),
     }
     core.atomic_write_json(attempt / "authoring-context.json", context)
     return {
         "attempt_id": attempt_id,
-        "attempt_dir": str(attempt),
-        "poster_path": str(artifact / "poster.html"),
-        "authoring_context": str(attempt / "authoring-context.json"),
+        "attempt_path": f"attempts/{attempt_id}",
+        "poster_path": f"attempts/{attempt_id}/artifact/poster.html",
+        "authoring_context": f"attempts/{attempt_id}/authoring-context.json",
         "staged_content_visuals": staged,
         "style_references": style_references,
     }
@@ -1495,11 +1624,12 @@ def validate_poster_attempt(
     allow_browser_install: bool = True,
 ) -> dict[str, Any]:
     run = Path(run_dir).absolute()
+    _require_v2_run(run)
     core.resume_run(run, skill_root=SKILL_ROOT)
     state = _read_run(run)
     if state.get("state") != "authoring" or state.get("active_attempt") != attempt_id:
         raise PosterContractError("validation must target the active authoring attempt")
-    plan = _load_plan(run)
+    plan = normalize_plan(core.load_attempt_plan(run, attempt_id))
     attempt = core.safe_path(run / "attempts", attempt_id, must_exist=True)
     artifact = attempt / "artifact"
     _clear_generated_attempt_outputs(attempt)
@@ -1507,10 +1637,17 @@ def validate_poster_attempt(
     if set(source_map_input) != {"claims"} or not isinstance(source_map_input["claims"], list):
         raise PosterContractError("source-map input must contain only a claims list")
     core.write_source_map(run, attempt_id, source_map_input["claims"])
-    visual_contract = _read_json_object(run / "evidence" / "source_visuals.json")
-    visual_catalog = visual_contract.get("visuals")
-    if not isinstance(visual_catalog, list):
-        raise PosterContractError("source visual catalog requires a visuals list")
+    reviewed_catalog = core.load_attempt_visual_catalog(run, attempt_id)
+    _validate_reviewed_plan(plan, reviewed_catalog)
+    visual_catalog = [
+        {
+            "id": asset["asset_id"],
+            "path": asset["path"],
+            "sha256": asset["sha256"],
+            "eligibility": "eligible",
+        }
+        for asset in _catalog_assets(reviewed_catalog).values()
+    ]
     static = lint_poster_html(
         artifact / "poster.html",
         artifact_root=artifact,
@@ -1559,13 +1696,61 @@ def validate_poster_attempt(
 
 
 def create_poster_review_context(run_dir: Path | str, attempt_id: str) -> dict[str, Any]:
+    plan = normalize_plan(core.load_attempt_plan(run_dir, attempt_id))
+    catalog = core.load_attempt_visual_catalog(run_dir, attempt_id)
+    _validate_reviewed_plan(plan, catalog)
     return core.create_review_context(run_dir, attempt_id, rubric=REVIEW_RUBRIC)
 
 
+def _validate_poster_route_review(review: Mapping[str, Any]) -> None:
+    route = review.get("repair_route")
+    if route is not None and route not in core.REPAIR_ROUTE_ORDER:
+        raise PosterContractError(f"invalid Poster repair route: {route}")
+    findings = review.get("route_findings")
+    if not isinstance(findings, list):
+        raise PosterContractError("poster review route_findings must be a list")
+    for raw in findings:
+        if not isinstance(raw, Mapping):
+            raise PosterContractError("poster review route finding must be an object")
+        code = raw.get("code")
+        minimum = POSTER_FINDING_MINIMUM_ROUTE.get(str(code))
+        if minimum is None:
+            raise PosterContractError(f"unknown Poster finding code: {code}")
+        if raw.get("minimum_route") != minimum:
+            raise PosterContractError(
+                f"Poster finding {code} requires minimum route {minimum}"
+            )
+        if route is not None and core.REPAIR_ROUTE_ORDER[route] < core.REPAIR_ROUTE_ORDER[minimum]:
+            raise PosterContractError(
+                f"Poster repair route {route} downgrades finding {code}"
+            )
+
+
+def _load_attempt_semantic_review(
+    run_dir: Path | str, attempt_id: str
+) -> dict[str, Any] | None:
+    path = Path(run_dir) / "attempts" / attempt_id / "qa" / "semantic-review.json"
+    if not path.exists():
+        return None
+    review = _read_json_object(path)
+    _validate_poster_route_review(review)
+    return review
+
+
 def record_poster_review(
-    run_dir: Path | str, attempt_id: str, review_path: Path | str
+    run_dir: Path | str,
+    attempt_id: str,
+    review_path: Path | str | Mapping[str, Any],
 ) -> dict[str, Any]:
-    review = _read_json_object(review_path)
+    plan = normalize_plan(core.load_attempt_plan(run_dir, attempt_id))
+    catalog = core.load_attempt_visual_catalog(run_dir, attempt_id)
+    _validate_reviewed_plan(plan, catalog)
+    review = (
+        dict(review_path)
+        if isinstance(review_path, Mapping)
+        else _read_json_object(review_path)
+    )
+    _validate_poster_route_review(review)
     scores = review.get("dimension_scores")
     if isinstance(scores, Mapping) and scores:
         average = sum(float(value) for value in scores.values()) / len(scores)
@@ -1579,12 +1764,97 @@ def record_poster_review(
     return core.record_semantic_review(run_dir, attempt_id, review)
 
 
+def reopen_poster_curation(
+    run_dir: Path | str, request: Mapping[str, Any]
+) -> dict[str, Any]:
+    attempt_id = request.get("attempt_id")
+    if not isinstance(attempt_id, str):
+        raise PosterContractError("reopen request requires an attempt_id")
+    core.load_attempt_plan(run_dir, attempt_id)
+    core.load_attempt_visual_catalog(run_dir, attempt_id)
+    if _load_attempt_semantic_review(run_dir, attempt_id) is None:
+        raise PosterContractError("reopen curation requires a persisted semantic review")
+    return core.reopen_curation(run_dir, request)
+
+
 def finalize_poster_attempt(run_dir: Path | str, attempt_id: str) -> dict[str, Any]:
+    plan = normalize_plan(core.load_attempt_plan(run_dir, attempt_id))
+    catalog = core.load_attempt_visual_catalog(run_dir, attempt_id)
+    _validate_reviewed_plan(plan, catalog)
+    review = _load_attempt_semantic_review(run_dir, attempt_id)
+    if review is None:
+        raise PosterContractError("finalization requires a persisted semantic review")
     return core.finalize_attempt(run_dir, attempt_id)
 
 
 def resume_poster_run(run_dir: Path | str) -> dict[str, Any]:
-    return core.resume_run(run_dir, skill_root=SKILL_ROOT)
+    _require_v2_run(run_dir)
+    persisted_state = _read_run(run_dir)
+    persisted_attempt = persisted_state.get("active_attempt")
+    if isinstance(persisted_attempt, str):
+        _load_attempt_semantic_review(run_dir, persisted_attempt)
+    state = core.resume_run(run_dir, skill_root=SKILL_ROOT)
+    attempt_id = state.get("active_attempt")
+    if isinstance(attempt_id, str):
+        plan = normalize_plan(core.load_attempt_plan(run_dir, attempt_id))
+        catalog = core.load_attempt_visual_catalog(run_dir, attempt_id)
+        _validate_reviewed_plan(plan, catalog)
+        _load_attempt_semantic_review(run_dir, attempt_id)
+    return state
+
+
+def inspect_poster_source(run_dir: Path | str) -> dict[str, Any]:
+    _require_v2_run(run_dir)
+    return core.inspect_source(run_dir)
+
+
+def crop_poster_source(
+    run_dir: Path | str, request: Mapping[str, Any]
+) -> dict[str, Any]:
+    role = request.get("role")
+    if role not in POSTER_SOURCE_ROLES:
+        raise PosterContractError(f"unsupported Poster source role: {role}")
+    return core.crop_source(run_dir, request)
+
+
+def create_poster_source_review_context(
+    run_dir: Path | str, selection: Mapping[str, Any]
+) -> dict[str, Any]:
+    assets = selection.get("assets")
+    if not isinstance(assets, list):
+        raise PosterContractError("source review selection requires an assets list")
+    for item in assets:
+        roles = item.get("roles") if isinstance(item, Mapping) else None
+        if (
+            not isinstance(roles, list)
+            or not roles
+            or any(role not in POSTER_SOURCE_ROLES for role in roles)
+        ):
+            raise PosterContractError("source review selection has invalid Poster roles")
+    return core.create_source_review_context(run_dir, selection)
+
+
+def record_poster_source_review(
+    run_dir: Path | str,
+    context_path: Path | str,
+    review: Mapping[str, Any],
+) -> dict[str, Any]:
+    return core.record_source_review(run_dir, context_path, review)
+
+
+def poster_dom_audit_blocked(
+    run_dir: Path | str, attempt_id: str
+) -> dict[str, Any]:
+    _require_v2_run(run_dir)
+    core.load_attempt_plan(run_dir, attempt_id)
+    core.load_attempt_visual_catalog(run_dir, attempt_id)
+    return {
+        "run_format_version": core.AGENT_FIRST_RUN_FORMAT_VERSION,
+        "attempt_id": attempt_id,
+        "status": "blocked",
+        "reason": "read-only Poster DOM audit is not installed in this build",
+        "next_action": "install the Task 6 read-only DOM audit",
+    }
 
 
 def _doctor(*, cache_root: Path | None, install_browser: bool) -> dict[str, Any]:
@@ -1612,8 +1882,14 @@ def _print_json(value: Any) -> None:
     print(json.dumps(core.redact_secrets(value), ensure_ascii=False, indent=2, sort_keys=True))
 
 
+class _JsonArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        _print_json({"status": "error", "error": message})
+        raise SystemExit(1)
+
+
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = _JsonArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
     doctor = subparsers.add_parser("doctor", help="check Poppler and pinned Chromium")
     doctor.add_argument("--cache-root", type=Path)
@@ -1629,14 +1905,30 @@ def _build_parser() -> argparse.ArgumentParser:
     evidence.add_argument("--run-dir", type=Path, required=True)
     evidence.add_argument("--query", required=True)
     evidence.add_argument("--limit", type=int, default=8)
-    bind = subparsers.add_parser("bind-visuals", help="bind PDF visuals after fresh host-VLM review")
-    bind.add_argument("--run-dir", type=Path, required=True)
-    bind.add_argument("--review", type=Path, required=True)
+    inspect = subparsers.add_parser("inspect-source", help="inspect immutable PDF pages and untrusted hints")
+    inspect.add_argument("--run-dir", type=Path, required=True)
+    crop = subparsers.add_parser("crop-source", help="derive an immutable crop from the source PDF")
+    crop.add_argument("--run-dir", type=Path, required=True)
+    crop.add_argument("--request", type=Path, required=True)
+    assets = subparsers.add_parser("list-source-assets", help="list unreviewed crops and extraction hints")
+    assets.add_argument("--run-dir", type=Path, required=True)
+    source_context = subparsers.add_parser("source-review-context", help="create a hash-bound source-review context")
+    source_context.add_argument("--run-dir", type=Path, required=True)
+    source_context.add_argument("--selection", type=Path, required=True)
+    source_record = subparsers.add_parser("record-source-review", help="record a fresh source review")
+    source_record.add_argument("--run-dir", type=Path, required=True)
+    source_record.add_argument("--context", required=True)
+    source_record.add_argument("--review", type=Path, required=True)
     plan = subparsers.add_parser("plan", help="save the evidence-grounded poster plan")
     plan.add_argument("--run-dir", type=Path, required=True)
     plan.add_argument("--plan", type=Path, required=True)
     begin = subparsers.add_parser("begin-attempt", help="start a bounded authoring attempt")
     begin.add_argument("--run-dir", type=Path, required=True)
+    dom = subparsers.add_parser("dom-audit", help="run the strictly read-only Poster DOM audit")
+    dom.add_argument("--run-dir", type=Path, required=True)
+    dom.add_argument("--attempt", required=True)
+    dom.add_argument("--cache-root", type=Path)
+    dom.add_argument("--offline-browser", action="store_true")
     validate = subparsers.add_parser("validate", help="run static, browser, preview, and PDF gates")
     validate.add_argument("--run-dir", type=Path, required=True)
     validate.add_argument("--attempt", required=True)
@@ -1650,12 +1942,31 @@ def _build_parser() -> argparse.ArgumentParser:
     record.add_argument("--run-dir", type=Path, required=True)
     record.add_argument("--attempt", required=True)
     record.add_argument("--review", type=Path, required=True)
+    reopen = subparsers.add_parser("reopen-curation", help="authorize reviewed replan or source reingest")
+    reopen.add_argument("--run-dir", type=Path, required=True)
+    reopen.add_argument("--request", type=Path, required=True)
     finalize = subparsers.add_parser("finalize", help="promote one reviewed attempt atomically")
     finalize.add_argument("--run-dir", type=Path, required=True)
     finalize.add_argument("--attempt", required=True)
     resume = subparsers.add_parser("resume", help="verify hashes and report the next safe action")
     resume.add_argument("--run-dir", type=Path, required=True)
+    diagnose = subparsers.add_parser("diagnose-v1", help="read legacy run metadata without mutation")
+    diagnose.add_argument("--run-dir", type=Path, required=True)
     return parser
+
+
+def _command_exit_code(result: Mapping[str, Any]) -> int:
+    pending: list[Mapping[str, Any]] = [result]
+    while pending:
+        value = pending.pop()
+        if value.get("status") in {"blocked", "failed"}:
+            return 2
+        if value.get("passed") is False or value.get("ready") is False:
+            return 2
+        if value.get("verdict") == "fail" or value.get("state") in {"blocked", "failed"}:
+            return 2
+        pending.extend(item for item in value.values() if isinstance(item, Mapping))
+    return 0
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -1678,15 +1989,37 @@ def main(argv: Sequence[str] | None = None) -> int:
                 archive_sha256=args.archive_sha256,
             )
         elif args.command == "evidence":
-            result = core.lexical_retrieve(
+            _require_v2_run(args.run_dir)
+            result = {"results": core.lexical_retrieve(
                 core.load_evidence(args.run_dir), args.query, limit=args.limit
+            )}
+        elif args.command == "inspect-source":
+            result = inspect_poster_source(args.run_dir)
+        elif args.command == "crop-source":
+            result = crop_poster_source(
+                args.run_dir, _read_canonical_json_object(args.request)
             )
-        elif args.command == "bind-visuals":
-            result = core.bind_host_vlm_visuals(args.run_dir, _read_json_object(args.review))
+        elif args.command == "list-source-assets":
+            _require_v2_run(args.run_dir)
+            result = core.list_source_assets(args.run_dir)
+        elif args.command == "source-review-context":
+            result = create_poster_source_review_context(
+                args.run_dir, _read_canonical_json_object(args.selection)
+            )
+        elif args.command == "record-source-review":
+            result = record_poster_source_review(
+                args.run_dir,
+                args.context,
+                _read_canonical_json_object(args.review),
+            )
         elif args.command == "plan":
-            result = save_poster_plan(args.run_dir, _read_json_object(args.plan))
+            result = save_poster_plan(
+                args.run_dir, _read_canonical_json_object(args.plan)
+            )
         elif args.command == "begin-attempt":
             result = begin_poster_attempt(args.run_dir)
+        elif args.command == "dom-audit":
+            result = poster_dom_audit_blocked(args.run_dir, args.attempt)
         elif args.command == "validate":
             result = validate_poster_attempt(
                 args.run_dir,
@@ -1695,22 +2028,35 @@ def main(argv: Sequence[str] | None = None) -> int:
                 cache_root=args.cache_root,
                 allow_browser_install=not args.offline_browser,
             )
-            _print_json(result)
-            return 0 if result.get("passed") is True else 2
         elif args.command == "review-context":
             result = create_poster_review_context(args.run_dir, args.attempt)
         elif args.command == "record-review":
-            result = record_poster_review(args.run_dir, args.attempt, args.review)
+            result = record_poster_review(
+                args.run_dir,
+                args.attempt,
+                _read_canonical_json_object(args.review),
+            )
+        elif args.command == "reopen-curation":
+            result = reopen_poster_curation(
+                args.run_dir, _read_canonical_json_object(args.request)
+            )
         elif args.command == "finalize":
             result = finalize_poster_attempt(args.run_dir, args.attempt)
         elif args.command == "resume":
             result = resume_poster_run(args.run_dir)
+        elif args.command == "diagnose-v1":
+            result = core.diagnose_v1_run(args.run_dir)
         else:  # pragma: no cover - argparse owns command dispatch
             parser.error(f"unknown command: {args.command}")
         _print_json(result)
-        return 0
+        return _command_exit_code(result)
     except (OSError, UnicodeError, ValueError, subprocess.SubprocessError, core.PortableError, setup_browser.BrowserRuntimeError) as error:
-        print(f"ERROR: {core.redact_secrets(str(error))}", file=sys.stderr)
+        _print_json(
+            {
+                "status": "error",
+                "error": str(core.redact_secrets(str(error))),
+            }
+        )
         return 1
 
 

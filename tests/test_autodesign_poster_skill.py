@@ -4,10 +4,12 @@ import importlib.util
 import json
 import os
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
 import unittest
+import zlib
 from pathlib import Path
 from unittest import mock
 
@@ -183,6 +185,188 @@ class AutoDesignPosterSkillTests(unittest.TestCase):
             (artifact / "assets" / "vis-001.png").write_bytes(b"fixture-image")
         return artifact, html
 
+    def _passing_source_review(self, context: dict[str, object]) -> dict[str, object]:
+        return {
+            "run_format_version": 2,
+            "source_review_context_sha256": context["context_sha256"],
+            "reviewer_kind": "host_fresh_pass",
+            "dimension_scores": {
+                "importance": 4,
+                "crop_completeness": 4,
+                "caption_claim_match": 4,
+                "label_axis_legend_readability": 4,
+                "duplicate_or_ornamental_content": 4,
+                "method_result_coverage": 4,
+                "poster_area_fit": 4,
+            },
+            "asset_findings": [],
+            "coverage_findings": [],
+            "blockers": [],
+            "localized_repairs": [],
+            "verdict": "pass",
+            "complete": True,
+        }
+
+    def _curate_no_visuals(self, harness: object, run: Path) -> None:
+        evidence = harness.core.load_evidence(run)
+        evidence_id = str(evidence[0]["id"])
+        selection = {
+            "run_format_version": 2,
+            "assets": [],
+            "source_story": {
+                key: {
+                    "status": "not_applicable",
+                    "asset_ids": [],
+                    "evidence_ids": [evidence_id],
+                    "rationale": f"The reviewed source has no distinct {key} visual region.",
+                }
+                for key in ("central_method", "primary_result")
+            },
+        }
+        context = harness.create_poster_source_review_context(run, selection)
+        harness.record_poster_source_review(
+            run, context["context_path"], self._passing_source_review(context)
+        )
+
+    def _initialize_no_visual_run(
+        self, harness: object, run: Path, source: Path, *, max_attempts: int = 4
+    ) -> None:
+        harness.initialize_poster_run(run, source)
+        self._curate_no_visuals(harness, run)
+        harness.save_poster_plan(run, _plan(max_attempts=max_attempts))
+
+    @staticmethod
+    def _png(width: int, height: int, value: int) -> bytes:
+        def chunk(kind: bytes, payload: bytes) -> bytes:
+            return (
+                struct.pack(">I", len(payload))
+                + kind
+                + payload
+                + struct.pack(">I", zlib.crc32(kind + payload) & 0xFFFFFFFF)
+            )
+
+        header = struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0)
+        rows = b"".join(
+            b"\0" + bytes([value, value, value, 255]) * width
+            for _ in range(height)
+        )
+        return (
+            b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", header)
+            + chunk(b"IDAT", zlib.compress(rows))
+            + chunk(b"IEND", b"")
+        )
+
+    def _fake_poppler(self, name: str) -> dict[str, Path]:
+        tools_root = self.root / name
+        tools_root.mkdir()
+        page_one = tools_root / "page-one.png"
+        page_two = tools_root / "page-two.png"
+        page_one.write_bytes(self._png(20, 12, 20))
+        page_two.write_bytes(self._png(20, 12, 40))
+        script = f'''#!/usr/bin/env python3
+import shutil
+import sys
+from pathlib import Path
+
+name = Path(sys.argv[0]).name
+if name == "pdfinfo":
+    print("Pages: 2")
+elif name == "pdftotext":
+    Path(sys.argv[-1]).write_text("Central method.\\fPrimary result.\\n", encoding="utf-8")
+elif name == "pdftoppm":
+    shutil.copyfile({str(page_one)!r}, sys.argv[-1] + "-1.png")
+    shutil.copyfile({str(page_two)!r}, sys.argv[-1] + "-2.png")
+elif name == "pdfimages" and "-list" in sys.argv:
+    print("page num type width height color comp bpc enc interp object ID x-ppi y-ppi size ratio")
+'''
+        tools: dict[str, Path] = {}
+        for tool_name in ("pdftotext", "pdfinfo", "pdftoppm", "pdfimages"):
+            executable = tools_root / tool_name
+            executable.write_text(script, encoding="utf-8")
+            executable.chmod(0o755)
+            tools[tool_name] = executable
+        return tools
+
+    def _initialize_reviewed_visual_run(
+        self,
+        harness: object,
+        run: Path,
+        *,
+        reference_images: list[Path] | None = None,
+        include_supporting: bool = False,
+    ) -> tuple[dict[str, object], dict[str, object], dict[str, object] | None]:
+        source = self.root / f"{run.name}.pdf"
+        source.write_bytes(b"%PDF-1.4\nsynthetic\n")
+        tools = self._fake_poppler(f"poppler-{run.name}")
+        original_which = harness.core.shutil.which
+        with mock.patch.object(
+            harness.core.shutil,
+            "which",
+            side_effect=lambda name: str(tools[name]) if name in tools else original_which(name),
+        ):
+            harness.initialize_poster_run(
+                run, source, reference_images=reference_images or []
+            )
+        inspection = harness.inspect_poster_source(run)
+
+        def crop(page: int, role: str, bbox: list[float]) -> dict[str, object]:
+            page_info = inspection["pages"][page - 1]
+            return harness.crop_poster_source(
+                run,
+                {
+                    "run_format_version": 2,
+                    "source_sha256": inspection["source"]["sha256"],
+                    "page_manifest_sha256": inspection["page_manifest_sha256"],
+                    "page": page,
+                    "page_sha256": page_info["sha256"],
+                    "bbox_normalized": bbox,
+                    "role": role,
+                    "claim": f"Reviewed {role} source region.",
+                    "max_reuse": 2,
+                },
+            )
+
+        method = crop(1, "method", [0.0, 0.0, 1.0, 1.0])
+        result = crop(2, "result", [0.0, 0.0, 1.0, 1.0])
+        supporting = (
+            crop(1, "supporting", [0.0, 0.0, 0.5, 1.0])
+            if include_supporting
+            else None
+        )
+        evidence_id = str(harness.core.load_evidence(run)[0]["id"])
+        selected = [
+            {"asset_id": method["asset_id"], "roles": ["method"], "max_reuse": 2, "importance": "essential"},
+            {"asset_id": result["asset_id"], "roles": ["result"], "max_reuse": 2, "importance": "essential"},
+        ]
+        if supporting is not None:
+            selected.append(
+                {"asset_id": supporting["asset_id"], "roles": ["supporting"], "max_reuse": 1, "importance": "supporting"}
+            )
+        selection = {
+            "run_format_version": 2,
+            "assets": selected,
+            "source_story": {
+                "central_method": {
+                    "status": "covered",
+                    "asset_ids": [method["asset_id"]],
+                    "evidence_ids": [evidence_id],
+                    "rationale": "The complete method crop shows the central method.",
+                },
+                "primary_result": {
+                    "status": "covered",
+                    "asset_ids": [result["asset_id"]],
+                    "evidence_ids": [evidence_id],
+                    "rationale": "The complete result crop shows the primary result.",
+                },
+            },
+        }
+        context = harness.create_poster_source_review_context(run, selection)
+        harness.record_poster_source_review(
+            run, context["context_path"], self._passing_source_review(context)
+        )
+        return method, result, supporting
+
     def test_cli_help_exposes_complete_portable_lifecycle(self) -> None:
         completed = subprocess.run(
             [sys.executable, str(HARNESS_PATH), "--help"],
@@ -193,11 +377,160 @@ class AutoDesignPosterSkillTests(unittest.TestCase):
         )
         self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
         for command in (
-            "doctor", "init", "evidence", "bind-visuals", "plan",
-            "begin-attempt", "validate", "review-context", "record-review",
-            "finalize", "resume",
+            "doctor", "init", "evidence", "inspect-source", "crop-source",
+            "list-source-assets", "source-review-context", "record-source-review",
+            "plan", "begin-attempt", "dom-audit", "validate", "review-context",
+            "record-review", "reopen-curation", "finalize", "resume", "diagnose-v1",
         ):
             self.assertIn(command, completed.stdout)
+        self.assertNotIn("bind-visuals", completed.stdout)
+
+    def test_agent_first_cli_exposes_exact_new_argument_contracts(self) -> None:
+        expectations = {
+            "inspect-source": {"--run-dir"},
+            "crop-source": {"--run-dir", "--request"},
+            "list-source-assets": {"--run-dir"},
+            "source-review-context": {"--run-dir", "--selection"},
+            "record-source-review": {"--run-dir", "--context", "--review"},
+            "reopen-curation": {"--run-dir", "--request"},
+            "dom-audit": {"--run-dir", "--attempt", "--cache-root", "--offline-browser"},
+            "diagnose-v1": {"--run-dir"},
+        }
+        for command, flags in expectations.items():
+            with self.subTest(command=command):
+                completed = subprocess.run(
+                    [sys.executable, str(HARNESS_PATH), command, "--help"],
+                    cwd=self.root,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                self.assertEqual(
+                    completed.returncode, 0, completed.stdout + completed.stderr
+                )
+                for flag in flags:
+                    self.assertIn(flag, completed.stdout)
+
+    def test_cli_rejects_noncanonical_json_with_one_json_error(self) -> None:
+        payload = self.root / "noncanonical-plan.json"
+        payload.write_text('{"format_version": 1}\n', encoding="utf-8")
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(HARNESS_PATH),
+                "plan",
+                "--run-dir",
+                str(self.root / "missing-run"),
+                "--plan",
+                str(payload),
+            ],
+            cwd=self.root,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 1)
+        self.assertEqual(completed.stderr, "")
+        result = json.loads(completed.stdout)
+        self.assertEqual(result["status"], "error")
+        self.assertIn("canonical shared serialization", result["error"])
+
+    def test_cli_rejects_asset_evidence_before_creating_a_v2_run(self) -> None:
+        source = self.root / "paper.txt"
+        source.write_text("Grounded paper.", encoding="utf-8")
+        asset = self.root / "scratch.png"
+        asset.write_bytes(self._png(2, 2, 1))
+        run = self.root / "asset-rejected-run"
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(HARNESS_PATH),
+                "init",
+                "--run-dir",
+                str(run),
+                "--source",
+                str(source),
+                "--asset",
+                str(asset),
+            ],
+            cwd=self.root,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 1)
+        self.assertEqual(json.loads(completed.stdout)["status"], "error")
+        self.assertFalse(run.exists())
+
+    def test_dom_audit_cli_is_explicitly_blocked_until_read_only_engine_exists(self) -> None:
+        harness = _load_harness()
+        run = self.root / "dom-seam-run"
+        source = self.root / "paper.txt"
+        source.write_text("A source without distinct visuals.", encoding="utf-8")
+        self._initialize_no_visual_run(harness, run, source)
+        attempt = harness.begin_poster_attempt(run)["attempt_id"]
+        artifact = run / "attempts" / attempt / "artifact"
+        before = harness.core.tree_hash(artifact)
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(HARNESS_PATH),
+                "dom-audit",
+                "--run-dir",
+                str(run),
+                "--attempt",
+                attempt,
+                "--offline-browser",
+            ],
+            cwd=self.root,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 2, completed.stdout + completed.stderr)
+        result = json.loads(completed.stdout)
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(harness.core.tree_hash(artifact), before)
+
+    def test_diagnose_v1_cli_is_read_only_and_other_v2_commands_reject_it(self) -> None:
+        harness = _load_harness()
+        run = self.root / "legacy-run"
+        source = self.root / "legacy.txt"
+        source.write_text("Legacy grounded source.", encoding="utf-8")
+        harness.core.initialize_run(
+            run, SKILL_ROOT, release_version="0.1.0"
+        )
+        harness.core.prepare_source(run, source)
+        before = {
+            path.relative_to(run).as_posix(): path.read_bytes()
+            for path in run.rglob("*")
+            if path.is_file()
+        }
+        diagnosed = subprocess.run(
+            [sys.executable, str(HARNESS_PATH), "diagnose-v1", "--run-dir", str(run)],
+            cwd=self.root,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(diagnosed.returncode, 0, diagnosed.stdout + diagnosed.stderr)
+        self.assertEqual(json.loads(diagnosed.stdout)["mode"], "read_only")
+        after = {
+            path.relative_to(run).as_posix(): path.read_bytes()
+            for path in run.rglob("*")
+            if path.is_file()
+        }
+        self.assertEqual(after, before)
+
+        rejected = subprocess.run(
+            [sys.executable, str(HARNESS_PATH), "resume", "--run-dir", str(run)],
+            cwd=self.root,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(rejected.returncode, 1)
+        self.assertIn("diagnose-v1", json.loads(rejected.stdout)["error"])
 
     def test_cli_help_does_not_write_bytecode_into_a_read_only_style_install(self) -> None:
         installed = self.root / "installed" / "autodesign-poster"
@@ -263,17 +596,13 @@ class AutoDesignPosterSkillTests(unittest.TestCase):
     def test_plan_rejects_empty_allocations_when_eligible_visuals_exist(self) -> None:
         harness = _load_harness()
         run = self.root / "eligible-empty-run"
-        source = self.root / "paper.txt"
-        source.write_text("A paper with source-grounded visual evidence.", encoding="utf-8")
-        visual = self.root / "method.png"
-        visual.write_bytes(b"eligible-method-visual")
-        harness.initialize_poster_run(run, source, extra_assets=[visual])
+        self._initialize_reviewed_visual_run(harness, run)
 
         plan = _plan()
         plan["no_visual_fallback"] = None
         with self.assertRaisesRegex(
             harness.PosterContractError,
-            "requires 1 distinct eligible source visual",
+            "retain reviewed source evidence for central_method",
         ):
             harness.save_poster_plan(run, plan)
 
@@ -283,6 +612,7 @@ class AutoDesignPosterSkillTests(unittest.TestCase):
         source = self.root / "paper.txt"
         source.write_text("A paper with no extractable visual evidence.", encoding="utf-8")
         harness.initialize_poster_run(run, source)
+        self._curate_no_visuals(harness, run)
 
         missing_fallback = _plan()
         missing_fallback.pop("no_visual_fallback")
@@ -292,55 +622,41 @@ class AutoDesignPosterSkillTests(unittest.TestCase):
         plan = _plan()
         plan["no_visual_fallback"] = _no_visual_fallback()
         saved = harness.save_poster_plan(run, plan)
-        self.assertEqual(saved["no_visual_fallback"], _no_visual_fallback())
+        self.assertEqual(saved["plan_revision"], 1)
+        self.assertEqual(
+            harness.core.load_active_plan(run)["no_visual_fallback"],
+            _no_visual_fallback(),
+        )
 
-    def test_limited_eligible_catalog_uses_bounded_target_and_meaningful_roles(self) -> None:
+    def test_reviewed_catalog_has_no_fixed_visual_count_floor_and_enforces_roles(self) -> None:
         harness = _load_harness()
         run = self.root / "limited-eligible-run"
-        source = self.root / "paper.txt"
-        source.write_text("A paper with two reviewed source visuals.", encoding="utf-8")
-        visuals = []
-        for name in ("method.png", "result.png"):
-            visual = self.root / name
-            visual.write_bytes(name.encode("utf-8"))
-            visuals.append(visual)
-        harness.initialize_poster_run(run, source, extra_assets=visuals)
-
-        too_few = _plan()
-        too_few["no_visual_fallback"] = None
-        too_few["visual_allocations"] = [{"visual_id": "vis-001", "role": "method"}]
-        with self.assertRaisesRegex(
-            harness.PosterContractError,
-            "requires 2 distinct eligible source visuals",
-        ):
-            harness.save_poster_plan(run, too_few)
+        method, result, _supporting = self._initialize_reviewed_visual_run(
+            harness, run
+        )
 
         wrong_roles = _plan()
         wrong_roles["no_visual_fallback"] = None
         wrong_roles["visual_allocations"] = [
-            {"visual_id": "vis-001", "role": "method"},
-            {"visual_id": "vis-002", "role": "overview"},
+            {"visual_id": method["asset_id"], "role": "result"},
+            {"visual_id": result["asset_id"], "role": "result"},
         ]
-        with self.assertRaisesRegex(harness.PosterContractError, "result/comparison"):
+        with self.assertRaisesRegex(harness.PosterContractError, "not permitted"):
             harness.save_poster_plan(run, wrong_roles)
 
         plan = _plan()
         plan["no_visual_fallback"] = None
         plan["visual_allocations"] = [
-            {"visual_id": "vis-001", "role": "method"},
-            {"visual_id": "vis-002", "role": "result"},
+            {"visual_id": method["asset_id"], "role": "method"},
+            {"visual_id": result["asset_id"], "role": "result"},
         ]
         saved = harness.save_poster_plan(run, plan)
-        self.assertEqual(len(saved["visual_allocations"]), 2)
+        self.assertEqual(saved["plan_revision"], 1)
         attempt = harness.begin_poster_attempt(run)
         context = json.loads(
-            Path(attempt["authoring_context"]).read_text(encoding="utf-8")
+            (run / attempt["authoring_context"]).read_text(encoding="utf-8")
         )
-        self.assertEqual(context["visual_coverage"]["target_count"], 2)
-        self.assertEqual(
-            context["visual_coverage"]["required_role_groups"],
-            ["method/overview", "result/comparison"],
-        )
+        self.assertEqual(context["reviewed_coverage"]["allocated_asset_count"], 2)
 
     def test_skill_teaches_portable_python_resolution_and_source_flow_preservation(self) -> None:
         skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
@@ -603,12 +919,9 @@ class AutoDesignPosterSkillTests(unittest.TestCase):
         source.write_text("Grounded poster source reports 85% accuracy.", encoding="utf-8")
         unsupported = self.root / "raw-data.csv"
         unsupported.write_text("measure,value\naccuracy,85\n", encoding="utf-8")
-        harness.initialize_poster_run(run, source, extra_assets=[unsupported])
-        plan = _plan()
-        plan["no_visual_fallback"] = None
-        plan["visual_allocations"] = [{"visual_id": "vis-001", "role": "evidence"}]
-        with self.assertRaisesRegex(harness.PosterContractError, "unsupported poster visual"):
-            harness.save_poster_plan(run, plan)
+        with self.assertRaisesRegex(harness.PosterContractError, "derive reviewed crops"):
+            harness.initialize_poster_run(run, source, extra_assets=[unsupported])
+        self.assertFalse(run.exists())
 
     def test_static_lint_rejects_raster_only_or_non_native_table_content(self) -> None:
         harness = _load_harness()
@@ -797,45 +1110,181 @@ class AutoDesignPosterSkillTests(unittest.TestCase):
     def test_begin_attempt_stages_only_allocated_eligible_content_visuals(self) -> None:
         harness = _load_harness()
         run = self.root / "run"
-        source = self.root / "paper.txt"
-        source.write_text(
-            "Grounded poster source reports 85% accuracy and uses two-stage routing.",
-            encoding="utf-8",
-        )
-        content_asset = self.root / "method.png"
-        content_asset.write_bytes(b"content")
         style_reference = self.root / "reference.png"
-        style_reference.write_bytes(b"style-only")
-        harness.initialize_poster_run(
+        style_reference.write_bytes(self._png(3, 3, 90))
+        method, result, supporting = self._initialize_reviewed_visual_run(
+            harness,
             run,
-            source,
-            extra_assets=[content_asset],
             reference_images=[style_reference],
+            include_supporting=True,
         )
+        assert supporting is not None
         plan = _plan()
         plan["no_visual_fallback"] = None
-        plan["visual_allocations"] = [{"visual_id": "vis-001", "role": "method"}]
+        plan["visual_allocations"] = [
+            {"visual_id": method["asset_id"], "role": "method"},
+            {"visual_id": result["asset_id"], "role": "result"},
+        ]
+        plan["style_reference_ids"] = ["vis-001"]
         harness.save_poster_plan(run, plan)
         attempt = harness.begin_poster_attempt(run)
         staged = run / "attempts" / attempt["attempt_id"] / "artifact" / "assets"
-        self.assertEqual([path.name for path in staged.iterdir()], ["vis-001.png"])
-        self.assertEqual((staged / "vis-001.png").read_bytes(), b"content")
-        self.assertNotIn(b"style-only", (staged / "vis-001.png").read_bytes())
+        self.assertEqual(
+            {path.name for path in staged.iterdir()},
+            {f"{method['asset_id']}.png", f"{result['asset_id']}.png"},
+        )
+        self.assertFalse((staged / f"{supporting['asset_id']}.png").exists())
+        context = json.loads((run / attempt["authoring_context"]).read_text())
+        self.assertEqual(context["style_references"][0]["visual_id"], "vis-001")
+        self.assertTrue(
+            all("receipt_sha256" in item for item in context["staged_content_visuals"])
+        )
+        self.assertEqual(context["catalog_revision"], 1)
+        self.assertEqual(context["plan_revision"], 1)
+        self.assertIn("source-flow-unit", context["source_flow_guidance"])
+        self.assertIn(f"--attempt {attempt['attempt_id']}", context["next_command"])
+        self.assertTrue(
+            all("page_path" in item and "page_sha256" in item for item in context["staged_content_visuals"])
+        )
 
-    def test_bounded_repair_stops_after_plan_attempt_budget(self) -> None:
+    def test_plan_and_attempt_honor_reviewed_max_reuse_without_duplicate_files(self) -> None:
+        harness = _load_harness()
+        run = self.root / "reuse-run"
+        method, result, _supporting = self._initialize_reviewed_visual_run(
+            harness, run
+        )
+        plan = _plan()
+        plan["no_visual_fallback"] = None
+        plan["visual_allocations"] = [
+            {"visual_id": method["asset_id"], "role": "method"},
+            {"visual_id": method["asset_id"], "role": "method"},
+            {"visual_id": result["asset_id"], "role": "result"},
+        ]
+        harness.save_poster_plan(run, plan)
+        attempt = harness.begin_poster_attempt(run)
+        staged = run / "attempts" / attempt["attempt_id"] / "artifact" / "assets"
+        self.assertEqual(
+            {path.name for path in staged.iterdir()},
+            {f"{method['asset_id']}.png", f"{result['asset_id']}.png"},
+        )
+        context = json.loads((run / attempt["authoring_context"]).read_text())
+        self.assertEqual(
+            [item["visual_id"] for item in context["staged_content_visuals"]].count(
+                method["asset_id"]
+            ),
+            2,
+        )
+
+        over_reused = dict(plan)
+        over_reused["visual_allocations"] = [
+            *plan["visual_allocations"],
+            {"visual_id": method["asset_id"], "role": "method"},
+        ]
+        second_run = self.root / "over-reuse-run"
+        second_method, second_result, _ = self._initialize_reviewed_visual_run(
+            harness, second_run
+        )
+        over_reused["visual_allocations"] = [
+            {"visual_id": second_method["asset_id"], "role": "method"},
+            {"visual_id": second_method["asset_id"], "role": "method"},
+            {"visual_id": second_method["asset_id"], "role": "method"},
+            {"visual_id": second_result["asset_id"], "role": "result"},
+        ]
+        with self.assertRaisesRegex(harness.PosterContractError, "reuse limit"):
+            harness.save_poster_plan(second_run, over_reused)
+
+    def test_poster_finding_table_rejects_unknown_or_downgraded_routes(self) -> None:
+        harness = _load_harness()
+        harness._validate_poster_route_review(
+            {
+                "repair_route": "source_reingest",
+                "route_findings": [
+                    {
+                        "code": "dom_overflow",
+                        "minimum_route": "layout_repair",
+                    }
+                ],
+            }
+        )
+        with self.assertRaisesRegex(harness.PosterContractError, "requires minimum route"):
+            harness._validate_poster_route_review(
+                {
+                    "repair_route": "layout_repair",
+                    "route_findings": [
+                        {
+                            "code": "fragmentary_crop",
+                            "minimum_route": "layout_repair",
+                        }
+                    ],
+                }
+            )
+        with self.assertRaisesRegex(harness.PosterContractError, "unknown Poster finding"):
+            harness._validate_poster_route_review(
+                {
+                    "repair_route": "layout_repair",
+                    "route_findings": [
+                        {"code": "unregistered", "minimum_route": "layout_repair"}
+                    ],
+                }
+            )
+
+    def test_resume_revalidates_poster_route_before_shared_recovery(self) -> None:
+        harness = _load_harness()
+        run = self.root / "route-revalidation-run"
+        review_path = run / "attempts" / "01" / "qa" / "semantic-review.json"
+        review_path.parent.mkdir(parents=True)
+        (run / "run.json").write_text(
+            json.dumps({"active_attempt": "01"}), encoding="utf-8"
+        )
+        review_path.write_text(
+            json.dumps(
+                {
+                    "repair_route": "layout_repair",
+                    "route_findings": [
+                        {
+                            "code": "fragmentary_crop",
+                            "minimum_route": "layout_repair",
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        with mock.patch.object(
+            harness.core,
+            "inspect_run_format",
+            return_value=harness.core.AGENT_FIRST_RUN_FORMAT_VERSION,
+        ), mock.patch.object(
+            harness.core,
+            "resume_run",
+            side_effect=AssertionError("shared recovery must not run first"),
+        ) as shared_resume:
+            with self.assertRaisesRegex(
+                harness.PosterContractError, "requires minimum route"
+            ):
+                harness.resume_poster_run(run)
+        shared_resume.assert_not_called()
+
+    def test_nested_blocked_result_uses_cli_blocked_exit_code(self) -> None:
+        harness = _load_harness()
+        self.assertEqual(
+            harness._command_exit_code(
+                {"source": {"status": "blocked"}, "resume": {"state": "blocked"}}
+            ),
+            2,
+        )
+
+    def test_runtime_retry_does_not_consume_or_trip_attempt_budget(self) -> None:
         harness = _load_harness()
         run = self.root / "bounded-run"
         source = self.root / "paper.txt"
         source.write_text("Grounded poster source reports 85% accuracy.", encoding="utf-8")
-        harness.initialize_poster_run(run, source)
-        harness.save_poster_plan(run, _plan(max_attempts=2))
+        self._initialize_no_visual_run(harness, run, source, max_attempts=1)
         first = harness.begin_poster_attempt(run)["attempt_id"]
-        harness.core.mark_side_state(run, "failed", reason="first repair")
-        second = harness.begin_poster_attempt(run)["attempt_id"]
-        self.assertEqual((first, second), ("01", "02"))
-        harness.core.mark_side_state(run, "failed", reason="second repair")
-        with self.assertRaisesRegex(harness.PosterContractError, "attempt budget"):
-            harness.begin_poster_attempt(run)
+        harness.core.mark_side_state(run, "failed", reason="browser runtime unavailable")
+        retried = harness.begin_poster_attempt(run)["attempt_id"]
+        self.assertEqual((first, retried), ("01", "01"))
+        self.assertEqual(json.loads((run / "run.json").read_text())["attempt_count"], 1)
 
     def test_full_lifecycle_hash_binds_preview_pdf_review_and_final_delivery(self) -> None:
         harness = _load_harness()
@@ -846,11 +1295,10 @@ class AutoDesignPosterSkillTests(unittest.TestCase):
             "The grounded poster retains accuracy.",
             encoding="utf-8",
         )
-        harness.initialize_poster_run(run, source)
-        harness.save_poster_plan(run, _plan())
+        self._initialize_no_visual_run(harness, run, source)
         attempt_info = harness.begin_poster_attempt(run)
         attempt_id = attempt_info["attempt_id"]
-        poster_path = Path(attempt_info["poster_path"])
+        poster_path = run / attempt_info["poster_path"]
         poster_path.write_text(_poster_html(), encoding="utf-8")
         source_map = self.root / "source-map-input.json"
         source_map.write_text(json.dumps({"claims": _claims()}), encoding="utf-8")
@@ -893,10 +1341,12 @@ class AutoDesignPosterSkillTests(unittest.TestCase):
             "source_manifest_sha256": context["source_manifest_sha256"],
             "source_map_sha256": context["source_map_sha256"],
             "rubric_sha256": context["rubric_sha256"],
-            "reviewer_mode": "fresh_host_vlm",
+            "reviewer_mode": "fresh_subagent",
             "dimension_scores": {name: 4 for name in harness.REVIEW_RUBRIC["dimensions"]},
             "blockers": [],
             "localized_repairs": [],
+            "repair_route": None,
+            "route_findings": [],
             "verdict": "pass",
             "complete": True,
         }
@@ -923,11 +1373,10 @@ class AutoDesignPosterSkillTests(unittest.TestCase):
             "The grounded poster retains accuracy.",
             encoding="utf-8",
         )
-        harness.initialize_poster_run(run, source)
-        harness.save_poster_plan(run, _plan())
+        self._initialize_no_visual_run(harness, run, source)
         attempt_info = harness.begin_poster_attempt(run)
         attempt_id = attempt_info["attempt_id"]
-        Path(attempt_info["poster_path"]).write_text(_poster_html(), encoding="utf-8")
+        (run / attempt_info["poster_path"]).write_text(_poster_html(), encoding="utf-8")
         source_map = self.root / "interrupted-source-map.json"
         source_map.write_text(json.dumps({"claims": _claims()}), encoding="utf-8")
 
@@ -1015,10 +1464,9 @@ class AutoDesignPosterSkillTests(unittest.TestCase):
             "The grounded poster retains accuracy.",
             encoding="utf-8",
         )
-        harness.initialize_poster_run(run, source)
-        harness.save_poster_plan(run, _plan())
+        self._initialize_no_visual_run(harness, run, source)
         attempt = harness.begin_poster_attempt(run)
-        Path(attempt["poster_path"]).write_text(_poster_html(), encoding="utf-8")
+        (run / attempt["poster_path"]).write_text(_poster_html(), encoding="utf-8")
         source_map = self.root / "real-source-map.json"
         source_map.write_text(json.dumps({"claims": _claims()}), encoding="utf-8")
         result = harness.validate_poster_attempt(
@@ -1049,8 +1497,7 @@ class AutoDesignPosterSkillTests(unittest.TestCase):
             "The grounded poster retains accuracy.",
             encoding="utf-8",
         )
-        harness.initialize_poster_run(run, source)
-        harness.save_poster_plan(run, _plan())
+        self._initialize_no_visual_run(harness, run, source)
         attempt = harness.begin_poster_attempt(run)
         html = _poster_html().replace(
             "</style>",
@@ -1061,7 +1508,7 @@ class AutoDesignPosterSkillTests(unittest.TestCase):
 }
 </style>""",
         )
-        Path(attempt["poster_path"]).write_text(html, encoding="utf-8")
+        (run / attempt["poster_path"]).write_text(html, encoding="utf-8")
         source_map = self.root / "computed-typography-source-map.json"
         source_map.write_text(json.dumps({"claims": _claims()}), encoding="utf-8")
         result = harness.validate_poster_attempt(
@@ -1089,15 +1536,14 @@ class AutoDesignPosterSkillTests(unittest.TestCase):
             "Grounded poster source reports 85% accuracy and uses two-stage routing. ",
             encoding="utf-8",
         )
-        harness.initialize_poster_run(run, source)
-        harness.save_poster_plan(run, _plan())
+        self._initialize_no_visual_run(harness, run, source)
         attempt = harness.begin_poster_attempt(run)
         html = _poster_html().replace(
             "Grounded Poster Study",
             '<span style="font-size:8px!important">Grounded Poster Study</span>',
             1,
         )
-        Path(attempt["poster_path"]).write_text(html, encoding="utf-8")
+        (run / attempt["poster_path"]).write_text(html, encoding="utf-8")
         source_map = self.root / "nested-typography-source-map.json"
         source_map.write_text(json.dumps({"claims": _claims()}), encoding="utf-8")
         result = harness.validate_poster_attempt(
@@ -1125,8 +1571,7 @@ class AutoDesignPosterSkillTests(unittest.TestCase):
             "Grounded poster source reports 85% accuracy and uses two-stage routing. ",
             encoding="utf-8",
         )
-        harness.initialize_poster_run(run, source)
-        harness.save_poster_plan(run, _plan())
+        self._initialize_no_visual_run(harness, run, source)
         attempt = harness.begin_poster_attempt(run)
         html = _poster_html().replace(
             '<p data-claim-id="c-problem" data-source-ids="ev-001">'
@@ -1136,7 +1581,7 @@ class AutoDesignPosterSkillTests(unittest.TestCase):
             "The grounded poster source reports 85% accuracy.</div>",
             1,
         )
-        Path(attempt["poster_path"]).write_text(html, encoding="utf-8")
+        (run / attempt["poster_path"]).write_text(html, encoding="utf-8")
         source_map = self.root / "div-typography-source-map.json"
         source_map.write_text(json.dumps({"claims": _claims()}), encoding="utf-8")
         result = harness.validate_poster_attempt(
@@ -1172,15 +1617,14 @@ class AutoDesignPosterSkillTests(unittest.TestCase):
                     "Grounded poster source reports 85% accuracy and uses two-stage routing. ",
                     encoding="utf-8",
                 )
-                harness.initialize_poster_run(run, source)
-                harness.save_poster_plan(run, _plan())
+                self._initialize_no_visual_run(harness, run, source)
                 attempt = harness.begin_poster_attempt(run)
                 html = _poster_html().replace(
                     "</style>",
                     'section[data-section-role="method"]::after {'
                     f"{declaration};display:block;font-size:24px" + "}</style>",
                 )
-                Path(attempt["poster_path"]).write_text(html, encoding="utf-8")
+                (run / attempt["poster_path"]).write_text(html, encoding="utf-8")
                 source_map = self.root / f"generated-content-source-map-{index}.json"
                 source_map.write_text(json.dumps({"claims": _claims()}), encoding="utf-8")
                 result = harness.validate_poster_attempt(
@@ -1211,14 +1655,13 @@ class AutoDesignPosterSkillTests(unittest.TestCase):
             "Grounded poster source reports 85% accuracy and uses two-stage routing. ",
             encoding="utf-8",
         )
-        harness.initialize_poster_run(run, source)
-        harness.save_poster_plan(run, _plan())
+        self._initialize_no_visual_run(harness, run, source)
         attempt = harness.begin_poster_attempt(run)
         html = _poster_html().replace(
             "</style>",
             'li::marker { c\\6f ntent:"Fabricated accuracy 999% "; }</style>',
         )
-        Path(attempt["poster_path"]).write_text(html, encoding="utf-8")
+        (run / attempt["poster_path"]).write_text(html, encoding="utf-8")
         source_map = self.root / "generated-marker-source-map.json"
         source_map.write_text(json.dumps({"claims": _claims()}), encoding="utf-8")
         result = harness.validate_poster_attempt(
@@ -1247,8 +1690,7 @@ class AutoDesignPosterSkillTests(unittest.TestCase):
             "Grounded poster source reports 85% accuracy and uses two-stage routing. ",
             encoding="utf-8",
         )
-        harness.initialize_poster_run(run, source)
-        harness.save_poster_plan(run, _plan())
+        self._initialize_no_visual_run(harness, run, source)
         attempt = harness.begin_poster_attempt(run)
         html = _poster_html().replace(
             "</style>",
@@ -1261,7 +1703,7 @@ class AutoDesignPosterSkillTests(unittest.TestCase):
 }
 </style>""",
         )
-        Path(attempt["poster_path"]).write_text(html, encoding="utf-8")
+        (run / attempt["poster_path"]).write_text(html, encoding="utf-8")
         source_map = self.root / "screen-typography-source-map.json"
         source_map.write_text(json.dumps({"claims": _claims()}), encoding="utf-8")
         result = harness.validate_poster_attempt(
@@ -1289,14 +1731,13 @@ class AutoDesignPosterSkillTests(unittest.TestCase):
             "Grounded poster source reports 85% accuracy and uses two-stage routing. ",
             encoding="utf-8",
         )
-        harness.initialize_poster_run(run, source)
-        harness.save_poster_plan(run, _plan())
+        self._initialize_no_visual_run(harness, run, source)
         attempt = harness.begin_poster_attempt(run)
         html = _poster_html().replace(
             "@media print {",
             "@media print { .paper-poster { transform: scale(.5); transform-origin: top left; }",
         )
-        Path(attempt["poster_path"]).write_text(html, encoding="utf-8")
+        (run / attempt["poster_path"]).write_text(html, encoding="utf-8")
         source_map = self.root / "print-preview-source-map.json"
         source_map.write_text(json.dumps({"claims": _claims()}), encoding="utf-8")
         result = harness.validate_poster_attempt(

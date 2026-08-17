@@ -7,8 +7,10 @@ import tempfile
 import unittest
 import zlib
 from pathlib import Path
+from unittest import mock
 
 from agent_skills._shared import portable_core as core
+from tests import test_autodesign_poster_skill as poster_skill_fixtures
 
 
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
@@ -80,7 +82,11 @@ name = Path(sys.argv[0]).name
 if name == "pdfinfo":
     print("Pages: 2")
 elif name == "pdftotext":
-    Path(sys.argv[-1]).write_text("Central method.\\fPrimary result.\\n", encoding="utf-8")
+    Path(sys.argv[-1]).write_text(
+        "Central method. Grounded poster source reports 85% accuracy and uses two-stage routing."
+        "\\fPrimary result. Accuracy reaches 85%. The grounded poster retains accuracy.\\n",
+        encoding="utf-8",
+    )
 elif name == "pdftoppm":
     shutil.copyfile({str(first_page)!r}, sys.argv[-1] + "-1.png")
     shutil.copyfile({str(second_page)!r}, sys.argv[-1] + "-2.png")
@@ -1940,6 +1946,228 @@ elif name == "pdfimages":
                 "resolve_blocker",
             },
         )
+
+    def test_poster_wrapper_completes_source_reingest_lifecycle_without_mutating_attempt_one(self) -> None:
+        harness = poster_skill_fixtures._load_harness()
+        run = self.root / "runs" / "poster-wrapper-lifecycle"
+        method, result, _supporting = (
+            poster_skill_fixtures.AutoDesignPosterSkillTests._initialize_reviewed_visual_run(
+                self, harness, run
+            )
+        )
+
+        def poster_plan(method_asset: dict[str, object]) -> dict[str, object]:
+            plan = poster_skill_fixtures._plan()
+            plan["no_visual_fallback"] = None
+            plan["visual_allocations"] = [
+                {"visual_id": method_asset["asset_id"], "role": "method"},
+                {"visual_id": result["asset_id"], "role": "result"},
+            ]
+            return plan
+
+        def authored_html(method_id: str) -> str:
+            html = poster_skill_fixtures._poster_html(image=True).replace("vis-001", method_id)
+            marker = 'alt="Source method diagram">'
+            return html.replace(
+                marker,
+                marker
+                + f'<img src="assets/{result["asset_id"]}.png" '
+                f'data-source-id="{result["asset_id"]}" alt="Source primary result">',
+            )
+
+        def fake_render(*, attempt_root: Path, **_kwargs: object) -> dict[str, object]:
+            previews = attempt_root / "qa" / "previews"
+            previews.mkdir(parents=True, exist_ok=True)
+            (previews / "poster.png").write_bytes(b"screen-preview")
+            (previews / "poster-print.png").write_bytes(b"print-preview")
+            (attempt_root / "artifact" / "preview.png").write_bytes(b"print-preview")
+            (attempt_root / "artifact" / "poster.pdf").write_bytes(b"%PDF-fixture")
+            return {
+                "passed": True,
+                "checks": [
+                    {"id": "browser_geometry", "passed": True, "detail": "passed"},
+                    {"id": "computed_typography", "passed": True, "detail": "passed"},
+                    {"id": "single_page_pdf", "passed": True, "detail": "passed"},
+                ],
+                "preview_paths": {
+                    "poster_screen": "qa/previews/poster.png",
+                    "poster_pdf": "qa/previews/poster-print.png",
+                },
+            }
+
+        def semantic_review(
+            attempt_id: str,
+            context: dict[str, object],
+            *,
+            verdict: str,
+            route: str | None,
+            findings: list[dict[str, object]],
+        ) -> dict[str, object]:
+            return {
+                "format_version": 1,
+                "attempt_id": attempt_id,
+                "review_context_sha256": context["context_sha256"],
+                "artifact_hashes": context["artifact_hashes"],
+                "preview_hashes": context["preview_hashes"],
+                "reviewed_frame_ids": sorted(context["preview_hashes"]),
+                "source_manifest_sha256": context["source_manifest_sha256"],
+                "source_map_sha256": context["source_map_sha256"],
+                "rubric_sha256": context["rubric_sha256"],
+                "reviewer_mode": "fresh_subagent",
+                "dimension_scores": {
+                    name: 4 for name in harness.REVIEW_RUBRIC["dimensions"]
+                },
+                "blockers": [],
+                "localized_repairs": [],
+                "repair_route": route,
+                "route_findings": findings,
+                "verdict": verdict,
+                "complete": True,
+            }
+
+        harness.save_poster_plan(run, poster_plan(method))
+        first = harness.begin_poster_attempt(run)
+        self.assertEqual(first["attempt_id"], "01")
+        (run / first["poster_path"]).write_text(
+            authored_html(str(method["asset_id"])), encoding="utf-8"
+        )
+        source_map = self.root / "poster-wrapper-source-map.json"
+        source_map.write_text(
+            json.dumps({"claims": poster_skill_fixtures._claims()}),
+            encoding="utf-8",
+        )
+        with mock.patch.object(
+            harness, "_render_poster_outputs", side_effect=fake_render
+        ):
+            deterministic = harness.validate_poster_attempt(
+                run,
+                "01",
+                source_map_path=source_map,
+                allow_browser_install=False,
+            )
+        self.assertTrue(deterministic["passed"], deterministic)
+        first_review_context = harness.create_poster_review_context(run, "01")
+        source_finding = {
+            "finding_id": "method-fragment",
+            "code": "fragmentary_crop",
+            "minimum_route": "source_reingest",
+            "block_id": "method",
+            "message": "The method crop is fragmentary.",
+        }
+        failed = semantic_review(
+            "01",
+            first_review_context,
+            verdict="fail",
+            route="source_reingest",
+            findings=[source_finding],
+        )
+        harness.record_poster_review(run, "01", failed)
+        attempt_one = run / "attempts" / "01"
+        attempt_one_bytes = {
+            path.relative_to(attempt_one).as_posix(): path.read_bytes()
+            for path in attempt_one.rglob("*")
+            if path.is_file()
+        }
+        harness.reopen_poster_curation(
+            run,
+            self._reopen_request(
+                run, "01", "source_reingest", ["method-fragment"]
+            ),
+        )
+
+        inspection = harness.inspect_poster_source(run)
+        replacement = harness.crop_poster_source(
+            run,
+            self._crop_request(
+                inspection,
+                page=1,
+                role="method",
+                claim="The replacement crop contains the complete central method.",
+                bbox=[0.0, 0.0, 0.9, 1.0],
+            ),
+        )
+        evidence_id = str(harness.core.load_evidence(run)[0]["id"])
+        selection = {
+            "run_format_version": 2,
+            "assets": [
+                {
+                    "asset_id": replacement["asset_id"],
+                    "roles": ["method"],
+                    "max_reuse": 1,
+                    "importance": "essential",
+                },
+                {
+                    "asset_id": result["asset_id"],
+                    "roles": ["result"],
+                    "max_reuse": 2,
+                    "importance": "essential",
+                },
+            ],
+            "source_story": {
+                "central_method": {
+                    "status": "covered",
+                    "asset_ids": [replacement["asset_id"]],
+                    "evidence_ids": [evidence_id],
+                    "rationale": "The replacement crop shows the complete method.",
+                },
+                "primary_result": {
+                    "status": "covered",
+                    "asset_ids": [result["asset_id"]],
+                    "evidence_ids": [evidence_id],
+                    "rationale": "The original complete result remains primary evidence.",
+                },
+            },
+        }
+        source_context = harness.create_poster_source_review_context(run, selection)
+        harness.record_poster_source_review(
+            run,
+            source_context["context_path"],
+            self._passing_source_review(source_context),
+        )
+        harness.save_poster_plan(run, poster_plan(replacement))
+        second = harness.begin_poster_attempt(run)
+        self.assertEqual(second["attempt_id"], "02")
+        (run / second["poster_path"]).write_text(
+            authored_html(str(replacement["asset_id"])), encoding="utf-8"
+        )
+        with mock.patch.object(
+            harness, "_render_poster_outputs", side_effect=fake_render
+        ):
+            deterministic = harness.validate_poster_attempt(
+                run,
+                "02",
+                source_map_path=source_map,
+                allow_browser_install=False,
+            )
+        self.assertTrue(deterministic["passed"], deterministic)
+        second_context = harness.create_poster_review_context(run, "02")
+        harness.record_poster_review(
+            run,
+            "02",
+            semantic_review(
+                "02", second_context, verdict="pass", route=None, findings=[]
+            ),
+        )
+        manifest = harness.finalize_poster_attempt(run, "02")
+        self.assertEqual(manifest["attempt_id"], "02")
+        self.assertEqual(
+            {
+                path.relative_to(attempt_one).as_posix(): path.read_bytes()
+                for path in attempt_one.rglob("*")
+                if path.is_file()
+            },
+            attempt_one_bytes,
+        )
+        final_html = (run / "final" / "poster.html").read_text(encoding="utf-8")
+        self.assertIn(str(replacement["asset_id"]), final_html)
+        self.assertNotIn(str(method["asset_id"]), final_html)
+        self.assertTrue(
+            (run / "final" / "assets" / f"{replacement['asset_id']}.png").is_file()
+        )
+        self.assertFalse(
+            (run / "final" / "assets" / f"{method['asset_id']}.png").exists()
+        )
+        self.assertEqual(harness.resume_poster_run(run)["next_action"], "complete")
 
 
 if __name__ == "__main__":
