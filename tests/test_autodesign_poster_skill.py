@@ -478,6 +478,47 @@ elif name == "pdfimages" and "-list" in sys.argv:
         self.assertEqual(result["status"], "error")
         self.assertIn("canonical shared serialization", result["error"])
 
+    def test_cli_rejects_non_string_source_flow_with_one_json_error(self) -> None:
+        harness = _load_harness()
+        run = self.root / "source-flow-type-run"
+        source = self.root / "source-flow-type.txt"
+        source.write_text("Grounded paper source.", encoding="utf-8")
+        harness.initialize_poster_run(run, source)
+        self._curate_no_visuals(harness, run)
+        request = self.root / "source-flow-type-plan.json"
+
+        for invalid in ([], {}):
+            with self.subTest(invalid=invalid):
+                plan = _plan()
+                plan["visual_allocations"] = [
+                    _visual_allocation(
+                        "src-method",
+                        "method",
+                        relationship=invalid,
+                    )
+                ]
+                harness.core.atomic_write_json(request, plan)
+                completed = subprocess.run(
+                    [
+                        sys.executable,
+                        str(HARNESS_PATH),
+                        "plan",
+                        "--run-dir",
+                        str(run),
+                        "--plan",
+                        str(request),
+                    ],
+                    cwd=self.root,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                self.assertEqual(completed.returncode, 1)
+                self.assertEqual(completed.stderr, "")
+                error = json.loads(completed.stdout)
+                self.assertEqual(error["status"], "error")
+                self.assertIn("source_flow_relationship", error["error"])
+
     def test_cli_rejects_asset_evidence_before_creating_a_v2_run(self) -> None:
         source = self.root / "paper.txt"
         source.write_text("Grounded paper.", encoding="utf-8")
@@ -799,6 +840,52 @@ elif name == "pdfimages" and "-list" in sys.argv:
                 with self.assertRaisesRegex(harness.PosterContractError, message):
                     harness.normalize_plan(payload)
 
+    def test_plan_rejects_non_string_no_visual_fallback_text(self) -> None:
+        harness = _load_harness()
+
+        for field in ("reason", "strategy"):
+            with self.subTest(field=field):
+                plan = _plan()
+                plan["no_visual_fallback"][field] = 1234567890123456
+                with self.assertRaisesRegex(
+                    harness.PosterContractError, "reason and strategy"
+                ):
+                    harness.normalize_plan(plan)
+
+    def test_plan_rejects_non_string_section_role_and_rounded_zero_area(self) -> None:
+        harness = _load_harness()
+
+        numeric_section = _plan()
+        numeric_section["narrative"].append(
+            {
+                "role": "7",
+                "purpose": "Keep an explicit auxiliary narrative section.",
+                "claim_ids": ["c-seven"],
+            }
+        )
+        allocation = _visual_allocation(
+            "src-seven", "supporting", claim_ids=["c-seven"]
+        )
+        allocation["intended_area"]["section_role"] = 7
+        numeric_section["visual_allocations"] = [allocation]
+        with self.subTest(case="numeric_section_role"):
+            with self.assertRaisesRegex(
+                harness.PosterContractError, "section_role.*string"
+            ):
+                harness.normalize_plan(numeric_section)
+
+        rounded_zero = _plan()
+        rounded_zero["visual_allocations"] = [
+            _visual_allocation(
+                "src-method", "method", relative_area=0.00001
+            )
+        ]
+        with self.subTest(case="rounded_zero_area"):
+            with self.assertRaisesRegex(
+                harness.PosterContractError, "relative_area.*positive"
+            ):
+                harness.normalize_plan(rounded_zero)
+
     def test_plan_story_fields_bind_active_plan_attempt_snapshot_and_context(self) -> None:
         harness = _load_harness()
         run = self.root / "story-binding-run"
@@ -886,6 +973,58 @@ elif name == "pdfimages" and "-list" in sys.argv:
                 / "source-map.json"
             ).exists()
         )
+
+    def test_validation_rejects_non_exact_claim_ids_before_provenance_write(self) -> None:
+        harness = _load_harness()
+
+        cases = (
+            ("7", 7, "non-empty strings"),
+            ("True", True, "non-empty strings"),
+            ("c-method", " c-method ", "attempt plan"),
+        )
+        for index, (planned_id, raw_id, message) in enumerate(cases, 1):
+            with self.subTest(raw_id=raw_id):
+                run = self.root / f"claim-id-type-run-{index}"
+                source = self.root / f"claim-id-type-source-{index}.txt"
+                source.write_text(
+                    "Grounded poster source reports 85% accuracy and uses two-stage routing.",
+                    encoding="utf-8",
+                )
+                harness.initialize_poster_run(run, source)
+                self._curate_no_visuals(harness, run)
+                plan = _plan()
+                plan["narrative"][1]["claim_ids"] = [planned_id]
+                harness.save_poster_plan(run, plan)
+                attempt = harness.begin_poster_attempt(run)
+                (run / attempt["poster_path"]).write_text(
+                    _poster_html(), encoding="utf-8"
+                )
+                claims = _claims()
+                claims[1] = {**claims[1], "id": raw_id}
+                source_map = self.root / f"claim-id-type-{index}.json"
+                source_map.write_text(
+                    json.dumps({"claims": claims}), encoding="utf-8"
+                )
+
+                with self.assertRaisesRegex(
+                    harness.PosterContractError, message
+                ):
+                    harness.validate_poster_attempt(
+                        run,
+                        attempt["attempt_id"],
+                        source_map_path=source_map,
+                        allow_browser_install=False,
+                    )
+
+                self.assertFalse(
+                    (
+                        run
+                        / "attempts"
+                        / attempt["attempt_id"]
+                        / "provenance"
+                        / "source-map.json"
+                    ).exists()
+                )
 
     def test_plan_honors_supported_user_size_and_rejects_ratio_mismatch(self) -> None:
         harness = _load_harness()

@@ -424,8 +424,19 @@ def _normalize_no_visual_fallback(value: Any) -> dict[str, str] | None:
         raise PosterContractError(
             "no_visual_fallback requires exactly reason and strategy"
         )
-    reason = str(value.get("reason") or "").strip()
-    strategy = str(value.get("strategy") or "").strip()
+    raw_reason = value.get("reason")
+    raw_strategy = value.get("strategy")
+    if (
+        not isinstance(raw_reason, str)
+        or not raw_reason.strip()
+        or not isinstance(raw_strategy, str)
+        or not raw_strategy.strip()
+    ):
+        raise PosterContractError(
+            "no_visual_fallback reason and strategy must be non-empty strings"
+        )
+    reason = raw_reason.strip()
+    strategy = raw_strategy.strip()
     if len(reason) < 16 or len(strategy) < 16:
         raise PosterContractError(
             "no_visual_fallback reason and strategy must be explicit"
@@ -515,7 +526,10 @@ def normalize_plan(payload: Mapping[str, Any]) -> dict[str, Any]:
             )
         claims = _claim_ids(item.get("claim_ids"), f"visual_allocations.{visual_id}.claim_ids")
         relationship = item.get("source_flow_relationship")
-        if relationship not in _SOURCE_FLOW_RELATIONSHIPS:
+        if (
+            not isinstance(relationship, str)
+            or relationship not in _SOURCE_FLOW_RELATIONSHIPS
+        ):
             raise PosterContractError(
                 "source_flow_relationship must be primary or supporting"
             )
@@ -527,7 +541,12 @@ def normalize_plan(payload: Mapping[str, Any]) -> dict[str, Any]:
             raise PosterContractError(
                 "intended_area requires exactly section_role and relative_area"
             )
-        section_role = str(intended.get("section_role") or "").strip().lower()
+        raw_section_role = intended.get("section_role")
+        if not isinstance(raw_section_role, str) or not raw_section_role.strip():
+            raise PosterContractError(
+                "intended_area.section_role must be a non-empty string"
+            )
+        section_role = raw_section_role.strip().lower()
         if section_role not in {section["role"] for section in narrative}:
             raise PosterContractError(
                 f"intended_area references an unknown narrative section: {section_role}"
@@ -545,6 +564,10 @@ def normalize_plan(payload: Mapping[str, Any]) -> dict[str, Any]:
         )
         if relative_area > 1:
             raise PosterContractError("intended_area.relative_area must be at most 1")
+        if relative_area <= 0:
+            raise PosterContractError(
+                "intended_area.relative_area must remain positive after normalization"
+            )
         section_area[section_role] = round(
             section_area.get(section_role, 0.0) + relative_area, 4
         )
@@ -1775,9 +1798,11 @@ def validate_poster_attempt(
     for raw_claim in source_map_input["claims"]:
         if not isinstance(raw_claim, Mapping):
             raise PosterContractError("source-map claims must be objects")
-        claim_id = str(raw_claim.get("id") or "").strip()
-        if not claim_id:
-            raise PosterContractError("source-map claims require non-empty IDs")
+        claim_id = raw_claim.get("id")
+        if not isinstance(claim_id, str) or not claim_id.strip():
+            raise PosterContractError(
+                "source-map claim IDs must be non-empty strings"
+            )
         claim_ids.append(claim_id)
     if len(set(claim_ids)) != len(claim_ids):
         raise PosterContractError("source-map claim IDs must be unique")
