@@ -8,6 +8,7 @@
 
 | Date | Update |
 | :--- | :--- |
+| **2026-08-17** | [Standalone Agent Skills for Poster, PPT, Webpage, and Video are now installable](./agent_skills/README.md) |
 | **2026-08-15** | [Added official DeepSeek Harness support for coding agents](https://github.com/Yaxin9Luo/AutoDesign/pull/2) |
 | **2026-08-14** | [Initial public release](https://github.com/Yaxin9Luo/AutoDesign/commit/55586f66fa4a126997f0d252e070701c4ae68920) |
 

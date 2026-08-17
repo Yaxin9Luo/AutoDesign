@@ -1,90 +1,126 @@
 # AutoDesign Agent Skills
 
-This directory contains four independently installable Agent Skills:
+Turn one research paper into an editable poster, slide deck, project webpage,
+or narrated conference video directly inside your Coding Agent. These are four
+independently installable, self-contained Agent Skills:
 
-- `autodesign-poster`
-- `autodesign-ppt`
-- `autodesign-webpage`
-- `autodesign-video`
+| Skill | Creates | Primary delivery |
+|---|---|---|
+| [`autodesign-poster`](./autodesign-poster/) | Source-grounded academic conference poster | Editable HTML, one-page PDF, preview, provenance |
+| [`autodesign-ppt`](./autodesign-ppt/) | Research talk and slide deck | Editable HTML, native editable PPTX, PDF, notes |
+| [`autodesign-webpage`](./autodesign-webpage/) | Responsive research project webpage | Editable local HTML, assets, desktop/mobile QA |
+| [`autodesign-video`](./autodesign-video/) | Narrated and subtitled conference video | Editable HyperFrames project, 1080p MP4, audio, SRT/VTT |
 
-Each package is self-contained at installation time. It does not require the
-AutoDesign application or a running server, and it stores mutable run data only
-in a user-selected output directory.
+Each Skill carries a lightweight local harness for evidence, attempts,
+deterministic checks, rendering, and delivery. No AutoDesign application server
+is required. Mutable runs, caches, and generated artifacts stay in an output
+directory selected by the user, never inside the installed Skill.
 
-## Choose an installation root
+> [!IMPORTANT]
+> The Skill edition is the portable, convenient way to use part of AutoDesign
+> from an existing Coding Agent. It does not replace the full AutoDesign
+> Harness. Read [Skills vs. the full AutoDesign Harness](#skills-vs-the-full-autodesign-harness)
+> before evaluating output quality.
 
-Install each complete Skill folder directly below one host discovery root:
+## Quick install
 
-| Host | User discovery roots |
-|---|---|
-| Codex | `~/.agents/skills` or `~/.codex/skills` |
-| DeepSeek Harness | `~/.agents/skills` or `~/.dsh/skills` |
-| Claude Code | `~/.claude/skills` |
-
-`~/.agents/skills` can be shared by Codex and DeepSeek Harness. Restart the
-host after installation so it discovers the new Skill folders.
-
-## Python and platform prerequisites
-
-The harness scripts require Python 3.10+. On macOS and Linux, use `python3`
-when available and fall back to `python`. On Windows, prefer `py -3` and fall
-back to `python`. Use the selected command consistently in place of `PYTHON`
-below.
-
-| Skill | Additional local prerequisites |
-|---|---|
-| Poster | Poppler (`pdftotext`, `pdfinfo`, `pdftoppm`, `pdfimages`); its setup installs a pinned browser in the user cache |
-| PPT | Poppler and LibreOffice; its setup installs pinned browser and PPT runtimes in the user cache |
-| Webpage | Poppler; its setup installs a pinned browser in the user cache |
-| Video | Poppler (`pdftotext`, `pdfinfo`, `pdftoppm`, `pdfimages`); Node.js 22+, npm, `ffmpeg`, `ffprobe`, and Python 3.10–3.12 for Kokoro/HyperFrames runtime setup |
-
-The setup tools select macOS, Linux, or Windows runtime packages and fail
-closed on unsupported architectures. Run each Skill's `doctor` before its first
-job. Initial browser, PPT, and Video setup requires network access; generated
-artifacts and caches remain outside the installed Skill.
-
-## Validate
+The shortest route is the official GitHub CLI Skill installer. Check that your
+GitHub CLI includes it:
 
 ```bash
-python3 scripts/validate_agent_skills.py --root agent_skills
+gh skill install --help
 ```
 
-## Build deterministic release archives
-
-Choose a new, unused output directory. Release builds deliberately refuse to
-overwrite an existing directory.
+Install all four Skills for Codex at user scope:
 
 ```bash
-python3 scripts/package_agent_skills.py build \
-  --source-root agent_skills \
-  --output-dir dist/agent-skills-v0.1.0 \
-  --version 0.1.0
+gh skill install Yaxin9Luo/AutoDesign agent_skills/autodesign-poster --agent codex --scope user
+gh skill install Yaxin9Luo/AutoDesign agent_skills/autodesign-ppt --agent codex --scope user
+gh skill install Yaxin9Luo/AutoDesign agent_skills/autodesign-webpage --agent codex --scope user
+gh skill install Yaxin9Luo/AutoDesign agent_skills/autodesign-video --agent codex --scope user
 ```
 
-The release contains one versioned ZIP and SHA-256 sidecar per Skill, a
-deterministic `manifest.json`, and the release-local `package_agent_skills.py`
-installer with its `validate_agent_skills.py` validation helper.
+Install only the artifact types you need. If `gh skill` is unavailable, update
+GitHub CLI or use the checksum-verified release installer below.
 
-## Install one Skill
+## Install by Coding Agent
+
+Agent Skills are directories containing a required `SKILL.md` plus optional
+scripts, references, and assets. AutoDesign follows the open
+[Agent Skills specification](https://agentskills.io/specification).
+
+### Codex
+
+Codex discovers user Skills under `~/.agents/skills`. Older local setups may
+also use `~/.codex/skills`.
 
 ```bash
-# macOS / Linux
-if command -v python3 >/dev/null 2>&1; then
-  PYTHON=python3
-elif command -v python >/dev/null 2>&1; then
-  PYTHON=python
-else
-  echo "Python 3.10+ is required" >&2
-  exit 1
-fi
-"$PYTHON" ./package_agent_skills.py install \
+gh skill install Yaxin9Luo/AutoDesign agent_skills/autodesign-poster --agent codex --scope user
+```
+
+After installation, start a new Codex task if the Skill does not appear
+immediately. See the official [Codex Skills documentation](https://developers.openai.com/codex/skills).
+
+### Claude Code
+
+Claude Code discovers personal Skills under `~/.claude/skills`:
+
+```bash
+for skill in autodesign-poster autodesign-ppt autodesign-webpage autodesign-video; do
+  gh skill install Yaxin9Luo/AutoDesign "agent_skills/$skill" --agent claude-code --scope user
+done
+```
+
+Claude Code normally detects changes in an existing Skills directory. Restart
+it if this is the first Skill directory on the machine. See the official
+[Claude Code Skills documentation](https://code.claude.com/docs/en/skills).
+
+### DeepSeek Harness
+
+DeepSeek Harness supports project roots `.dsh/skills` and `.agents/skills`, plus
+the user roots `~/.dsh/skills` and `~/.agents/skills`. This command installs all
+four into the user DSH root:
+
+```bash
+for skill in autodesign-poster autodesign-ppt autodesign-webpage autodesign-video; do
+  gh skill install Yaxin9Luo/AutoDesign "agent_skills/$skill" --dir "$HOME/.dsh/skills"
+done
+```
+
+Use `--dir "$HOME/.agents/skills"` instead when you want one shared installation
+for Codex and DeepSeek Harness. See the official
+[DeepSeek Harness Skills subsystem](https://github.com/deepseek-ai/deepseek-harness/blob/master/docs/subsystems/skills.md).
+
+### Checksum-verified release installer
+
+The [`agent-skills-v0.1.0` release](https://github.com/Yaxin9Luo/AutoDesign/releases/tag/agent-skills-v0.1.0)
+contains four ZIPs, four SHA-256 sidecars, a manifest, and a standalone
+installer. Download it with GitHub CLI:
+
+```bash
+mkdir -p autodesign-skills-v0.1.0
+gh release download agent-skills-v0.1.0 \
+  --repo Yaxin9Luo/AutoDesign \
+  --dir autodesign-skills-v0.1.0
+cd autodesign-skills-v0.1.0
+```
+
+Choose a Python 3 launcher: `python3` on most macOS/Linux systems, `python` as
+the fallback, or `py -3` on Windows. Then install one archive and its matching
+checksum:
+
+```bash
+python3 -I ./package_agent_skills.py install \
   --archive ./autodesign-poster-0.1.0.zip \
   --checksum ./autodesign-poster-0.1.0.zip.sha256 \
   --destination "$HOME/.agents/skills"
 ```
 
-On Windows, run the same release-local installer with `py -3` (or `python`)
-and choose the corresponding user discovery root, for example:
+Replace `autodesign-poster` with another Skill name and choose the destination
+for your Coding Agent. The installer verifies SHA-256, validates extracted
+contents, promotes atomically, and refuses to overwrite an existing Skill.
+
+Windows example:
 
 ```powershell
 py -3 .\package_agent_skills.py install `
@@ -93,6 +129,103 @@ py -3 .\package_agent_skills.py install `
   --destination "$HOME\.claude\skills"
 ```
 
-Installation verifies the release checksum, is atomic, and refuses to replace
-an existing Skill directory. Installing a raw development archive requires the
-explicit `--allow-unverified` opt-in.
+## First run
+
+Give the Coding Agent the paper PDF, name the Skill, and state the intended
+audience and output directory. For example:
+
+| Host | Example |
+|---|---|
+| Codex | `$autodesign-poster Turn /path/paper.pdf into an editable CVPR landscape poster. Save the complete run under /path/output.` |
+| Claude Code | `/autodesign-ppt Turn /path/paper.pdf into an 18-slide conference talk for a technical audience.` |
+| DeepSeek Harness | `Use autodesign-webpage to turn /path/paper.pdf into a responsive research project page under /path/output.` |
+| Any supported host | `Use autodesign-video to create a six-minute narrated conference video from /path/paper.pdf with optional English subtitles.` |
+
+The Coding Agent reads the Skill workflow, runs its local `doctor`, prepares
+the source evidence, authors bounded attempts, executes deterministic QA, and
+requests a fresh visual review before final delivery. The first browser, PPT,
+or Video run may download pinned runtime dependencies into a user cache.
+
+Generated deliverables live under the run directory you requested. The
+installed Skill remains read-only.
+
+## Requirements
+
+All four harnesses require Python 3.10 or newer. Video currently requires
+Python 3.10–3.12 for its locked Kokoro and HyperFrames runtime.
+
+| Skill | Additional local requirements |
+|---|---|
+| Poster | Poppler: `pdftotext`, `pdfinfo`, `pdftoppm`, `pdfimages`; first setup installs a pinned browser in the user cache |
+| PPT | Poppler, LibreOffice; first setup installs pinned browser and native-PPT runtimes in the user cache |
+| Webpage | Poppler; first setup installs a pinned browser in the user cache |
+| Video | Poppler, Node.js 22+, npm, `ffmpeg`, `ffprobe`, Python 3.10–3.12; setup installs exact `hyperframes@0.7.86` and locked Kokoro assets |
+
+The setup tools select supported macOS, Linux, or Windows packages and fail
+closed on unsupported platforms or architectures. Initial runtime setup
+requires network access. Run the Skill through your Coding Agent so it can act
+on `doctor` diagnostics rather than skipping a required gate.
+
+## Skills vs. the full AutoDesign Harness
+
+The four Skills preserve many of AutoDesign's artifact contracts and local QA
+checks, but they run inside a host Coding Agent rather than the complete
+AutoDesign system.
+
+| Area | Standalone Skills | Full AutoDesign Harness |
+|---|---|---|
+| Entry point | Existing Coding Agent conversation | AutoDesign Workbench and pipeline |
+| Orchestration | Host agent follows one portable workflow | Coordinated artifact pipeline, shared context, routing, and lifecycle management |
+| Source understanding | Host agent plus local evidence and provenance tools | Integrated paper memory, planners, artifact-specific harnesses, and shared source state |
+| Review and iteration | Deterministic gates plus fresh host-agent or subagent review | Integrated critics, retry routing, cross-stage diagnostics, and workbench feedback |
+| Editing experience | Files and the host Coding Agent | Workbench, previews, attempt history, Canvas editing, and artifact export |
+| Output consistency | More dependent on the selected agent, model, and local environment | More controlled by the full optimized pipeline |
+
+The standalone Skill path is intentionally easier to install, but it does not
+replace AutoDesign's full effect or guarantee the same artifact quality. In
+particular, PDF interpretation, important-figure selection, visual hierarchy,
+and multi-round repair still depend more heavily on the host Coding Agent.
+
+Our future target is to bring these portable Skills to roughly **70–80%** of
+the full Harness experience across supported artifact workflows. That is a
+roadmap target, not a claim about current measured performance.
+
+For the complete system, use the [AutoDesign Workbench](../README.md#quickstart)
+and the full DesignHarness pipeline.
+
+## Roadmap and contributing
+
+The Skills are under active development. Contributions are welcome in:
+
+- PDF understanding, figure ranking, crop selection, and source grounding;
+- artifact planning, context management, and repair routing;
+- layouts and editable export for Poster, PPT, Webpage, and Video;
+- deterministic evaluators, visual review rubrics, and regression cases;
+- real-paper examples that expose gaps between the Skills and full Harness.
+
+Open an [issue](https://github.com/Yaxin9Luo/AutoDesign/issues) with a reproducible
+paper/run case, or submit a pull request with focused tests. **Contributing** to
+the portable Skills is also a direct way to help move them toward the 70–80%
+future target without weakening their source-grounding and delivery contracts.
+
+## Maintainer verification
+
+Validate all four packages:
+
+```bash
+python3 -B scripts/validate_agent_skills.py --root agent_skills
+```
+
+Build deterministic, non-overwriting release archives:
+
+```bash
+python3 -B scripts/package_agent_skills.py build \
+  --source-root agent_skills \
+  --output-dir dist/agent-skills-v0.1.0 \
+  --version 0.1.0
+```
+
+The output directory contains one versioned ZIP and SHA-256 sidecar per Skill,
+`manifest.json`, and the release-local `package_agent_skills.py` and
+`validate_agent_skills.py` tools. Build twice and compare every byte before
+publishing a release.
