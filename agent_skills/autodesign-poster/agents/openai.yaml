@@ -1,0 +1,4 @@
+interface:
+  display_name: "AutoDesign Poster"
+  short_description: "Create source-grounded academic posters"
+  default_prompt: "Use $autodesign-poster to turn my paper into an editable conference poster."

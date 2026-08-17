@@ -1,0 +1,4 @@
+interface:
+  display_name: "AutoDesign Video"
+  short_description: "Create narrated source-grounded conference videos"
+  default_prompt: "Use $autodesign-video to turn my paper into a narrated conference video."

@@ -1,0 +1,11 @@
+{
+  "name": "autodesign-video-runtime",
+  "private": true,
+  "version": "0.1.0",
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "hyperframes": "0.7.86"
+  }
+}
