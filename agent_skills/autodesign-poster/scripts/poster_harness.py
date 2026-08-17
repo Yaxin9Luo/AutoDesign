@@ -11,6 +11,7 @@ import argparse
 import json
 import math
 import re
+import shlex
 import shutil
 import subprocess
 import uuid
@@ -112,6 +113,7 @@ REVIEW_RUBRIC: dict[str, Any] = {
 _PLAN_KEYS = {
     "format_version",
     "artifact_type",
+    "thesis",
     "preset",
     "canvas",
     "print",
@@ -121,6 +123,7 @@ _PLAN_KEYS = {
     "style_reference_ids",
     "max_attempts",
 }
+_SOURCE_FLOW_RELATIONSHIPS = {"primary", "supporting"}
 _ARC_GROUPS = {
     "problem": {"context", "introduction", "motivation", "problem"},
     "method": {"approach", "architecture", "method", "system"},
@@ -357,20 +360,58 @@ def _require_number(value: Any, name: str, *, integer: bool = False) -> float | 
     return round(float(value), 4)
 
 
-def _narrative_roles(value: Any) -> list[dict[str, str]]:
+def _claim_ids(value: Any, name: str) -> list[str]:
+    if (
+        not isinstance(value, list)
+        or not value
+        or any(not isinstance(item, str) or not item.strip() for item in value)
+    ):
+        raise PosterContractError(f"{name} must be a non-empty list of claim IDs")
+    normalized = [item.strip() for item in value]
+    if len(set(normalized)) != len(normalized):
+        raise PosterContractError(f"{name} claim IDs must be unique")
+    return normalized
+
+
+def _narrative_roles(value: Any) -> list[dict[str, Any]]:
     if not isinstance(value, list) or len(value) < 4:
         raise PosterContractError("poster plan requires at least four narrative sections")
-    sections: list[dict[str, str]] = []
+    sections: list[dict[str, Any]] = []
+    roles: set[str] = set()
+    claim_owners: dict[str, str] = {}
     for raw in value:
-        if not isinstance(raw, Mapping) or set(raw) != {"role", "purpose"}:
-            raise PosterContractError("each narrative section requires only role and purpose")
-        role = str(raw.get("role") or "").strip().lower()
-        purpose = str(raw.get("purpose") or "").strip()
+        if not isinstance(raw, Mapping) or set(raw) != {
+            "role",
+            "purpose",
+            "claim_ids",
+        }:
+            raise PosterContractError(
+                "each narrative section requires exactly role, purpose, and claim_ids"
+            )
+        raw_role = raw.get("role")
+        raw_purpose = raw.get("purpose")
+        if not isinstance(raw_role, str) or not isinstance(raw_purpose, str):
+            raise PosterContractError(
+                "narrative role and purpose must be non-empty strings"
+            )
+        role = raw_role.strip().lower()
+        purpose = raw_purpose.strip()
         if not role or not purpose:
-            raise PosterContractError("narrative role and purpose must be non-empty")
-        sections.append({"role": role, "purpose": purpose})
-    present = {section["role"] for section in sections}
-    missing = [name for name, aliases in _ARC_GROUPS.items() if not present.intersection(aliases)]
+            raise PosterContractError(
+                "narrative role and purpose must be non-empty strings"
+            )
+        if role in roles:
+            raise PosterContractError("narrative section roles must be unique")
+        roles.add(role)
+        claims = _claim_ids(raw.get("claim_ids"), f"narrative.{role}.claim_ids")
+        for claim_id in claims:
+            if claim_id in claim_owners:
+                raise PosterContractError(
+                    "each claim ID must belong to exactly one narrative section"
+                )
+            claim_owners[claim_id] = role
+        sections.append({"role": role, "purpose": purpose, "claim_ids": claims})
+    missing = [name for name, aliases in _ARC_GROUPS.items() if not roles.intersection(aliases)]
     if missing:
         raise PosterContractError(f"narrative arc is missing: {', '.join(missing)}")
     return sections
@@ -401,6 +442,10 @@ def normalize_plan(payload: Mapping[str, Any]) -> dict[str, Any]:
         raise PosterContractError(f"poster plan has unknown fields: {', '.join(unknown)}")
     if value.get("format_version") != FORMAT_VERSION or value.get("artifact_type") != "poster":
         raise PosterContractError("poster plan requires format_version=1 and artifact_type=poster")
+    raw_thesis = value.get("thesis")
+    if not isinstance(raw_thesis, str) or not raw_thesis.strip():
+        raise PosterContractError("poster plan requires a non-empty thesis")
+    thesis = raw_thesis.strip()
     preset = str(value.get("preset") or DEFAULT_PRESET).strip().lower()
     if preset != "custom" and preset not in PRESETS:
         raise PosterContractError(f"unsupported poster preset: {preset}")
@@ -433,14 +478,92 @@ def normalize_plan(payload: Mapping[str, Any]) -> dict[str, Any]:
     max_attempts = value.get("max_attempts", DEFAULT_MAX_ATTEMPTS)
     if isinstance(max_attempts, bool) or not isinstance(max_attempts, int) or not 1 <= max_attempts <= 8:
         raise PosterContractError("max_attempts must be an integer from 1 through 8")
+    narrative = _narrative_roles(value.get("narrative"))
+    claim_owners = {
+        claim_id: section["role"]
+        for section in narrative
+        for claim_id in section["claim_ids"]
+    }
     allocations = value.get("visual_allocations", [])
-    if not isinstance(allocations, list) or any(
-        not isinstance(item, Mapping) or set(item) != {"visual_id", "role"}
-        or not str(item.get("visual_id") or "").strip()
-        or not str(item.get("role") or "").strip()
-        for item in allocations
-    ):
-        raise PosterContractError("visual_allocations require visual_id and role")
+    if not isinstance(allocations, list):
+        raise PosterContractError("visual_allocations must be a list")
+    normalized_allocations: list[dict[str, Any]] = []
+    section_area: dict[str, float] = {}
+    for item in allocations:
+        if not isinstance(item, Mapping) or set(item) != {
+            "visual_id",
+            "role",
+            "claim_ids",
+            "source_flow_relationship",
+            "intended_area",
+        }:
+            raise PosterContractError(
+                "visual_allocations require exactly visual_id, role, claim_ids, "
+                "source_flow_relationship, and intended_area"
+            )
+        raw_visual_id = item.get("visual_id")
+        raw_role = item.get("role")
+        if not isinstance(raw_visual_id, str) or not isinstance(raw_role, str):
+            raise PosterContractError(
+                "visual allocation visual_id and role must be non-empty strings"
+            )
+        visual_id = raw_visual_id.strip()
+        role = raw_role.strip()
+        if not visual_id or not role:
+            raise PosterContractError(
+                "visual allocation visual_id and role must be non-empty strings"
+            )
+        claims = _claim_ids(item.get("claim_ids"), f"visual_allocations.{visual_id}.claim_ids")
+        relationship = item.get("source_flow_relationship")
+        if relationship not in _SOURCE_FLOW_RELATIONSHIPS:
+            raise PosterContractError(
+                "source_flow_relationship must be primary or supporting"
+            )
+        intended = item.get("intended_area")
+        if not isinstance(intended, Mapping) or set(intended) != {
+            "section_role",
+            "relative_area",
+        }:
+            raise PosterContractError(
+                "intended_area requires exactly section_role and relative_area"
+            )
+        section_role = str(intended.get("section_role") or "").strip().lower()
+        if section_role not in {section["role"] for section in narrative}:
+            raise PosterContractError(
+                f"intended_area references an unknown narrative section: {section_role}"
+            )
+        for claim_id in claims:
+            if claim_owners.get(claim_id) != section_role:
+                raise PosterContractError(
+                    f"allocation claim {claim_id} is not owned by narrative section {section_role}"
+                )
+        relative_area = float(
+            _require_number(
+                intended.get("relative_area"),
+                f"visual_allocations.{visual_id}.intended_area.relative_area",
+            )
+        )
+        if relative_area > 1:
+            raise PosterContractError("intended_area.relative_area must be at most 1")
+        section_area[section_role] = round(
+            section_area.get(section_role, 0.0) + relative_area, 4
+        )
+        if section_area[section_role] > 1:
+            raise PosterContractError(
+                f"intended area for narrative section {section_role} exceeds 1"
+            )
+        normalized_allocations.append(
+            {
+                "visual_id": visual_id,
+                "role": role,
+                "claim_ids": claims,
+                "source_flow_relationship": relationship,
+                "intended_area": {
+                    "section_role": section_role,
+                    "relative_area": relative_area,
+                },
+            }
+        )
     references = value.get("style_reference_ids", [])
     if not isinstance(references, list) or any(not isinstance(item, str) or not item for item in references):
         raise PosterContractError("style_reference_ids must be a list of non-empty strings")
@@ -449,14 +572,12 @@ def normalize_plan(payload: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "format_version": FORMAT_VERSION,
         "artifact_type": "poster",
+        "thesis": thesis,
         "preset": preset,
         "canvas": canvas,
         "print": print_size,
-        "narrative": _narrative_roles(value.get("narrative")),
-        "visual_allocations": [
-            {"visual_id": str(item["visual_id"]), "role": str(item["role"])}
-            for item in allocations
-        ],
+        "narrative": narrative,
+        "visual_allocations": normalized_allocations,
         "no_visual_fallback": _normalize_no_visual_fallback(
             value.get("no_visual_fallback")
         ),
@@ -478,6 +599,11 @@ def initialize_poster_run(
         raise PosterContractError(
             "--asset cannot provide v2 paper evidence; inspect the source PDF and "
             "derive reviewed crops with crop-source"
+        )
+    run_path = Path(run_dir)
+    if (run_path / "run.json").exists() and core.inspect_run_format(run_path) != core.AGENT_FIRST_RUN_FORMAT_VERSION:
+        raise PosterContractError(
+            "v2 init cannot modify a legacy run; use diagnose-v1 for read-only inspection"
         )
     core.initialize_run(
         run_dir,
@@ -740,6 +866,7 @@ def begin_poster_attempt(run_dir: Path | str) -> dict[str, Any]:
             }
         )
     source_manifest = _read_json_object(run / "evidence" / "source_manifest.json")
+    source_map_input = attempt / "source-map-input.json"
     context = {
         "format_version": FORMAT_VERSION,
         "attempt_id": attempt_id,
@@ -761,9 +888,18 @@ def begin_poster_attempt(run_dir: Path | str) -> dict[str, Any]:
             "text in one .source-flow-unit with a visible gutter; native diagrams "
             "or tables may explain but must not replace essential source evidence."
         ),
-        "next_command": (
-            "python3 scripts/poster_harness.py validate --run-dir RUN "
-            f"--attempt {attempt_id} --source-map SOURCE_MAP.json"
+        "next_command": shlex.join(
+            [
+                sys.executable,
+                str(Path(__file__).resolve()),
+                "validate",
+                "--run-dir",
+                str(run),
+                "--attempt",
+                attempt_id,
+                "--source-map",
+                str(source_map_input),
+            ]
         ),
     }
     core.atomic_write_json(attempt / "authoring-context.json", context)
@@ -1632,10 +1768,29 @@ def validate_poster_attempt(
     plan = normalize_plan(core.load_attempt_plan(run, attempt_id))
     attempt = core.safe_path(run / "attempts", attempt_id, must_exist=True)
     artifact = attempt / "artifact"
-    _clear_generated_attempt_outputs(attempt)
     source_map_input = _read_json_object(source_map_path)
     if set(source_map_input) != {"claims"} or not isinstance(source_map_input["claims"], list):
         raise PosterContractError("source-map input must contain only a claims list")
+    claim_ids: list[str] = []
+    for raw_claim in source_map_input["claims"]:
+        if not isinstance(raw_claim, Mapping):
+            raise PosterContractError("source-map claims must be objects")
+        claim_id = str(raw_claim.get("id") or "").strip()
+        if not claim_id:
+            raise PosterContractError("source-map claims require non-empty IDs")
+        claim_ids.append(claim_id)
+    if len(set(claim_ids)) != len(claim_ids):
+        raise PosterContractError("source-map claim IDs must be unique")
+    planned_claim_ids = {
+        claim_id
+        for section in plan["narrative"]
+        for claim_id in section["claim_ids"]
+    }
+    if set(claim_ids) != planned_claim_ids:
+        raise PosterContractError(
+            "source-map claim IDs do not match the attempt plan"
+        )
+    _clear_generated_attempt_outputs(attempt)
     core.write_source_map(run, attempt_id, source_map_input["claims"])
     reviewed_catalog = core.load_attempt_visual_catalog(run, attempt_id)
     _validate_reviewed_plan(plan, reviewed_catalog)
@@ -1787,6 +1942,15 @@ def finalize_poster_attempt(run_dir: Path | str, attempt_id: str) -> dict[str, A
     return core.finalize_attempt(run_dir, attempt_id)
 
 
+def _poster_authoring_complete(run_dir: Path | str, attempt_id: str) -> bool:
+    poster = Path(run_dir) / "attempts" / attempt_id / "artifact" / "poster.html"
+    if not poster.exists():
+        return False
+    if poster.is_symlink() or not poster.is_file() or poster.stat().st_nlink != 1:
+        raise core.PathSafetyError(f"authored poster must be a regular file: {poster}")
+    return poster.stat().st_size > 0
+
+
 def resume_poster_run(run_dir: Path | str) -> dict[str, Any]:
     _require_v2_run(run_dir)
     persisted_state = _read_run(run_dir)
@@ -1800,6 +1964,10 @@ def resume_poster_run(run_dir: Path | str) -> dict[str, Any]:
         catalog = core.load_attempt_visual_catalog(run_dir, attempt_id)
         _validate_reviewed_plan(plan, catalog)
         _load_attempt_semantic_review(run_dir, attempt_id)
+        if state.get("state") == "authoring" and not _poster_authoring_complete(
+            run_dir, attempt_id
+        ):
+            state = {**state, "next_action": "author"}
     return state
 
 

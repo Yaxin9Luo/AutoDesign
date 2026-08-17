@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import shlex
 import shutil
 import struct
 import subprocess
@@ -47,18 +48,60 @@ def _plan(*, preset: str = "cvpr-landscape", max_attempts: int = 4) -> dict[str,
     return {
         "format_version": 1,
         "artifact_type": "poster",
+        "thesis": "The grounded paper supports a clear problem, method, result, and bounded takeaway.",
         "preset": preset,
         "canvas": canvas,
         "print": print_size,
         "narrative": [
-            {"role": "problem", "purpose": "Frame the research problem."},
-            {"role": "method", "purpose": "Explain the method."},
-            {"role": "evidence", "purpose": "Show measured evidence."},
-            {"role": "takeaway", "purpose": "State the bounded conclusion."},
+            {
+                "role": "problem",
+                "purpose": "Frame the research problem.",
+                "claim_ids": ["c-problem"],
+            },
+            {
+                "role": "method",
+                "purpose": "Explain the method.",
+                "claim_ids": ["c-method"],
+            },
+            {
+                "role": "evidence",
+                "purpose": "Show measured evidence.",
+                "claim_ids": ["c-evidence"],
+            },
+            {
+                "role": "takeaway",
+                "purpose": "State the bounded conclusion.",
+                "claim_ids": ["c-takeaway"],
+            },
         ],
         "visual_allocations": [],
         "no_visual_fallback": _no_visual_fallback(),
         "max_attempts": max_attempts,
+    }
+
+
+def _visual_allocation(
+    visual_id: object,
+    role: str,
+    *,
+    section_role: str | None = None,
+    claim_ids: list[str] | None = None,
+    relationship: str = "primary",
+    relative_area: float = 0.25,
+) -> dict[str, object]:
+    section = section_role or (
+        "method" if role in {"method", "overview", "method-overview"} else "evidence"
+    )
+    claims = claim_ids or [f"c-{section}"]
+    return {
+        "visual_id": str(visual_id),
+        "role": role,
+        "claim_ids": claims,
+        "source_flow_relationship": relationship,
+        "intended_area": {
+            "section_role": section,
+            "relative_area": relative_area,
+        },
     }
 
 
@@ -492,6 +535,28 @@ elif name == "pdfimages" and "-list" in sys.argv:
         self.assertEqual(result["status"], "blocked")
         self.assertEqual(harness.core.tree_hash(artifact), before)
 
+    def test_resume_requires_poster_html_not_only_staged_source_assets(self) -> None:
+        harness = _load_harness()
+        run = self.root / "staged-assets-only-run"
+        method, result, _supporting = self._initialize_reviewed_visual_run(
+            harness, run
+        )
+        plan = _plan()
+        plan["no_visual_fallback"] = None
+        plan["visual_allocations"] = [
+            _visual_allocation(method["asset_id"], "method"),
+            _visual_allocation(result["asset_id"], "result"),
+        ]
+        harness.save_poster_plan(run, plan)
+        attempt = harness.begin_poster_attempt(run)
+        artifact = run / "attempts" / attempt["attempt_id"] / "artifact"
+        self.assertTrue(any((artifact / "assets").iterdir()))
+        self.assertFalse((artifact / "poster.html").exists())
+
+        resumed = harness.resume_poster_run(run)
+
+        self.assertEqual(resumed["next_action"], "author")
+
     def test_diagnose_v1_cli_is_read_only_and_other_v2_commands_reject_it(self) -> None:
         harness = _load_harness()
         run = self.root / "legacy-run"
@@ -531,6 +596,36 @@ elif name == "pdfimages" and "-list" in sys.argv:
         )
         self.assertEqual(rejected.returncode, 1)
         self.assertIn("diagnose-v1", json.loads(rejected.stdout)["error"])
+
+    def test_v2_init_preflights_existing_v1_before_shared_initialization(self) -> None:
+        harness = _load_harness()
+        run = self.root / "existing-v1-run"
+        source = self.root / "legacy-source.txt"
+        source.write_text("Legacy source evidence.", encoding="utf-8")
+        harness.core.initialize_run(run, SKILL_ROOT, release_version="0.1.0")
+        harness.core.prepare_source(run, source)
+        before = {
+            path.relative_to(run).as_posix(): path.read_bytes()
+            for path in run.rglob("*")
+            if path.is_file()
+        }
+
+        replacement = self.root / "replacement.txt"
+        replacement.write_text("Replacement source.", encoding="utf-8")
+        with mock.patch.object(
+            harness.core,
+            "initialize_run",
+            side_effect=AssertionError("shared initialize_run must not be called"),
+        ):
+            with self.assertRaisesRegex(harness.PosterContractError, "diagnose-v1"):
+                harness.initialize_poster_run(run, replacement)
+
+        after = {
+            path.relative_to(run).as_posix(): path.read_bytes()
+            for path in run.rglob("*")
+            if path.is_file()
+        }
+        self.assertEqual(after, before)
 
     def test_cli_help_does_not_write_bytecode_into_a_read_only_style_install(self) -> None:
         installed = self.root / "installed" / "autodesign-poster"
@@ -572,6 +667,7 @@ elif name == "pdfimages" and "-list" in sys.argv:
             {
                 "format_version": 1,
                 "artifact_type": "poster",
+                "thesis": _plan()["thesis"],
                 "narrative": _plan()["narrative"],
                 "visual_allocations": [],
             }
@@ -580,6 +676,216 @@ elif name == "pdfimages" and "-list" in sys.argv:
         self.assertEqual(normalized["canvas"], {"width_px": 3072, "height_px": 1536})
         self.assertEqual(normalized["print"], {"width_mm": 2133.6, "height_mm": 1066.8})
         self.assertEqual(normalized["max_attempts"], 4)
+
+    def test_plan_normalizes_closed_story_flow_and_area_contract(self) -> None:
+        harness = _load_harness()
+
+        normalized = harness.normalize_plan(_plan())
+
+        self.assertEqual(
+            normalized["thesis"],
+            "The grounded paper supports a clear problem, method, result, and bounded takeaway.",
+        )
+        self.assertEqual(
+            normalized["narrative"][1],
+            {
+                "role": "method",
+                "purpose": "Explain the method.",
+                "claim_ids": ["c-method"],
+            },
+        )
+        self.assertEqual(normalized["visual_allocations"], [])
+
+    def test_plan_rejects_missing_unknown_or_stale_story_bindings(self) -> None:
+        harness = _load_harness()
+
+        def fresh() -> dict[str, object]:
+            return json.loads(json.dumps(_plan()))
+
+        missing_thesis = fresh()
+        missing_thesis.pop("thesis")
+        cases: list[tuple[str, dict[str, object], str]] = [
+            ("missing_thesis", missing_thesis, "thesis"),
+        ]
+
+        non_string_thesis = fresh()
+        non_string_thesis["thesis"] = 7
+        cases.append(("non_string_thesis", non_string_thesis, "thesis"))
+
+        missing_claims = fresh()
+        missing_claims["narrative"][0].pop("claim_ids")
+        cases.append(("missing_narrative_claims", missing_claims, "claim_ids"))
+
+        unknown_narrative = fresh()
+        unknown_narrative["narrative"][0]["unknown"] = True
+        cases.append(("unknown_narrative_field", unknown_narrative, "narrative"))
+
+        non_string_purpose = fresh()
+        non_string_purpose["narrative"][0]["purpose"] = 7
+        cases.append(("non_string_narrative", non_string_purpose, "non-empty strings"))
+
+        duplicate_owner = fresh()
+        duplicate_owner["narrative"][1]["claim_ids"] = ["c-problem"]
+        cases.append(("duplicate_claim_owner", duplicate_owner, "exactly one"))
+
+        missing_allocation_fields = fresh()
+        missing_allocation_fields["visual_allocations"] = [
+            {"visual_id": "src-method", "role": "method"}
+        ]
+        cases.append(
+            ("missing_allocation_fields", missing_allocation_fields, "visual_allocations")
+        )
+
+        non_string_visual_id = fresh()
+        allocation = _visual_allocation("src-method", "method")
+        allocation["visual_id"] = 7
+        non_string_visual_id["visual_allocations"] = [allocation]
+        cases.append(("non_string_visual_id", non_string_visual_id, "non-empty strings"))
+
+        unknown_allocation = fresh()
+        allocation = _visual_allocation("src-method", "method")
+        allocation["unknown"] = True
+        unknown_allocation["visual_allocations"] = [allocation]
+        cases.append(("unknown_allocation_field", unknown_allocation, "visual_allocations"))
+
+        stale_claim = fresh()
+        stale_claim["visual_allocations"] = [
+            _visual_allocation(
+                "src-method", "method", claim_ids=["c-method-stale"]
+            )
+        ]
+        cases.append(("stale_claim", stale_claim, "not owned"))
+
+        wrong_section = fresh()
+        wrong_section["visual_allocations"] = [
+            _visual_allocation(
+                "src-method",
+                "method",
+                section_role="evidence",
+                claim_ids=["c-method"],
+            )
+        ]
+        cases.append(("wrong_section_binding", wrong_section, "not owned"))
+
+        bad_relationship = fresh()
+        bad_relationship["visual_allocations"] = [
+            _visual_allocation(
+                "src-method", "method", relationship="floating-decoration"
+            )
+        ]
+        cases.append(("bad_relationship", bad_relationship, "source_flow_relationship"))
+
+        bad_area = fresh()
+        bad_area["visual_allocations"] = [
+            _visual_allocation("src-method", "method", relative_area=0.0)
+        ]
+        cases.append(("bad_area", bad_area, "relative_area"))
+
+        unknown_area = fresh()
+        allocation = _visual_allocation("src-method", "method")
+        allocation["intended_area"]["pixels"] = 100
+        unknown_area["visual_allocations"] = [allocation]
+        cases.append(("unknown_area_field", unknown_area, "intended_area"))
+
+        excessive_area = fresh()
+        excessive_area["visual_allocations"] = [
+            _visual_allocation("src-method-a", "method", relative_area=0.6),
+            _visual_allocation("src-method-b", "method", relative_area=0.6),
+        ]
+        cases.append(("excessive_section_area", excessive_area, "exceeds"))
+
+        for name, payload, message in cases:
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(harness.PosterContractError, message):
+                    harness.normalize_plan(payload)
+
+    def test_plan_story_fields_bind_active_plan_attempt_snapshot_and_context(self) -> None:
+        harness = _load_harness()
+        run = self.root / "story-binding-run"
+        method, result, _supporting = self._initialize_reviewed_visual_run(
+            harness, run
+        )
+        plan = _plan()
+        plan["no_visual_fallback"] = None
+        plan["visual_allocations"] = [
+            _visual_allocation(method["asset_id"], "method", relative_area=0.4),
+            _visual_allocation(result["asset_id"], "result", relative_area=0.4),
+        ]
+
+        normalized = harness.normalize_plan(plan)
+        harness.save_poster_plan(run, plan)
+        attempt = harness.begin_poster_attempt(run)
+        active = harness.core.load_active_plan(run)
+        snapshot = harness.core.load_attempt_plan(run, attempt["attempt_id"])
+        context = json.loads((run / attempt["authoring_context"]).read_text())
+
+        self.assertEqual(active, normalized)
+        self.assertEqual(snapshot, normalized)
+        self.assertEqual(context["plan"], normalized)
+        self.assertEqual(
+            context["plan"]["visual_allocations"][0]["intended_area"],
+            {"section_role": "method", "relative_area": 0.4},
+        )
+
+    def test_authoring_context_next_command_is_exact_absolute_and_shell_safe(self) -> None:
+        harness = _load_harness()
+        run = self.root / "poster run's handoff"
+        source = self.root / "paper source.txt"
+        source.write_text("A grounded source without distinct visuals.", encoding="utf-8")
+        self._initialize_no_visual_run(harness, run, source)
+
+        attempt = harness.begin_poster_attempt(run)
+        context = json.loads((run / attempt["authoring_context"]).read_text())
+        source_map = run.absolute() / "attempts" / attempt["attempt_id"] / "source-map-input.json"
+
+        self.assertEqual(
+            shlex.split(context["next_command"]),
+            [
+                sys.executable,
+                str(HARNESS_PATH.resolve()),
+                "validate",
+                "--run-dir",
+                str(run.absolute()),
+                "--attempt",
+                attempt["attempt_id"],
+                "--source-map",
+                str(source_map),
+            ],
+        )
+
+    def test_validation_rejects_source_map_claim_ids_stale_from_attempt_plan(self) -> None:
+        harness = _load_harness()
+        run = self.root / "stale-plan-claims-run"
+        source = self.root / "stale-plan-claims.txt"
+        source.write_text(
+            "Grounded poster source reports 85% accuracy and uses two-stage routing.",
+            encoding="utf-8",
+        )
+        self._initialize_no_visual_run(harness, run, source)
+        attempt = harness.begin_poster_attempt(run)
+        (run / attempt["poster_path"]).write_text(_poster_html(), encoding="utf-8")
+        claims = _claims()
+        claims[1] = {**claims[1], "id": "c-method-stale"}
+        source_map = self.root / "stale-source-map.json"
+        source_map.write_text(json.dumps({"claims": claims}), encoding="utf-8")
+
+        with self.assertRaisesRegex(harness.PosterContractError, "attempt plan"):
+            harness.validate_poster_attempt(
+                run,
+                attempt["attempt_id"],
+                source_map_path=source_map,
+                allow_browser_install=False,
+            )
+
+        self.assertFalse(
+            (
+                run
+                / "attempts"
+                / attempt["attempt_id"]
+                / "provenance"
+                / "source-map.json"
+            ).exists()
+        )
 
     def test_plan_honors_supported_user_size_and_rejects_ratio_mismatch(self) -> None:
         harness = _load_harness()
@@ -638,8 +944,8 @@ elif name == "pdfimages" and "-list" in sys.argv:
         wrong_roles = _plan()
         wrong_roles["no_visual_fallback"] = None
         wrong_roles["visual_allocations"] = [
-            {"visual_id": method["asset_id"], "role": "result"},
-            {"visual_id": result["asset_id"], "role": "result"},
+            _visual_allocation(method["asset_id"], "result"),
+            _visual_allocation(result["asset_id"], "result"),
         ]
         with self.assertRaisesRegex(harness.PosterContractError, "not permitted"):
             harness.save_poster_plan(run, wrong_roles)
@@ -647,8 +953,8 @@ elif name == "pdfimages" and "-list" in sys.argv:
         plan = _plan()
         plan["no_visual_fallback"] = None
         plan["visual_allocations"] = [
-            {"visual_id": method["asset_id"], "role": "method"},
-            {"visual_id": result["asset_id"], "role": "result"},
+            _visual_allocation(method["asset_id"], "method"),
+            _visual_allocation(result["asset_id"], "result"),
         ]
         saved = harness.save_poster_plan(run, plan)
         self.assertEqual(saved["plan_revision"], 1)
@@ -677,7 +983,7 @@ elif name == "pdfimages" and "-list" in sys.argv:
         harness = _load_harness()
         artifact, html = self._write_fixture(image=True)
         plan = _plan()
-        plan["visual_allocations"] = [{"visual_id": "vis-001", "role": "method"}]
+        plan["visual_allocations"] = [_visual_allocation("vis-001", "method")]
         result = harness.lint_poster_html(
             html,
             artifact_root=artifact,
@@ -836,7 +1142,7 @@ elif name == "pdfimages" and "-list" in sys.argv:
         self.assertIn("not allocated", binding["detail"])
 
         plan = _plan()
-        plan["visual_allocations"] = [{"visual_id": "vis-001", "role": "method"}]
+        plan["visual_allocations"] = [_visual_allocation("vis-001", "method")]
         result = harness.lint_poster_html(
             html,
             artifact_root=artifact,
@@ -1122,8 +1428,8 @@ elif name == "pdfimages" and "-list" in sys.argv:
         plan = _plan()
         plan["no_visual_fallback"] = None
         plan["visual_allocations"] = [
-            {"visual_id": method["asset_id"], "role": "method"},
-            {"visual_id": result["asset_id"], "role": "result"},
+            _visual_allocation(method["asset_id"], "method"),
+            _visual_allocation(result["asset_id"], "result"),
         ]
         plan["style_reference_ids"] = ["vis-001"]
         harness.save_poster_plan(run, plan)
@@ -1156,9 +1462,9 @@ elif name == "pdfimages" and "-list" in sys.argv:
         plan = _plan()
         plan["no_visual_fallback"] = None
         plan["visual_allocations"] = [
-            {"visual_id": method["asset_id"], "role": "method"},
-            {"visual_id": method["asset_id"], "role": "method"},
-            {"visual_id": result["asset_id"], "role": "result"},
+            _visual_allocation(method["asset_id"], "method"),
+            _visual_allocation(method["asset_id"], "method"),
+            _visual_allocation(result["asset_id"], "result"),
         ]
         harness.save_poster_plan(run, plan)
         attempt = harness.begin_poster_attempt(run)
@@ -1178,17 +1484,17 @@ elif name == "pdfimages" and "-list" in sys.argv:
         over_reused = dict(plan)
         over_reused["visual_allocations"] = [
             *plan["visual_allocations"],
-            {"visual_id": method["asset_id"], "role": "method"},
+            _visual_allocation(method["asset_id"], "method"),
         ]
         second_run = self.root / "over-reuse-run"
         second_method, second_result, _ = self._initialize_reviewed_visual_run(
             harness, second_run
         )
         over_reused["visual_allocations"] = [
-            {"visual_id": second_method["asset_id"], "role": "method"},
-            {"visual_id": second_method["asset_id"], "role": "method"},
-            {"visual_id": second_method["asset_id"], "role": "method"},
-            {"visual_id": second_result["asset_id"], "role": "result"},
+            _visual_allocation(second_method["asset_id"], "method"),
+            _visual_allocation(second_method["asset_id"], "method"),
+            _visual_allocation(second_method["asset_id"], "method"),
+            _visual_allocation(second_result["asset_id"], "result"),
         ]
         with self.assertRaisesRegex(harness.PosterContractError, "reuse limit"):
             harness.save_poster_plan(second_run, over_reused)

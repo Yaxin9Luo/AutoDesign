@@ -1960,8 +1960,12 @@ elif name == "pdfimages":
             plan = poster_skill_fixtures._plan()
             plan["no_visual_fallback"] = None
             plan["visual_allocations"] = [
-                {"visual_id": method_asset["asset_id"], "role": "method"},
-                {"visual_id": result["asset_id"], "role": "result"},
+                poster_skill_fixtures._visual_allocation(
+                    method_asset["asset_id"], "method"
+                ),
+                poster_skill_fixtures._visual_allocation(
+                    result["asset_id"], "result"
+                ),
             ]
             return plan
 
