@@ -138,6 +138,28 @@ elif name == "pdfimages":
         core.prepare_source(run, source, tool_paths=tools)
         return run, core.inspect_source(run)
 
+    def _blocked_pdf_reference_run(
+        self, name: str
+    ) -> tuple[Path, Path, Path, Path]:
+        run = self.root / "runs" / name
+        self._initialize(run, run_format_version=2)
+        pdf = self.root / f"{name}.pdf"
+        pdf.write_bytes(b"%PDF-1.4\nblocked reference registry\n")
+        reference = self.root / f"{name}.png"
+        reference.write_bytes(_png(2, 2, 61))
+        manifest = core.prepare_source(
+            run,
+            pdf,
+            reference_images=[reference],
+            tool_paths={
+                tool: None
+                for tool in ("pdftotext", "pdfinfo", "pdftoppm", "pdfimages")
+            },
+        )
+        self.assertEqual(manifest["status"], "blocked")
+        copied = run / "evidence" / "reference_images" / "reference-001.png"
+        return run, pdf, reference, copied
+
     def _crop_request(
         self,
         inspection: dict[str, object],
@@ -2284,8 +2306,6 @@ elif name == "pdfimages":
         self.assertEqual(blocked["visual_count"], 1)
         self.assertEqual(blocked["source_visuals_sha256"], core.sha256_file(source_visuals))
         core.inspect_source(blocked_run)
-        stale = blocked_run / "evidence" / "reference_images" / "reference-999.png"
-        stale.write_bytes(_png(1, 1, 99))
         tools, _calls = self._fake_poppler("blocked-style-poppler")
 
         ready = core.prepare_source(
@@ -2299,6 +2319,85 @@ elif name == "pdfimages":
         self.assertEqual(
             [path.name for path in (blocked_run / "evidence" / "reference_images").iterdir()],
             ["reference-001.png"],
+        )
+
+    def test_blocked_pdf_inspect_rejects_persisted_reference_registry_drift_without_writes(self) -> None:
+        for drift in ("modified", "missing", "extra"):
+            with self.subTest(drift=drift):
+                run, _pdf, _reference, copied = self._blocked_pdf_reference_run(
+                    f"blocked-reference-inspect-{drift}"
+                )
+                if drift == "modified":
+                    copied.write_bytes(_png(2, 2, 99))
+                elif drift == "missing":
+                    copied.unlink()
+                else:
+                    (copied.parent / "reference-002.png").write_bytes(
+                        copied.read_bytes()
+                    )
+                before = _tree_snapshot(run)
+
+                with self.assertRaises((core.IntegrityError, core.PathSafetyError)):
+                    core.inspect_source(run)
+
+                self.assertEqual(_tree_snapshot(run), before)
+
+    def test_blocked_pdf_retry_rejects_persisted_reference_registry_drift_without_writes(self) -> None:
+        for drift in ("modified", "missing", "extra"):
+            with self.subTest(drift=drift):
+                run, pdf, reference, copied = self._blocked_pdf_reference_run(
+                    f"blocked-reference-retry-{drift}"
+                )
+                if drift == "modified":
+                    copied.write_bytes(_png(2, 2, 99))
+                elif drift == "missing":
+                    copied.unlink()
+                else:
+                    (copied.parent / "reference-002.png").write_bytes(
+                        copied.read_bytes()
+                    )
+                tools, _calls = self._fake_poppler(
+                    f"blocked-reference-retry-{drift}-poppler"
+                )
+                before = _tree_snapshot(run)
+
+                with self.assertRaises((core.IntegrityError, core.PathSafetyError)):
+                    core.prepare_source(
+                        run,
+                        pdf,
+                        reference_images=[reference],
+                        tool_paths=tools,
+                    )
+
+                self.assertEqual(_tree_snapshot(run), before)
+
+    def test_blocked_pdf_reference_retry_recovers_an_owned_partial_promotion(self) -> None:
+        run, pdf, reference, _copied = self._blocked_pdf_reference_run(
+            "blocked-reference-owned-recovery"
+        )
+        tools, _calls = self._fake_poppler("blocked-reference-owned-recovery-poppler")
+        with self.assertRaises(core.SimulatedCrash):
+            core.prepare_source(
+                run,
+                pdf,
+                reference_images=[reference],
+                tool_paths=tools,
+                fail_at="after_source_manifest_promotion",
+            )
+        self.assertTrue((run / ".source-prep-staging" / "transaction.json").is_file())
+
+        ready = core.prepare_source(
+            run,
+            pdf,
+            reference_images=[reference],
+            tool_paths=tools,
+        )
+
+        self.assertEqual(ready["status"], "ready")
+        self.assertFalse((run / ".source-prep-staging").exists())
+        self.assertEqual(
+            sum(event.get("event") == "source_prepared" for event in _events(run)),
+            1,
         )
 
     def test_blocked_pdf_retry_rejects_changed_reordered_omitted_or_added_references_without_writes(self) -> None:

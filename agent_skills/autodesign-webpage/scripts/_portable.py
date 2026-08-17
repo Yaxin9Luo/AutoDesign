@@ -2883,7 +2883,9 @@ def _blocked_source_reference_bindings(
         or sha256_file(visuals_path) != digest
     ):
         raise IntegrityError("blocked source visual binding is stale")
-    reconstructed = _style_reference_bindings_from_visuals(_load_visuals(run))
+    visuals = _load_visuals(run)
+    _verify_source_visual_files(run, visuals)
+    reconstructed = _style_reference_bindings_from_visuals(visuals)
     persisted = manifest.get("reference_images")
     if persisted is not None and persisted != reconstructed:
         raise IntegrityError("blocked source reference request binding is stale")
@@ -4298,6 +4300,19 @@ def _verify_style_reference_registry(
         raise IntegrityError("style reference registry is not an exact set")
 
 
+def _verify_source_visual_files(run: Path, visuals: Mapping[str, Any]) -> None:
+    _verify_style_reference_registry(run, visuals)
+    for visual in visuals.get("visuals", []):
+        if not isinstance(visual, Mapping):
+            raise IntegrityError("source visual entry must be an object")
+        relative = visual.get("path")
+        if not isinstance(relative, str):
+            raise IntegrityError("visual contract has no path")
+        path = safe_path(run / "evidence", relative, must_exist=True)
+        if sha256_file(path) != visual.get("sha256"):
+            raise IntegrityError(f"source visual hash mismatch: {visual.get('id')}")
+
+
 def _verify_source_contract(run: Path, state: Mapping[str, Any]) -> dict[str, Any]:
     manifest_path = run / "evidence" / "source_manifest.json"
     if sha256_file(manifest_path) != state.get("source_manifest_sha256"):
@@ -4318,7 +4333,7 @@ def _verify_source_contract(run: Path, state: Mapping[str, Any]) -> dict[str, An
         if sha256_file(visuals_path) != source_visuals_sha256:
             raise IntegrityError("source contract hash mismatch: source_visuals_sha256")
         visuals = _load_visuals(run)
-        _verify_style_reference_registry(run, visuals)
+        _verify_source_visual_files(run, visuals)
         persisted_references = manifest.get("reference_images")
         if (
             persisted_references is not None
@@ -4355,15 +4370,9 @@ def _verify_source_contract(run: Path, state: Mapping[str, Any]) -> dict[str, An
             if page.parent != pages_root or sha256_file(page) != digest:
                 raise IntegrityError(f"PDF rendered page hash mismatch: {relative}")
     load_evidence(run)
-    visuals = visuals or _load_visuals(run)
-    _verify_style_reference_registry(run, visuals)
-    for visual in visuals["visuals"]:
-        relative = visual.get("path")
-        if not isinstance(relative, str):
-            raise IntegrityError("visual contract has no path")
-        path = safe_path(run / "evidence", relative, must_exist=True)
-        if sha256_file(path) != visual.get("sha256"):
-            raise IntegrityError(f"source visual hash mismatch: {visual.get('id')}")
+    if visuals is None:
+        visuals = _load_visuals(run)
+        _verify_source_visual_files(run, visuals)
     _verify_vlm_history(run, manifest, visuals)
     return manifest
 
