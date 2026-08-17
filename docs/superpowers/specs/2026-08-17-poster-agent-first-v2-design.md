@@ -164,6 +164,12 @@ CSS, and any other mutation path are excluded.
 New Agent-first runs use run format version 2. Version-1 runs are never silently
 migrated or mutated by v2 code.
 
+Run format 2 is an explicit initialization opt-in. The shared portable core is
+vendored into all four Skill packages, but its default initialization behavior
+remains version 1 until an artifact harness opts in. In this iteration only
+`autodesign-poster` requests version 2; PPT, Webpage, and Video retain their
+released version-1 behavior and tests.
+
 ```text
 RUN/
   input/
