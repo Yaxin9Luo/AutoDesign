@@ -815,6 +815,97 @@ elif name == "pdfimages":
         with self.assertRaises(core.PathSafetyError):
             self._initialize(run, run_format_version=2)
 
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "FIFO creation is unavailable")
+    def test_v2_initialization_quarantines_a_promotion_boundary_mutation(self) -> None:
+        run = self.root / "runs" / "init-promotion-mutation"
+        stage = run.parent / f".{run.name}.v2-init-staging"
+        real_replace = os.replace
+        injected = False
+
+        def replace_with_late_fifo(source: object, target: object) -> None:
+            nonlocal injected
+            if Path(source) == stage and Path(target) == run and not injected:
+                injected = True
+                os.mkfifo(stage / "late.pipe")
+            real_replace(source, target)
+
+        with mock.patch.object(core.os, "replace", side_effect=replace_with_late_fifo):
+            with self.assertRaises(core.PathSafetyError):
+                self._initialize(run, run_format_version=2)
+
+        self.assertTrue(injected)
+        self.assertFalse(run.exists())
+        quarantines = list(
+            run.parent.glob(f".{run.name}.v2-init-quarantine-*")
+        )
+        self.assertEqual(len(quarantines), 1)
+        self.assertTrue((quarantines[0] / "late.pipe").exists())
+
+        state = self._initialize(run, run_format_version=2)
+
+        self.assertEqual(state["state"], "initialized")
+        self.assertTrue((run / ".initialization-seal.json").is_file())
+        self.assertEqual(
+            sum(event.get("event") == "run_initialized" for event in _events(run)),
+            1,
+        )
+
+    def test_v2_initialization_drift_does_not_quarantine_a_safe_live_run(self) -> None:
+        run = self.root / "runs" / "init-installed-drift"
+        self._initialize(run, run_format_version=2)
+        (self.skill / "scripts" / "tool.py").write_text(
+            "VALUE = 2\n", encoding="utf-8"
+        )
+
+        with self.assertRaises(core.IntegrityError):
+            self._initialize(run, run_format_version=2)
+
+        self.assertTrue(run.is_dir())
+        self.assertEqual(
+            list(run.parent.glob(f".{run.name}.v2-init-quarantine-*")),
+            [],
+        )
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "FIFO creation is unavailable")
+    def test_v2_initialization_never_overwrites_a_conflicting_quarantine(self) -> None:
+        run = self.root / "runs" / "init-quarantine-conflict"
+        stage = run.parent / f".{run.name}.v2-init-staging"
+        real_replace = os.replace
+        quarantine: Path | None = None
+
+        def replace_with_conflict(source: object, target: object) -> None:
+            nonlocal quarantine
+            if Path(source) == stage and Path(target) == run and quarantine is None:
+                seal = json.loads(
+                    (stage / ".initialization-seal.json").read_text(encoding="utf-8")
+                )
+                quarantine = run.parent / (
+                    f".{run.name}.v2-init-quarantine-{seal['generation_id']}"
+                )
+                quarantine.mkdir()
+                (quarantine / "owner.txt").write_text("do not overwrite\n", encoding="utf-8")
+                os.mkfifo(stage / "late.pipe")
+            real_replace(source, target)
+
+        with mock.patch.object(core.os, "replace", side_effect=replace_with_conflict):
+            with self.assertRaises(core.IntegrityError):
+                self._initialize(run, run_format_version=2)
+
+        self.assertIsNotNone(quarantine)
+        assert quarantine is not None
+        self.assertEqual(
+            (quarantine / "owner.txt").read_text(encoding="utf-8"),
+            "do not overwrite\n",
+        )
+        with self.assertRaises(core.PathSafetyError):
+            core.inspect_source(run)
+        with self.assertRaises(core.PathSafetyError):
+            self._initialize(run, run_format_version=2)
+        self.assertFalse(run.exists())
+
+        state = self._initialize(run, run_format_version=2)
+        self.assertEqual(state["state"], "initialized")
+
     def test_v2_source_staging_rejects_a_nonexact_file_set(self) -> None:
         source_run = self.root / "runs" / "source-stage-extra"
         self._initialize(source_run, run_format_version=2)
@@ -872,6 +963,119 @@ elif name == "pdfimages":
             sum(event.get("event") == "source_prepared" for event in _events(run)),
             1,
         )
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "FIFO creation is unavailable")
+    def test_v2_source_empty_stage_late_mutation_blocks_cleanup_and_commit(self) -> None:
+        run = self.root / "runs" / "source-empty-stage-late-mutation"
+        self._initialize(run, run_format_version=2)
+        source = self.root / "source-empty-stage-late-mutation.md"
+        source.write_text("# Do not commit after unsafe cleanup\n", encoding="utf-8")
+        stage = run / ".source-prep-staging"
+        stage.mkdir()
+        real_rmdir = Path.rmdir
+        injected = False
+
+        def rmdir_with_late_fifo(path: Path) -> None:
+            nonlocal injected
+            if path == stage and not injected:
+                injected = True
+                os.mkfifo(stage / "late.pipe")
+            real_rmdir(path)
+
+        with mock.patch.object(Path, "rmdir", new=rmdir_with_late_fifo):
+            with self.assertRaises(core.PathSafetyError):
+                core.prepare_source(run, source)
+
+        self.assertTrue(injected)
+        self.assertTrue((stage / "late.pipe").exists())
+        self.assertEqual(
+            json.loads((run / "run.json").read_text(encoding="utf-8"))["state"],
+            "initialized",
+        )
+        self.assertFalse((run / "input" / "source.md").exists())
+        self.assertEqual(
+            sum(event.get("event") == "source_prepared" for event in _events(run)),
+            0,
+        )
+
+    def test_v2_source_partial_seed_crash_recovers_exactly_once(self) -> None:
+        run = self.root / "runs" / "source-partial-seed-crash"
+        self._initialize(run, run_format_version=2)
+        source = self.root / "source-partial-seed-crash.md"
+        source.write_text("# Recover a legitimate partial seed\n", encoding="utf-8")
+
+        with self.assertRaises(core.SimulatedCrash):
+            core.prepare_source(run, source, fail_at="after_source_seed_input")
+        stage = run / ".source-prep-staging"
+        self.assertTrue((stage / "input" / "source.md").is_file())
+        self.assertFalse((stage / "transaction.json").exists())
+
+        manifest = core.prepare_source(run, source)
+
+        self.assertEqual(manifest["status"], "ready")
+        self.assertFalse(stage.exists())
+        self.assertEqual(
+            sum(event.get("event") == "source_prepared" for event in _events(run)),
+            1,
+        )
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "FIFO creation is unavailable")
+    def test_v2_source_partial_stage_late_mutation_is_quarantined(self) -> None:
+        run = self.root / "runs" / "source-partial-stage-late-mutation"
+        self._initialize(run, run_format_version=2)
+        source = self.root / "source-partial-stage-late-mutation.md"
+        source.write_text("# Quarantine a changed partial seed\n", encoding="utf-8")
+        with self.assertRaises(core.SimulatedCrash):
+            core.prepare_source(run, source, fail_at="after_source_seed_input")
+        stage = run / ".source-prep-staging"
+        real_replace = os.replace
+        injected = False
+
+        def replace_with_late_fifo(source_path: object, target: object) -> None:
+            nonlocal injected
+            target_path = Path(target)
+            if (
+                Path(source_path) == stage
+                and target_path.parent == run
+                and target_path.name.startswith(".source-prep-quarantine-")
+                and not injected
+            ):
+                injected = True
+                os.mkfifo(stage / "late.pipe")
+            real_replace(source_path, target)
+
+        with mock.patch.object(core.os, "replace", side_effect=replace_with_late_fifo):
+            with self.assertRaises(core.PathSafetyError):
+                core.prepare_source(run, source)
+
+        self.assertTrue(injected)
+        self.assertFalse(stage.exists())
+        quarantines = list(run.glob(".source-prep-quarantine-*"))
+        self.assertEqual(len(quarantines), 1)
+        self.assertTrue((quarantines[0] / "late.pipe").exists())
+        self.assertEqual(
+            json.loads((run / "run.json").read_text(encoding="utf-8"))["state"],
+            "initialized",
+        )
+        self.assertEqual(
+            sum(event.get("event") == "source_prepared" for event in _events(run)),
+            0,
+        )
+
+    def test_v2_source_partial_stage_is_bound_to_the_original_request(self) -> None:
+        run = self.root / "runs" / "source-partial-stage-request-binding"
+        self._initialize(run, run_format_version=2)
+        source = self.root / "source-partial-stage-request-binding.md"
+        source.write_text("# Original request\n", encoding="utf-8")
+        with self.assertRaises(core.SimulatedCrash):
+            core.prepare_source(run, source, fail_at="after_source_seed_input")
+        source.write_text("# Changed request\n", encoding="utf-8")
+        before = _tree_snapshot(run)
+
+        with self.assertRaises(core.IntegrityError):
+            core.prepare_source(run, source)
+
+        self.assertEqual(_tree_snapshot(run), before)
 
     @unittest.skipUnless(hasattr(os, "mkfifo"), "FIFO creation is unavailable")
     def test_v2_source_incomplete_staging_rejects_special_entries(self) -> None:
@@ -1000,6 +1204,76 @@ elif name == "pdfimages":
         symlink.symlink_to(valid)
         with self.assertRaises(core.PathSafetyError):
             core._png_dimensions(symlink)
+
+    def test_v2_tree_inventory_uses_fresh_metadata_on_windows(self) -> None:
+        tree = self.root / "windows-like-inventory"
+        tree.mkdir()
+        (tree / "file.txt").write_text("single link\n", encoding="utf-8")
+        real_scandir = os.scandir
+
+        class WindowsLikeEntry:
+            def __init__(self, entry: os.DirEntry[str]) -> None:
+                self.name = entry.name
+                self._entry = entry
+
+            def stat(self, *, follow_symlinks: bool = True) -> object:
+                details = self._entry.stat(follow_symlinks=follow_symlinks)
+                return mock.Mock(
+                    st_mode=details.st_mode,
+                    st_dev=0,
+                    st_ino=0,
+                    st_nlink=0,
+                )
+
+        def windows_like_scandir(path: object) -> list[WindowsLikeEntry]:
+            return [WindowsLikeEntry(entry) for entry in real_scandir(path)]
+
+        with mock.patch.object(core.os, "scandir", side_effect=windows_like_scandir):
+            files, directories = core._regular_tree_inventory(tree)
+
+        self.assertEqual(files, {"file.txt"})
+        self.assertEqual(directories, set())
+
+    def test_v2_tree_inventory_rejects_links_and_windows_reparse_entries(self) -> None:
+        hardlink_tree = self.root / "inventory-hardlink"
+        hardlink_tree.mkdir()
+        original = hardlink_tree / "original.txt"
+        original.write_text("two links\n", encoding="utf-8")
+        os.link(original, hardlink_tree / "second.txt")
+        with self.assertRaises(core.PathSafetyError):
+            core._regular_tree_inventory(hardlink_tree)
+
+        symlink_tree = self.root / "inventory-symlink"
+        symlink_tree.mkdir()
+        target = symlink_tree / "target.txt"
+        target.write_text("target\n", encoding="utf-8")
+        (symlink_tree / "alias.txt").symlink_to(target)
+        with self.assertRaises(core.PathSafetyError):
+            core._regular_tree_inventory(symlink_tree)
+
+        reparse_tree = self.root / "inventory-reparse"
+        reparse_tree.mkdir()
+        reparse = reparse_tree / "junction-like"
+        reparse.mkdir()
+        real_stat = os.stat
+
+        def windows_reparse_stat(
+            path: object, *, follow_symlinks: bool = True
+        ) -> object:
+            details = real_stat(path, follow_symlinks=follow_symlinks)
+            if Path(path) == reparse:
+                return mock.Mock(
+                    st_mode=details.st_mode,
+                    st_dev=details.st_dev,
+                    st_ino=details.st_ino,
+                    st_nlink=details.st_nlink,
+                    st_file_attributes=0x400,
+                )
+            return details
+
+        with mock.patch.object(core.os, "stat", side_effect=windows_reparse_stat):
+            with self.assertRaises(core.PathSafetyError):
+                core._regular_tree_inventory(reparse_tree)
 
 
 if __name__ == "__main__":

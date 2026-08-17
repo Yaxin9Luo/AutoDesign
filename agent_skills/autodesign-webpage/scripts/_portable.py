@@ -16,6 +16,7 @@ import json
 import math
 import os
 import re
+import secrets
 import shutil
 import struct
 import subprocess
@@ -27,7 +28,7 @@ from collections import Counter
 from contextlib import contextmanager
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from stat import S_ISDIR, S_ISLNK, S_ISREG
+from stat import S_IFMT, S_ISDIR, S_ISLNK, S_ISREG
 from typing import Any, Iterable, Iterator, Mapping, Sequence
 
 
@@ -541,7 +542,11 @@ def _regular_tree_inventory(path: Path) -> tuple[set[str], set[str]]:
         root_details = path.lstat()
     except OSError as error:
         raise PathSafetyError(f"unsafe staging directory: {path}") from error
-    if S_ISLNK(root_details.st_mode) or not S_ISDIR(root_details.st_mode):
+    if (
+        S_ISLNK(root_details.st_mode)
+        or not S_ISDIR(root_details.st_mode)
+        or getattr(root_details, "st_file_attributes", 0) & 0x400
+    ):
         raise PathSafetyError(f"unsafe staging directory: {path}")
     files: set[str] = set()
     directories: set[str] = set()
@@ -555,11 +560,23 @@ def _regular_tree_inventory(path: Path) -> tuple[set[str], set[str]]:
         for entry in entries:
             child = current / entry.name
             try:
-                details = entry.stat(follow_symlinks=False)
+                cached = entry.stat(follow_symlinks=False)
+                details = os.stat(child, follow_symlinks=False)
             except OSError as error:
                 raise PathSafetyError(f"unsafe staging entry: {child}") from error
             relative = child.relative_to(path).as_posix()
-            if S_ISLNK(details.st_mode):
+            if S_IFMT(cached.st_mode) != S_IFMT(details.st_mode):
+                raise PathSafetyError(f"staging entry type changed: {child}")
+            if (
+                cached.st_dev
+                and cached.st_ino
+                and (cached.st_dev, cached.st_ino) != (details.st_dev, details.st_ino)
+            ):
+                raise PathSafetyError(f"staging entry identity changed: {child}")
+            if (
+                S_ISLNK(details.st_mode)
+                or getattr(details, "st_file_attributes", 0) & 0x400
+            ):
                 raise PathSafetyError(f"unsafe staging symlink: {child}")
             if S_ISDIR(details.st_mode):
                 directories.add(relative)
@@ -576,6 +593,18 @@ def _regular_tree_inventory(path: Path) -> tuple[set[str], set[str]]:
 def _remove_regular_tree(path: Path) -> None:
     _regular_tree_inventory(path)
     shutil.rmtree(path)
+
+
+def _unused_sibling(parent: Path, prefix: str) -> Path:
+    for _attempt in range(16):
+        candidate = parent / f"{prefix}-{secrets.token_hex(16)}"
+        try:
+            candidate.lstat()
+        except FileNotFoundError:
+            return candidate
+        except OSError as error:
+            raise PathSafetyError(f"cannot inspect quarantine path: {candidate}") from error
+    raise IntegrityError(f"cannot allocate an unused quarantine path beneath {parent}")
 
 
 def _read_event_log(path: Path) -> list[dict[str, Any]]:
@@ -627,6 +656,51 @@ _AGENT_FIRST_INITIAL_DIRECTORIES = (
     "curations",
     "plans",
 )
+_INITIALIZATION_SEAL = ".initialization-seal.json"
+
+
+def _initialization_seal_payload(
+    run: Path,
+    *,
+    generation_id: str,
+) -> dict[str, Any]:
+    files, directories = _regular_tree_inventory(run)
+    files.discard(_INITIALIZATION_SEAL)
+    return {
+        "format_version": FORMAT_VERSION,
+        "generation_id": generation_id,
+        "directories": sorted(directories),
+        "files": [
+            {"path": relative, "sha256": sha256_file(run / relative)}
+            for relative in sorted(files)
+        ],
+    }
+
+
+def _seal_agent_first_initialization(run: Path) -> dict[str, Any]:
+    seal_path = run / _INITIALIZATION_SEAL
+    if seal_path.exists() or seal_path.is_symlink():
+        return _validate_agent_first_initialization_seal(run)
+    seal = _initialization_seal_payload(run, generation_id=secrets.token_hex(16))
+    atomic_write_json(seal_path, seal)
+    return _validate_agent_first_initialization_seal(run)
+
+
+def _validate_agent_first_initialization_seal(run: Path) -> dict[str, Any]:
+    seal_path = run / _INITIALIZATION_SEAL
+    seal = _read_json(seal_path)
+    if seal_path.read_bytes() != _stored_json_bytes(seal):
+        raise IntegrityError("Agent-first initialization seal is not canonical JSON")
+    generation_id = seal.get("generation_id")
+    if (
+        set(seal) != {"format_version", "generation_id", "directories", "files"}
+        or seal.get("format_version") != FORMAT_VERSION
+        or not isinstance(generation_id, str)
+        or re.fullmatch(r"[0-9a-f]{32}", generation_id) is None
+        or seal != _initialization_seal_payload(run, generation_id=generation_id)
+    ):
+        raise IntegrityError("Agent-first initialization seal does not match its tree")
+    return seal
 
 
 def _populate_agent_first_run(
@@ -687,12 +761,17 @@ def _validate_agent_first_initialization(
     *,
     release_version: str,
     archive_sha256: str | None,
+    require_seal: bool | None = None,
+    validate_request: bool = True,
+    validate_installed_skill: bool = True,
 ) -> dict[str, Any]:
     run, state = _load_agent_first_run(run)
-    manifest = verify_skill_snapshot(run, skill_root=skill)
-    if manifest.get("release_version") != release_version:
+    manifest = verify_skill_snapshot(
+        run, skill_root=skill if validate_installed_skill else None
+    )
+    if validate_request and manifest.get("release_version") != release_version:
         raise IntegrityError("requested release version differs from the run snapshot")
-    if manifest.get("archive_sha256") != archive_sha256:
+    if validate_request and manifest.get("archive_sha256") != archive_sha256:
         raise IntegrityError("requested archive hash differs from the run snapshot")
     expected = _agent_first_initial_state(run)
     if state != expected:
@@ -722,6 +801,13 @@ def _validate_agent_first_initialization(
         ),
     }
     actual_files, actual_directories = _regular_tree_inventory(run)
+    has_seal = _INITIALIZATION_SEAL in actual_files
+    if require_seal is True and not has_seal:
+        raise IntegrityError("Agent-first initialization seal is missing")
+    if require_seal is False and has_seal:
+        raise IntegrityError("Agent-first initialization was sealed too early")
+    if has_seal:
+        expected_files.add(_INITIALIZATION_SEAL)
     if actual_files != expected_files:
         raise IntegrityError("Agent-first initialization staging file set is not exact")
     expected_directories: set[str] = set(_AGENT_FIRST_INITIAL_DIRECTORIES)
@@ -734,6 +820,63 @@ def _validate_agent_first_initialization(
         raise IntegrityError(
             "Agent-first initialization staging directory set is not exact"
         )
+    if has_seal:
+        _validate_agent_first_initialization_seal(run)
+    return state
+
+
+def _promote_agent_first_initialization(
+    stage: Path,
+    run: Path,
+    skill: Path,
+    *,
+    release_version: str,
+    archive_sha256: str | None,
+    fail_at: str | None,
+) -> dict[str, Any]:
+    seal = _seal_agent_first_initialization(stage)
+    state = _validate_agent_first_initialization(
+        stage,
+        skill,
+        release_version=release_version,
+        archive_sha256=archive_sha256,
+        require_seal=True,
+    )
+    events = _read_event_log(stage / "events.jsonl")
+    if events != [{"event": "run_initialized", "state": "initialized"}]:
+        raise IntegrityError("Agent-first initialization event is not exact-once")
+    quarantine = run.parent / (
+        f".{run.name}.v2-init-quarantine-{seal['generation_id']}"
+    )
+    if quarantine.exists() or quarantine.is_symlink():
+        raise IntegrityError(f"conflicting initialization quarantine: {quarantine}")
+    os.replace(stage, run)
+    _fsync_directory(run.parent)
+    try:
+        state = _validate_agent_first_initialization(
+            run,
+            skill,
+            release_version=release_version,
+            archive_sha256=archive_sha256,
+            require_seal=True,
+        )
+        if _read_event_log(run / "events.jsonl") != events:
+            raise IntegrityError("promoted initialization event log changed")
+    except Exception:
+        if quarantine.exists() or quarantine.is_symlink():
+            raise IntegrityError(
+                f"conflicting initialization quarantine: {quarantine}"
+            )
+        try:
+            os.replace(run, quarantine)
+            _fsync_directory(run.parent)
+        except OSError as error:
+            raise PathSafetyError(
+                "unsafe promoted initialization could not be quarantined"
+            ) from error
+        raise
+    if fail_at == "after_init_promotion":
+        raise SimulatedCrash("after Agent-first initialization promotion")
     return state
 
 
@@ -756,6 +899,45 @@ def _initialize_agent_first_run(
         if run.exists():
             if not run.is_dir():
                 raise PathSafetyError(f"run path must be a directory: {run}")
+            preview = _read_json(run / "run.json")
+            if preview.get("state") == "initialized":
+                try:
+                    state = _validate_agent_first_initialization(
+                        run,
+                        skill,
+                        release_version=release_version,
+                        archive_sha256=archive_sha256,
+                        require_seal=True,
+                        validate_request=False,
+                        validate_installed_skill=False,
+                    )
+                except Exception:
+                    quarantine = _unused_sibling(
+                        run.parent, f".{run.name}.v2-init-quarantine"
+                    )
+                    try:
+                        os.replace(run, quarantine)
+                        _fsync_directory(run.parent)
+                    except OSError as error:
+                        raise PathSafetyError(
+                            "unsafe live initialization could not be quarantined"
+                        ) from error
+                    raise
+                manifest = verify_skill_snapshot(run, skill_root=skill)
+                if manifest.get("release_version") != release_version:
+                    raise IntegrityError(
+                        "requested release version differs from the run snapshot"
+                    )
+                if manifest.get("archive_sha256") != archive_sha256:
+                    raise IntegrityError(
+                        "requested archive hash differs from the run snapshot"
+                    )
+                events = _read_event_log(run / "events.jsonl")
+                if events != [{"event": "run_initialized", "state": "initialized"}]:
+                    raise IntegrityError(
+                        "Agent-first initialization event is not exact-once"
+                    )
+                return state
             run, state = _load_agent_first_run(run)
             manifest = verify_skill_snapshot(run, skill_root=skill)
             if manifest.get("release_version") != release_version:
@@ -781,6 +963,7 @@ def _initialize_agent_first_run(
                     skill,
                     release_version=release_version,
                     archive_sha256=archive_sha256,
+                    require_seal=None,
                 )
                 events = _read_event_log(stage / "events.jsonl")
                 if events not in ([], [{"event": "run_initialized", "state": "initialized"}]):
@@ -789,11 +972,14 @@ def _initialize_agent_first_run(
                     _event(stage, "run_initialized", state="initialized")
                 if fail_at == "after_init_event_append":
                     raise SimulatedCrash("after Agent-first initialization event append")
-                os.replace(stage, run)
-                _fsync_directory(run.parent)
-                if fail_at == "after_init_promotion":
-                    raise SimulatedCrash("after Agent-first initialization promotion")
-                return state
+                return _promote_agent_first_initialization(
+                    stage,
+                    run,
+                    skill,
+                    release_version=release_version,
+                    archive_sha256=archive_sha256,
+                    fail_at=fail_at,
+                )
         _populate_agent_first_run(
             stage,
             skill,
@@ -806,15 +992,19 @@ def _initialize_agent_first_run(
             skill,
             release_version=release_version,
             archive_sha256=archive_sha256,
+            require_seal=False,
         )
         _event(stage, "run_initialized", state="initialized")
         if fail_at == "after_init_event_append":
             raise SimulatedCrash("after Agent-first initialization event append")
-        os.replace(stage, run)
-        _fsync_directory(run.parent)
-        if fail_at == "after_init_promotion":
-            raise SimulatedCrash("after Agent-first initialization promotion")
-        return state
+        return _promote_agent_first_initialization(
+            stage,
+            run,
+            skill,
+            release_version=release_version,
+            archive_sha256=archive_sha256,
+            fail_at=fail_at,
+        )
 
 
 def initialize_run(
@@ -1790,11 +1980,22 @@ _SOURCE_STAGE_DIRECTORIES = {
     "evidence/assets",
     "evidence/reference_images",
 }
+_SOURCE_SEED_CLAIM = "source-seed-claim.json"
+_SOURCE_SEED_CLAIM_KEYS = {
+    "format_version",
+    "operation",
+    "generation_id",
+    "previous_run_sha256",
+    "previous_source_manifest_sha256",
+    "source_sha256",
+    "source_suffix",
+    "claim_sha256",
+}
 
 
 def _source_pretransaction_file_is_expected(relative: str) -> bool:
     return (
-        relative in {"run.json", "events.jsonl"}
+        relative in {"run.json", "events.jsonl", _SOURCE_SEED_CLAIM}
         or relative in _SOURCE_SINGLE_FILES
         or re.fullmatch(r"input/source(?:\.md|\.markdown|\.txt|\.pdf)", relative)
         is not None
@@ -1803,14 +2004,108 @@ def _source_pretransaction_file_is_expected(relative: str) -> bool:
     )
 
 
-def _discard_incomplete_source_stage(stage: Path) -> None:
+def _source_seed_claim(
+    run: Path,
+    state: Mapping[str, Any],
+    source: Path,
+) -> dict[str, Any]:
+    claim: dict[str, Any] = {
+        "format_version": FORMAT_VERSION,
+        "operation": "prepare_source_seed",
+        "generation_id": secrets.token_hex(16),
+        "previous_run_sha256": sha256_file(run / "run.json"),
+        "previous_source_manifest_sha256": state["source_manifest_sha256"],
+        "source_sha256": sha256_file(source),
+        "source_suffix": source.suffix.lower(),
+    }
+    claim["claim_sha256"] = _canonical_hash(claim)
+    return claim
+
+
+def _validate_source_seed_claim(
+    stage: Path,
+    source: Path,
+    *,
+    previous_run_sha256: str,
+    previous_source_manifest_sha256: str,
+) -> dict[str, Any]:
+    claim_path = stage / _SOURCE_SEED_CLAIM
+    claim = _read_json(claim_path)
+    if claim_path.read_bytes() != _stored_json_bytes(claim):
+        raise IntegrityError("source seed claim is not canonical JSON")
+    unsigned = dict(claim)
+    stored_hash = unsigned.pop("claim_sha256", None)
+    generation_id = claim.get("generation_id")
+    if (
+        set(claim) != _SOURCE_SEED_CLAIM_KEYS
+        or claim.get("format_version") != FORMAT_VERSION
+        or claim.get("operation") != "prepare_source_seed"
+        or not isinstance(generation_id, str)
+        or re.fullmatch(r"[0-9a-f]{32}", generation_id) is None
+        or not isinstance(stored_hash, str)
+        or stored_hash != _canonical_hash(unsigned)
+        or claim.get("previous_run_sha256") != previous_run_sha256
+        or claim.get("previous_source_manifest_sha256")
+        != previous_source_manifest_sha256
+        or claim.get("source_suffix") != source.suffix.lower()
+        or claim.get("source_sha256") != sha256_file(source)
+    ):
+        raise IntegrityError("source seed claim does not match its request")
+    return claim
+
+
+def _discard_incomplete_source_stage(
+    run: Path,
+    state: Mapping[str, Any],
+    stage: Path,
+    source: Path,
+) -> None:
     files, directories = _regular_tree_inventory(stage)
+    if not files and not directories:
+        try:
+            stage.rmdir()
+            _fsync_directory(run)
+        except OSError as error:
+            raise PathSafetyError(
+                "empty source staging directory changed before removal"
+            ) from error
+        return
+    if _SOURCE_SEED_CLAIM not in files:
+        raise IntegrityError("incomplete source staging tree has no seed claim")
+    claim = _validate_source_seed_claim(
+        stage,
+        source,
+        previous_run_sha256=sha256_file(run / "run.json"),
+        previous_source_manifest_sha256=state["source_manifest_sha256"],
+    )
     unexpected_files = {
         relative for relative in files if not _source_pretransaction_file_is_expected(relative)
     }
     if unexpected_files or not directories.issubset(_SOURCE_STAGE_DIRECTORIES):
         raise IntegrityError("incomplete source staging tree is not process-owned")
-    _remove_regular_tree(stage)
+    quarantine = run / f".source-prep-quarantine-{claim['generation_id']}"
+    if quarantine.exists() or quarantine.is_symlink():
+        raise IntegrityError(f"conflicting source staging quarantine: {quarantine}")
+    os.replace(stage, quarantine)
+    _fsync_directory(run)
+    quarantined_files, quarantined_directories = _regular_tree_inventory(quarantine)
+    _validate_source_seed_claim(
+        quarantine,
+        source,
+        previous_run_sha256=sha256_file(run / "run.json"),
+        previous_source_manifest_sha256=state["source_manifest_sha256"],
+    )
+    unexpected_files = {
+        relative
+        for relative in quarantined_files
+        if not _source_pretransaction_file_is_expected(relative)
+    }
+    if (
+        unexpected_files
+        or not quarantined_directories.issubset(_SOURCE_STAGE_DIRECTORIES)
+    ):
+        raise IntegrityError("quarantined source staging tree changed before cleanup")
+    _remove_regular_tree(quarantine)
 
 
 def _source_stage_files(stage: Path) -> dict[str, str]:
@@ -1834,12 +2129,14 @@ def _seed_source_stage(
     run: Path,
     state: Mapping[str, Any],
     stage: Path,
+    source: Path,
     *,
     fail_at: str | None,
 ) -> None:
     stage.mkdir()
     if fail_at == "after_source_stage_mkdir":
         raise SimulatedCrash("after source staging directory creation")
+    atomic_write_json(stage / _SOURCE_SEED_CLAIM, _source_seed_claim(run, state, source))
     for relative in (
         "input",
         "evidence/pages",
@@ -1851,6 +2148,8 @@ def _seed_source_stage(
         if source.is_symlink() or not source.is_file() or source.stat().st_nlink != 1:
             raise PathSafetyError(f"unsafe Agent-first source input: {source}")
         atomic_write_bytes(stage / "input" / source.name, source.read_bytes())
+    if fail_at == "after_source_seed_input":
+        raise SimulatedCrash("after source staging input seed")
     for relative in (
         "evidence/source_manifest.json",
         "evidence/evidence.jsonl",
@@ -1870,6 +2169,14 @@ def _create_source_transaction(
     previous_state: Mapping[str, Any],
     previous_events: Sequence[Mapping[str, Any]],
 ) -> dict[str, Any]:
+    _validate_source_seed_claim(
+        stage,
+        source,
+        previous_run_sha256=sha256_file(run / "run.json"),
+        previous_source_manifest_sha256=previous_state[
+            "source_manifest_sha256"
+        ],
+    )
     staged_events = _read_event_log(stage / "events.jsonl")
     previous = [dict(event) for event in previous_events]
     if staged_events[: len(previous)] != previous:
@@ -1920,6 +2227,14 @@ def _validate_source_transaction(
         or transaction.get("source_sha256") != sha256_file(source)
     ):
         raise IntegrityError("source transaction request binding mismatch")
+    _validate_source_seed_claim(
+        stage,
+        source,
+        previous_run_sha256=transaction["previous_run_sha256"],
+        previous_source_manifest_sha256=transaction[
+            "previous_source_manifest_sha256"
+        ],
+    )
     files = transaction.get("files")
     if not isinstance(files, dict) or files != _source_stage_files(stage):
         raise IntegrityError("source transaction staged file set mismatch")
@@ -1930,6 +2245,7 @@ def _validate_source_transaction(
         *files,
         "run.json",
         "events.jsonl",
+        _SOURCE_SEED_CLAIM,
         "transaction.json",
     }
     if actual_stage_files != expected_stage_files:
@@ -2073,7 +2389,7 @@ def _prepare_source_v2_transaction(
         staged_files, _staged_directories = _regular_tree_inventory(stage)
         if "transaction.json" in staged_files:
             return _commit_source_transaction(run, stage, source, fail_at=fail_at)
-        _discard_incomplete_source_stage(stage)
+        _discard_incomplete_source_stage(run, state, stage, source)
     manifest_path = run / "evidence" / "source_manifest.json"
     if sha256_file(manifest_path) != state.get("source_manifest_sha256"):
         raise IntegrityError("source manifest hash mismatch")
@@ -2101,7 +2417,7 @@ def _prepare_source_v2_transaction(
         atomic_write_bytes(input_source, source.read_bytes())
     previous_events = _read_event_log(run / "events.jsonl")
     try:
-        _seed_source_stage(run, state, stage, fail_at=fail_at)
+        _seed_source_stage(run, state, stage, source, fail_at=fail_at)
         _prepare_source_v2(
             stage,
             dict(state),
@@ -2122,7 +2438,7 @@ def _prepare_source_v2_transaction(
         raise
     except Exception:
         if stage.exists() and not stage.is_symlink():
-            _remove_regular_tree(stage)
+            _discard_incomplete_source_stage(run, state, stage, source)
         raise
     if fail_at == "after_source_outputs_staged":
         raise SimulatedCrash("after source outputs staged")
@@ -2143,6 +2459,7 @@ def prepare_source(
     allowed_failures = {
         None,
         "after_source_stage_mkdir",
+        "after_source_seed_input",
         "after_source_outputs_staged",
         "after_source_manifest_promotion",
         "after_source_run_update",
