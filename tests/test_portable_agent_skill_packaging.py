@@ -16,7 +16,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SKILLS_ROOT = REPO_ROOT / "agent_skills"
 PACKAGER = REPO_ROOT / "scripts" / "package_agent_skills.py"
-VERSION = "0.1.0"
+VERSION = "0.2.0-rc1"
 RELEASE_TOOLS = (
     "package_agent_skills.py",
     "validate_agent_skills.py",
@@ -47,6 +47,27 @@ def _build(output_dir: Path, source_root: Path = SKILLS_ROOT) -> subprocess.Comp
         capture_output=True,
         check=False,
     )
+
+
+def _tree_hashes(root: Path) -> dict[str, str]:
+    return {
+        path.relative_to(root).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in root.rglob("*")
+        if path.is_file()
+    }
+
+
+def _make_tree_read_only(root: Path) -> None:
+    for path in sorted(root.rglob("*"), reverse=True):
+        path.chmod(0o555 if path.is_dir() else 0o444)
+    root.chmod(0o555)
+
+
+def _make_tree_removable(root: Path) -> None:
+    root.chmod(0o755)
+    for path in root.rglob("*"):
+        if path.is_dir():
+            path.chmod(0o755)
 
 
 class PortableAgentSkillPackagingTests(unittest.TestCase):
@@ -161,6 +182,152 @@ class PortableAgentSkillPackagingTests(unittest.TestCase):
                 if path.is_file()
             }
             self.assertEqual(after, before)
+
+    def test_read_only_installed_poster_runs_agent_first_lifecycle_outside_repo(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            temp = Path(temporary)
+            release_a = temp / "release-a"
+            release_b = temp / "release-b"
+            first = _build(release_a)
+            second = _build(release_b)
+            self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+            self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+            self.assertEqual(_tree_hashes(release_a), _tree_hashes(release_b))
+
+            archive = release_a / f"autodesign-poster-{VERSION}.zip"
+            checksum = release_a / f"{archive.name}.sha256"
+            destination = temp / "host-root" / "skills"
+            outside = temp / "unrelated-working-directory"
+            mutable = temp / "mutable"
+            outside.mkdir()
+            mutable.mkdir()
+            install = subprocess.run(
+                [
+                    sys.executable,
+                    "-I",
+                    str(release_a / "package_agent_skills.py"),
+                    "install",
+                    "--archive",
+                    str(archive),
+                    "--checksum",
+                    str(checksum),
+                    "--destination",
+                    str(destination),
+                ],
+                cwd=outside,
+                env={
+                    key: value
+                    for key, value in os.environ.items()
+                    if key not in {"PYTHONHOME", "PYTHONPATH"}
+                },
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(install.returncode, 0, install.stdout + install.stderr)
+            installed = destination / "autodesign-poster"
+            harness = installed / "scripts" / "poster_harness.py"
+            before = _tree_hashes(installed)
+            _make_tree_read_only(installed)
+            environment = {
+                key: value
+                for key, value in os.environ.items()
+                if key not in {"PYTHONHOME", "PYTHONPATH"}
+            }
+
+            def run_cli(*arguments: str) -> subprocess.CompletedProcess[str]:
+                return subprocess.run(
+                    [sys.executable, "-I", "-B", str(harness), *arguments],
+                    cwd=outside,
+                    env=environment,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+
+            try:
+                help_result = run_cli("--help")
+                self.assertEqual(help_result.returncode, 0, help_result.stdout + help_result.stderr)
+                self.assertIn("inspect-source", help_result.stdout)
+
+                doctor = run_cli(
+                    "doctor",
+                    "--cache-root",
+                    str(mutable / "browser-cache"),
+                )
+                self.assertEqual(doctor.returncode, 2, doctor.stdout + doctor.stderr)
+                self.assertFalse(json.loads(doctor.stdout)["ready"])
+                self.assertFalse((mutable / "browser-cache").exists())
+
+                source = mutable / "paper.md"
+                source.write_text(
+                    "# Grounded paper\n\nCentral method and primary result.\n",
+                    encoding="utf-8",
+                )
+                run = mutable / "poster-run"
+                initialized = run_cli(
+                    "init",
+                    "--run-dir",
+                    str(run),
+                    "--source",
+                    str(source),
+                    "--release-version",
+                    VERSION,
+                    "--archive-sha256",
+                    hashlib.sha256(archive.read_bytes()).hexdigest(),
+                )
+                self.assertEqual(
+                    initialized.returncode,
+                    0,
+                    initialized.stdout + initialized.stderr,
+                )
+                self.assertEqual(
+                    json.loads(initialized.stdout)["resume"]["next_action"],
+                    "inspect_source",
+                )
+
+                inspected = run_cli("inspect-source", "--run-dir", str(run))
+                self.assertEqual(inspected.returncode, 0, inspected.stdout + inspected.stderr)
+                inspection = json.loads(inspected.stdout)
+                self.assertEqual(inspection["run_format_version"], 2)
+                self.assertEqual(inspection["source"]["source_type"], "markdown")
+                self.assertEqual(inspection["pages"], [])
+
+                resumed = run_cli("resume", "--run-dir", str(run))
+                self.assertEqual(resumed.returncode, 0, resumed.stdout + resumed.stderr)
+                self.assertEqual(json.loads(resumed.stdout)["next_action"], "inspect_source")
+
+                legacy = mutable / "legacy-run"
+                legacy.mkdir()
+                (legacy / "run.json").write_text(
+                    json.dumps(
+                        {
+                            "active_attempt": None,
+                            "attempt_count": 0,
+                            "format_version": 1,
+                            "state": "initialized",
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                diagnosed = run_cli("diagnose-v1", "--run-dir", str(legacy))
+                self.assertEqual(diagnosed.returncode, 0, diagnosed.stdout + diagnosed.stderr)
+                diagnosis = json.loads(diagnosed.stdout)
+                self.assertEqual(diagnosis["mode"], "read_only")
+                self.assertEqual(diagnosis["run_format_version"], 1)
+
+                self.assertEqual(_tree_hashes(installed), before)
+                self.assertFalse(any(installed.rglob("*.pyc")))
+                self.assertFalse(any(path.name == "__pycache__" for path in installed.rglob("*")))
+                for mutable_path in (run, mutable / "browser-cache", legacy):
+                    self.assertFalse(
+                        mutable_path == installed or installed in mutable_path.parents
+                    )
+            finally:
+                _make_tree_removable(installed)
 
     def test_build_refuses_to_overwrite_an_existing_release(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

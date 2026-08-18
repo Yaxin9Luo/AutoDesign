@@ -14,6 +14,23 @@ from tests import test_autodesign_poster_skill as poster_skill_fixtures
 
 
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+POSTER_SOURCE_GUIDE = (
+    Path(__file__).resolve().parents[1]
+    / "agent_skills"
+    / "autodesign-poster"
+    / "references"
+    / "agent-first-source.md"
+)
+POSTER_REVIEW_GUIDE = POSTER_SOURCE_GUIDE.with_name("review-rubric.md")
+
+
+def _json_example_after_heading(document: str, heading: str) -> tuple[dict[str, object], str]:
+    section = document.split(heading, 1)[1]
+    fenced = section.split("```json\n", 1)[1].split("```", 1)[0]
+    value = json.loads(fenced)
+    if not isinstance(value, dict):
+        raise AssertionError(f"{heading} must contain one JSON object")
+    return value, fenced
 
 
 def _chunk(kind: bytes, payload: bytes) -> bytes:
@@ -63,6 +80,152 @@ class PosterAgentFirstV2Tests(unittest.TestCase):
         value = getattr(core, name, None)
         self.assertTrue(callable(value), f"portable core must expose {name}")
         return value
+
+    def test_documented_source_and_plan_examples_match_closed_v2_schemas(self) -> None:
+        document = POSTER_SOURCE_GUIDE.read_text(encoding="utf-8")
+        crop, crop_bytes = _json_example_after_heading(
+            document, "## Exact crop request"
+        )
+        selection, selection_bytes = _json_example_after_heading(
+            document, "## Exact source selection"
+        )
+        review, review_bytes = _json_example_after_heading(
+            document, "## Exact source review"
+        )
+        plan, plan_bytes = _json_example_after_heading(
+            document, "## Exact immutable plan"
+        )
+        harness = poster_skill_fixtures._load_harness()
+        for index, (value, encoded) in enumerate((
+            (crop, crop_bytes),
+            (selection, selection_bytes),
+            (review, review_bytes),
+            (plan, plan_bytes),
+        )):
+            self.assertEqual(
+                encoded,
+                harness.core._stored_json_bytes(value).decode("utf-8"),
+            )
+            contract_path = self.root / f"documented-source-contract-{index}.json"
+            contract_path.write_text(encoded, encoding="utf-8")
+            self.assertEqual(harness._read_canonical_json_object(contract_path), value)
+
+        self.assertEqual(
+            set(crop),
+            {
+                "run_format_version",
+                "source_sha256",
+                "page_manifest_sha256",
+                "page",
+                "page_sha256",
+                "bbox_normalized",
+                "role",
+                "claim",
+                "max_reuse",
+            },
+        )
+        self.assertEqual(set(selection), {"run_format_version", "assets", "source_story"})
+        self.assertEqual(
+            {key for item in selection["assets"] for key in item},
+            {"asset_id", "roles", "max_reuse", "importance"},
+        )
+        self.assertEqual(
+            set(review),
+            {
+                "run_format_version",
+                "source_review_context_sha256",
+                "reviewer_kind",
+                "dimension_scores",
+                "asset_findings",
+                "coverage_findings",
+                "blockers",
+                "localized_repairs",
+                "verdict",
+                "complete",
+            },
+        )
+        self.assertEqual(harness.normalize_plan(plan), plan)
+        reuse_by_asset = {
+            item["asset_id"]: item["max_reuse"] for item in selection["assets"]
+        }
+        for asset_id, maximum in reuse_by_asset.items():
+            self.assertLessEqual(
+                sum(
+                    allocation["visual_id"] == asset_id
+                    for allocation in plan["visual_allocations"]
+                ),
+                maximum,
+            )
+
+    def test_documented_repair_table_matches_poster_policy_order_exactly(self) -> None:
+        harness = poster_skill_fixtures._load_harness()
+        document = POSTER_REVIEW_GUIDE.read_text(encoding="utf-8")
+        section = document.split("## Exact repair-route table", 1)[1].split("\n## ", 1)[0]
+        rows: list[tuple[str, str]] = []
+        for line in section.splitlines():
+            fields = [field.strip().strip("`") for field in line.strip().split("|")]
+            if len(fields) == 4 and fields[1] in harness.POSTER_FINDING_MINIMUM_ROUTE:
+                rows.append((fields[1], fields[2]))
+        self.assertEqual(rows, list(harness.POSTER_FINDING_MINIMUM_ROUTE.items()))
+        self.assertIn(
+            "`layout_repair < content_replan < source_reingest`",
+            document,
+        )
+
+    def test_documented_artifact_review_and_reopen_examples_are_canonical(self) -> None:
+        document = POSTER_REVIEW_GUIDE.read_text(encoding="utf-8")
+        review, review_bytes = _json_example_after_heading(
+            document, "## Exact artifact-review schema"
+        )
+        reopen, reopen_bytes = _json_example_after_heading(
+            document, "## Exact reopen request"
+        )
+        harness = poster_skill_fixtures._load_harness()
+        for index, (value, encoded) in enumerate(
+            ((review, review_bytes), (reopen, reopen_bytes))
+        ):
+            self.assertEqual(
+                encoded,
+                harness.core._stored_json_bytes(value).decode("utf-8"),
+            )
+            contract_path = self.root / f"documented-review-contract-{index}.json"
+            contract_path.write_text(encoded, encoding="utf-8")
+            self.assertEqual(harness._read_canonical_json_object(contract_path), value)
+        self.assertEqual(
+            set(review),
+            {
+                "format_version",
+                "attempt_id",
+                "review_context_sha256",
+                "artifact_hashes",
+                "preview_hashes",
+                "reviewed_frame_ids",
+                "source_manifest_sha256",
+                "rubric_sha256",
+                "source_map_sha256",
+                "reviewer_mode",
+                "dimension_scores",
+                "blockers",
+                "localized_repairs",
+                "repair_route",
+                "route_findings",
+                "verdict",
+                "complete",
+            },
+        )
+        self.assertEqual(
+            set(reopen),
+            {
+                "run_format_version",
+                "attempt_id",
+                "semantic_review_sha256",
+                "repair_route",
+                "reason",
+                "finding_ids",
+                "expected_curation_revision",
+                "expected_plan_revision",
+            },
+        )
 
     def _fake_poppler(self, name: str) -> dict[str, Path]:
         tools_root = self.root / name

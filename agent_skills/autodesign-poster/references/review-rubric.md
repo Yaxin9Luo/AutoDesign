@@ -1,108 +1,162 @@
-# Fresh poster review rubric
+# Fresh Poster reviews and repair routes
 
-Perform this review only after deterministic validation passes. The reviewer
-must be a fresh host VLM or fresh subagent that did not author the attempt. It
-must inspect both the screen preview and PDF-raster preview listed by
-`review-context`, read the relevant source
-map and evidence, and judge the rendered poster rather than nominal HTML/CSS.
-No external judge API is required.
+There are two separate semantic reviews. Source review happens before planning
+and uses the exact schema in
+[agent-first-source.md](agent-first-source.md). Artifact review happens only
+after deterministic validation passes. Neither review may be authored by the
+Agent pass that made the decisions being reviewed.
 
-## Blockers
+## Artifact-review procedure
 
-Return a failing verdict when any of these is visible or evidenced:
+Give a fresh host VLM or fresh subagent all screen and PDF-raster frames listed
+by `review-context`, plus its exact source map, evidence, plan/catalog snapshot,
+and this rubric. Judge the rendered Poster, not nominal HTML/CSS. Inspect every
+bound frame; no external judge API is required.
 
-- the title, author, institution, claim, number, figure, table, or conclusion is
-  unsupported, wrong, or assigned to the wrong source;
-- reference content leaked into the target: wording, logo, QR code, link,
-  figure, table, claim, or recognizable identity treatment used as content;
-- a key method or result is absent, the research arc is misleading, or the
-  conclusion outruns the evidence;
-- the poster omits planned eligible source visuals, misses the required
-  method/overview or result/comparison coverage, or invokes a no-visual fallback
-  despite an eligible source figure/table;
-- a source figure/table is detached from its local source-flow readout, made an
-  unreadable thumbnail, stripped of needed axes/labels, or replaced by a native
-  reconstruction instead of preserved as evidence;
-- important text is illegible at full-poster view, overlaps, clips, or falls
-  outside the canvas; a figure loses labels/legend/axes needed to understand it;
-- the output is a sparse landing page, a wallpaper of tiny paper screenshots,
-  or a flattened poster rather than editable native structure;
-- the identity header contains anything beyond title, authors, and
-  institutions;
-- the poster cannot be presented as the planned one-page physical PDF.
+Fail when any identity, claim, number, figure, table, or conclusion is
+unsupported or wrong; reference content leaks into the target; the central
+method/result or research arc is missing or misleading; a selected source
+visual is fragmentary, wrong, unreadable, detached from its readout, or replaced
+by reconstruction; text/evidence clips, overlaps, escapes, or becomes
+illegible; the composition is a sparse landing page, screenshot wallpaper, or
+flattened image; the header contains more than title/authors/institutions; or
+the planned editable one-page physical PDF cannot be presented.
 
-## Dimension scores
+Score every dimension from 1 through 5. Use 3 for competent but improvable, 4
+for presentation-ready, and 5 only for unusually strong work:
 
-Score every dimension from 1 to 5. Use 3 for competent but clearly improvable,
-4 for presentation-ready, and 5 only for unusually strong work.
+1. `poster_impact`
+2. `information_architecture`
+3. `evidence_use`
+4. `human_effort_saved`
+5. `typography_craft`
+6. `originality_anti_template`
+7. `editability_export`
 
-1. `poster_impact`: At thumbnail distance, the research identity, main idea,
-   and decisive result are immediately recognizable. Composition feels like a
-   conference poster, not a generic dashboard or web page.
-2. `information_architecture`: Reading order is obvious; problem → method →
-   evidence → takeaway has meaningful grouping, proportional panel space, and
-   no dead zones, repeated boilerplate, or stranded bottom strips.
-3. `evidence_use`: Original figures/tables and native synthesis are correctly
-   selected, readable, source-bound, and integrated through coherent source-flow
-   units. Native readouts explain rather than replace source evidence; claims
-   stay within the paper's facts and limitations.
-4. `human_effort_saved`: The poster is substantially ready for a real author to
-   present, not merely a scaffold requiring wholesale rewriting, rearrangement,
-   or asset replacement.
-5. `typography_craft`: Type hierarchy, wrapping, line length, density, table
-   craft, alignment, rhythm, and contrast remain readable and deliberate at the
-   full board scale.
-6. `originality_anti_template`: The visual system reflects the target research
-   and any permitted style geometry without AI-slop gradients, gratuitous
-   cards, random colors, fake branding, repeated decoration, or copied reference
-   content.
-7. `editability_export`: Text, tables, and SVG labels remain native; local
-   assets are sharp and correctly cropped; preview and one-page PDF faithfully
-   represent the same poster.
+A pass requires zero blockers, all bound frames reviewed, and an average score
+of at least 3.75.
 
-A `pass` requires zero blockers and an average score of at least 3.75. Use
-`fail` for actionable quality or correctness defects. Use
-`needs_visual_review` only when the reviewer truly cannot inspect the bound
-preview; it is not a pass.
+## Exact artifact-review schema
 
-## Exact review object
-
-Copy every binding field exactly from `review-context.json`. Do not omit or add
-keys.
+Copy all binding values exactly from `review-context.json`. A pass uses
+`repair_route:null` and no route findings:
 
 ```json
 {
-  "format_version": 1,
-  "attempt_id": "01",
-  "review_context_sha256": "COPY_CONTEXT_SHA256",
-  "artifact_hashes": {},
-  "preview_hashes": {
-    "poster_pdf": "COPY_PDF_PREVIEW_SHA256",
-    "poster_screen": "COPY_SCREEN_PREVIEW_SHA256"
+  "artifact_hashes": {
+    "artifact/poster.html": "COPY_HASH",
+    "artifact/poster.pdf": "COPY_HASH",
+    "artifact/preview.png": "COPY_HASH"
   },
-  "reviewed_frame_ids": ["poster_pdf", "poster_screen"],
-  "source_manifest_sha256": "COPY_SOURCE_MANIFEST_SHA256",
-  "source_map_sha256": "COPY_SOURCE_MAP_SHA256",
-  "rubric_sha256": "COPY_RUBRIC_SHA256",
-  "reviewer_mode": "fresh_host_vlm",
+  "attempt_id": "COPY_ACTIVE_ATTEMPT_ID",
+  "blockers": [],
+  "complete": true,
   "dimension_scores": {
-    "poster_impact": 4,
-    "information_architecture": 4,
+    "editability_export": 4,
     "evidence_use": 4,
     "human_effort_saved": 4,
-    "typography_craft": 4,
+    "information_architecture": 4,
     "originality_anti_template": 4,
-    "editability_export": 4
+    "poster_impact": 4,
+    "typography_craft": 4
   },
-  "blockers": [],
+  "format_version": 1,
   "localized_repairs": [],
-  "verdict": "pass",
-  "complete": true
+  "preview_hashes": {
+    "poster_pdf": "COPY_HASH",
+    "poster_screen": "COPY_HASH"
+  },
+  "repair_route": null,
+  "review_context_sha256": "COPY_CONTEXT_SHA256",
+  "reviewed_frame_ids": [
+    "poster_pdf",
+    "poster_screen"
+  ],
+  "reviewer_mode": "fresh_subagent",
+  "route_findings": [],
+  "rubric_sha256": "COPY_RUBRIC_SHA256",
+  "source_manifest_sha256": "COPY_SOURCE_MANIFEST_SHA256",
+  "source_map_sha256": "COPY_SOURCE_MAP_SHA256",
+  "verdict": "pass"
 }
 ```
 
-`artifact_hashes`, `preview_hashes`, and `reviewed_frame_ids` must be the exact
-complete values from context. For a failed review, make each repair local and
-verifiable, for example: identify the panel, observed problem, source evidence
-to preserve, and desired visible correction. Never respond with a generic
-request to “make it more polished.”
+For a failure, `repair_route` is non-null and at least one bound blocker or route
+finding is present. Each route finding has exactly `finding_id`, `code`,
+`minimum_route`, `block_id`, and `message`. Each localized repair identifies a
+specific panel/element, observed defect, source evidence to preserve, and a
+visible testable correction. Never request only “more polish.”
+
+## Exact repair-route table
+
+Route order is `layout_repair < content_replan < source_reingest`. The chosen
+route must be at least the strongest minimum below.
+
+| Finding code | Minimum route |
+| --- | --- |
+| `dom_overflow` | `layout_repair` |
+| `dom_clipping` | `layout_repair` |
+| `dom_overlap` | `layout_repair` |
+| `dom_blank_band` | `layout_repair` |
+| `typography` | `layout_repair` |
+| `visual_balance` | `layout_repair` |
+| `narrative_hierarchy` | `content_replan` |
+| `claim_selection` | `content_replan` |
+| `section_allocation` | `content_replan` |
+| `evidence_area_mismatch` | `content_replan` |
+| `key_visual_missing` | `source_reingest` |
+| `wrong_visual` | `source_reingest` |
+| `incomplete_crop` | `source_reingest` |
+| `fragmentary_crop` | `source_reingest` |
+| `unreadable_source_visual` | `source_reingest` |
+| `caption_claim_mismatch` | `source_reingest` |
+| `poster-dom-root-overflow` | `layout_repair` |
+| `poster-dom-text-clipping` | `layout_repair` |
+| `poster-dom-text-overlap` | `layout_repair` |
+| `poster-dom-viewport-escape` | `layout_repair` |
+| `poster-dom-blank-band` | `layout_repair` |
+| `poster-dom-sparse-oversized-panel` | `layout_repair` |
+| `poster-dom-image-low-effective-resolution` | `layout_repair` |
+| `poster-dom-table-overflow` | `layout_repair` |
+| `poster-dom-table-text-small` | `layout_repair` |
+| `poster-dom-source-flow-gutter` | `layout_repair` |
+| `poster-dom-source-flow-sibling` | `layout_repair` |
+| `poster-dom-screen-print-mismatch` | `layout_repair` |
+| `poster-dom-template-boxiness` | `layout_repair` |
+
+The reviewer may escalate but never downgrade. Multiple findings take the
+strongest minimum route.
+
+## Route actions
+
+- `layout_repair`: keep the catalog and plan; start the next authoring attempt
+  and repair HTML/CSS there.
+- `content_replan`: keep the catalog; submit the canonical `reopen-curation`
+  request, commit a new plan revision, then start the next attempt.
+- `source_reingest`: submit the reopen request, return to PDF/pages, create
+  append-only replacement crops, pass a fresh source review, commit a new
+  catalog and plan, then start the next attempt.
+
+## Exact reopen request
+
+For the latter two routes, copy current values from the persisted review and
+`resume` into this exact reopen schema:
+
+```json
+{
+  "attempt_id": "COPY_ACTIVE_ATTEMPT_ID",
+  "expected_curation_revision": 2,
+  "expected_plan_revision": 3,
+  "finding_ids": [
+    "COPY_FINDING_ID"
+  ],
+  "reason": "Repair the bound semantic finding before the next attempt.",
+  "repair_route": "content_replan",
+  "run_format_version": 2,
+  "semantic_review_sha256": "COPY_SEMANTIC_REVIEW_SHA256"
+}
+```
+
+Browser startup, Poppler, export, or other environment/runtime failures are not
+semantic findings. Retry the current attempt and do not consume a new semantic
+attempt or invent a repair route.
