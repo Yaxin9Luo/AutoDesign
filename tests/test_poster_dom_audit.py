@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import inspect
 import json
 import os
 import shutil
@@ -70,6 +71,22 @@ def _snapshot(*, media: str = "screen") -> dict[str, object]:
     }
 
 
+def _dense_snapshot(*, media: str = "screen") -> dict[str, object]:
+    snapshot = _snapshot(media=media)
+    snapshot["text_nodes"] = [
+        {
+            "block_id": f"dense-{row}-{column}",
+            "text": "Grounded editable poster content fills this scientific region.",
+            "rect": _rect(15 + column * 245, 10 + row * 95, 225, 80),
+            "visible_rect": _rect(15 + column * 245, 10 + row * 95, 225, 80),
+            "clipped_by": "",
+        }
+        for row in range(6)
+        for column in range(4)
+    ]
+    return snapshot
+
+
 class PosterDomPureEvaluatorTests(unittest.TestCase):
     def setUp(self) -> None:
         self.audit = _load_dom_audit(self)
@@ -81,38 +98,283 @@ class PosterDomPureEvaluatorTests(unittest.TestCase):
         screen: dict[str, object],
         print_snapshot: dict[str, object] | None = None,
     ) -> dict[str, object]:
-        return self.audit.evaluate_dom_snapshot(
-            screen,
-            print_snapshot or _snapshot(media="print"),
-            canvas=self.canvas,
-            print_size=self.print_size,
-        )
+        evaluations = [
+            self.audit.evaluate_dom_snapshot(
+                screen,
+                canvas=self.canvas,
+                print_size=self.print_size,
+            )
+        ]
+        if print_snapshot is not None:
+            evaluations.append(
+                self.audit.evaluate_dom_snapshot(
+                    print_snapshot,
+                    canvas=self.canvas,
+                    print_size=self.print_size,
+                )
+            )
+        return {
+            "passed": all(item["passed"] for item in evaluations),
+            "findings": [
+                finding
+                for evaluation in evaluations
+                for finding in evaluation["findings"]
+            ],
+            "metrics": {
+                key: value
+                for evaluation in evaluations
+                for key, value in evaluation["metrics"].items()
+            },
+        }
 
     def _codes(self, result: dict[str, object]) -> list[str]:
         return [str(item["code"]) for item in result["findings"]]
 
+    def test_public_interface_uses_one_snapshot_and_one_probe_script(self) -> None:
+        parameters = inspect.signature(
+            self.audit.evaluate_dom_snapshot
+        ).parameters
+        self.assertEqual(list(parameters), ["snapshot", "canvas", "print_size"])
+        self.assertEqual(
+            parameters["snapshot"].kind,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        )
+        self.assertTrue(
+            all(
+                parameters[name].kind is inspect.Parameter.KEYWORD_ONLY
+                for name in ("canvas", "print_size")
+            )
+        )
+        self.assertEqual(
+            list(inspect.signature(self.audit.browser_probe_script).parameters), []
+        )
+        script = self.audit.browser_probe_script()
+        self.assertIsInstance(script, str)
+        self.assertIn("document.createTreeWalker", script)
+
+        result = self.audit.evaluate_dom_snapshot(
+            _dense_snapshot(),
+            canvas=self.canvas,
+            print_size=self.print_size,
+        )
+
+        self.assertTrue(result["passed"], result)
+
+    def test_each_media_capture_waits_for_fonts_and_uses_the_public_probe_script(self) -> None:
+        probe_script = "(media) => ({media, sentinel: 'single-probe-source'})"
+
+        class FakePage:
+            def __init__(self) -> None:
+                self.calls: list[tuple[object, ...]] = []
+
+            def emulate_media(self, *, media: str) -> None:
+                self.calls.append(("emulate_media", media))
+
+            def evaluate(self, script: str, argument: str | None = None) -> object:
+                if script == probe_script:
+                    self.calls.append(("evaluate_probe", argument))
+                    return {"media": argument, "sentinel": "single-probe-source"}
+                self.assert_font_script(script)
+                self.calls.append(("wait_fonts",))
+                return True
+
+            def screenshot(self, *, full_page: bool) -> bytes:
+                self.calls.append(("screenshot", full_page))
+                return b"png-bytes"
+
+            @staticmethod
+            def assert_font_script(script: str) -> None:
+                if "document.fonts.ready" not in script:
+                    raise AssertionError(f"unexpected page evaluation: {script}")
+
+        page = FakePage()
+        with mock.patch.object(
+            self.audit, "browser_probe_script", return_value=probe_script
+        ):
+            screen = self.audit._capture_media_snapshot(page, "screen")
+            printed = self.audit._capture_media_snapshot(page, "print")
+
+        self.assertEqual(screen, ({"media": "screen", "sentinel": "single-probe-source"}, b"png-bytes"))
+        self.assertEqual(printed, ({"media": "print", "sentinel": "single-probe-source"}, b"png-bytes"))
+        self.assertEqual(
+            page.calls,
+            [
+                ("emulate_media", "screen"),
+                ("wait_fonts",),
+                ("evaluate_probe", "screen"),
+                ("screenshot", True),
+                ("emulate_media", "print"),
+                ("wait_fonts",),
+                ("evaluate_probe", "print"),
+                ("screenshot", True),
+            ],
+        )
+
     def test_valid_dense_snapshot_is_deterministic_and_has_no_findings(self) -> None:
-        screen = _snapshot()
-        screen["text_nodes"] = [
-            {
-                "block_id": "method-copy",
-                "text": "A complete method explanation with grounded evidence.",
-                "rect": _rect(40, 80, 420, 80),
-                "visible_rect": _rect(40, 80, 420, 80),
-                "clipped_by": "",
-            },
-            {
-                "block_id": "result-copy",
-                "text": "A primary result with a bounded scientific takeaway.",
-                "rect": _rect(540, 360, 400, 80),
-                "visible_rect": _rect(540, 360, 400, 80),
-                "clipped_by": "",
-            },
-        ]
+        screen = _dense_snapshot()
         first = self._evaluate(screen)
         second = self._evaluate(json.loads(json.dumps(screen)))
         self.assertEqual(first, second)
         self.assertEqual((first["passed"], first["findings"]), (True, []))
+
+    def test_canvas_fill_detects_blank_lower_canvas_without_panels(self) -> None:
+        snapshot = _snapshot()
+        snapshot["text_nodes"] = [
+            {
+                "block_id": f"top-copy-{column}",
+                "text": "Grounded content occupies only the top of this sparse poster.",
+                "rect": _rect(20 + column * 245, 20, 220, 90),
+                "visible_rect": _rect(20 + column * 245, 20, 220, 90),
+                "clipped_by": "",
+            }
+            for column in range(4)
+        ]
+
+        result = self.audit.evaluate_dom_snapshot(
+            snapshot,
+            canvas=self.canvas,
+            print_size=self.print_size,
+        )
+
+        self.assertEqual(snapshot["panels"], [])
+        self.assertIn("poster-dom-blank-band", self._codes(result))
+        self.assertIn("poster-dom-sparse-oversized-panel", self._codes(result))
+        self.assertGreater(result["metrics"]["screen_canvas_lower_blank_ratio"], 0.75)
+
+    def test_canvas_fill_detects_underfilled_columns_even_when_content_reaches_bottom(self) -> None:
+        snapshot = _snapshot()
+        snapshot["text_nodes"] = [
+            {
+                "block_id": f"left-column-{row}",
+                "text": "Grounded content fills one column but not the poster width.",
+                "rect": _rect(20, 10 + row * 95, 200, 80),
+                "visible_rect": _rect(20, 10 + row * 95, 200, 80),
+                "clipped_by": "",
+            }
+            for row in range(6)
+        ]
+
+        result = self.audit.evaluate_dom_snapshot(
+            snapshot,
+            canvas=self.canvas,
+            print_size=self.print_size,
+        )
+
+        self.assertNotIn("poster-dom-blank-band", self._codes(result))
+        self.assertIn("poster-dom-sparse-oversized-panel", self._codes(result))
+        finding = next(
+            item
+            for item in result["findings"]
+            if item["code"] == "poster-dom-sparse-oversized-panel"
+        )
+        self.assertIn("lower_half_sparse", finding["geometry"]["reasons"])
+
+    def test_root_position_escape_is_detected_in_all_four_directions(self) -> None:
+        cases = {
+            "left": _rect(-12, 0, 1000, 600),
+            "top": _rect(0, -12, 1000, 600),
+            "right": _rect(12, 0, 1000, 600),
+            "bottom": _rect(0, 12, 1000, 600),
+        }
+
+        for direction, root_rect in cases.items():
+            with self.subTest(direction=direction):
+                snapshot = _snapshot()
+                snapshot["root"]["rect"] = root_rect
+                result = self.audit.evaluate_dom_snapshot(
+                    snapshot,
+                    canvas=self.canvas,
+                    print_size=self.print_size,
+                )
+                finding = next(
+                    item
+                    for item in result["findings"]
+                    if item["code"] == "poster-dom-viewport-escape"
+                )
+                self.assertGreater(finding["geometry"][f"{direction}_gap_px"], 4)
+                self.assertEqual(finding["geometry"]["media"], "screen")
+
+    def test_document_scroll_escape_and_body_margin_offset_are_both_measured(self) -> None:
+        snapshot = _snapshot()
+        snapshot["root"]["rect"] = _rect(12, 0, 1000, 600)
+        snapshot["viewport"]["document_width"] = 1012
+
+        result = self.audit.evaluate_dom_snapshot(
+            snapshot,
+            canvas=self.canvas,
+            print_size=self.print_size,
+        )
+
+        findings = {item["code"]: item for item in result["findings"]}
+        self.assertIn("poster-dom-root-overflow", findings)
+        self.assertIn("poster-dom-viewport-escape", findings)
+        self.assertEqual(
+            findings["poster-dom-root-overflow"]["geometry"]["document_width_gap_px"],
+            12,
+        )
+        self.assertEqual(
+            findings["poster-dom-viewport-escape"]["geometry"]["right_gap_px"],
+            12,
+        )
+
+        vertical = _snapshot()
+        vertical["viewport"]["document_height"] = 612
+        vertical_result = self.audit.evaluate_dom_snapshot(
+            vertical,
+            canvas=self.canvas,
+            print_size=self.print_size,
+        )
+        vertical_finding = next(
+            item
+            for item in vertical_result["findings"]
+            if item["code"] == "poster-dom-root-overflow"
+        )
+        self.assertEqual(vertical_finding["geometry"]["document_height_gap_px"], 12)
+
+    def test_intended_root_and_document_bounds_do_not_emit_fit_findings(self) -> None:
+        result = self.audit.evaluate_dom_snapshot(
+            _snapshot(),
+            canvas=self.canvas,
+            print_size=self.print_size,
+        )
+
+        self.assertFalse(
+            {
+                "poster-dom-root-overflow",
+                "poster-dom-viewport-escape",
+                "poster-dom-screen-print-mismatch",
+            }
+            & set(self._codes(result)),
+            result,
+        )
+
+    def test_physical_print_canvas_sets_the_allowed_document_bounds(self) -> None:
+        snapshot = _snapshot(media="print")
+        snapshot["viewport"] = {
+            "width": 3072,
+            "height": 1536,
+            "document_width": 8064,
+            "document_height": 4032,
+        }
+        snapshot["root"] = {
+            **snapshot["root"],
+            "rect": _rect(0, 0, 8064, 4032),
+            "scrollWidth": 8064,
+            "scrollHeight": 4032,
+            "clientWidth": 8064,
+            "clientHeight": 4032,
+        }
+
+        result = self.audit.evaluate_dom_snapshot(
+            snapshot,
+            canvas={"width_px": 3072, "height_px": 1536},
+            print_size={"width_mm": 2133.6, "height_mm": 1066.8},
+        )
+
+        self.assertNotIn("poster-dom-root-overflow", self._codes(result), result)
+        self.assertNotIn(
+            "poster-dom-screen-print-mismatch", self._codes(result), result
+        )
 
     def test_all_stable_finding_codes_have_the_exact_contract(self) -> None:
         cases: dict[str, tuple[dict[str, object], dict[str, object]]] = {}
@@ -329,6 +591,31 @@ class PosterDomPureEvaluatorTests(unittest.TestCase):
                 )
                 self.assertEqual(finding["suggested_repair_route"], "layout_repair")
                 self.assertIsInstance(finding["geometry"], dict)
+                self.assertIn(finding["geometry"]["media"], {"screen", "print"})
+                self.assertIn(
+                    finding["geometry"]["media"].capitalize(), finding["message"]
+                )
+
+                print_only = json.loads(
+                    json.dumps(
+                        print_snapshot
+                        if expected_code == "poster-dom-screen-print-mismatch"
+                        else screen
+                    )
+                )
+                print_only["media"] = "print"
+                print_result = self.audit.evaluate_dom_snapshot(
+                    print_only,
+                    canvas=self.canvas,
+                    print_size=self.print_size,
+                )
+                self.assertIn(expected_code, self._codes(print_result), print_result)
+                print_finding = next(
+                    item
+                    for item in print_result["findings"]
+                    if item["code"] == expected_code
+                )
+                self.assertEqual(print_finding["geometry"]["media"], "print")
 
     def test_table_container_escape_uses_the_table_overflow_code(self) -> None:
         screen = _snapshot()
@@ -503,8 +790,8 @@ class PosterDomRunnerTests(unittest.TestCase):
         return run, attempt, artifact
 
     def _probe_payload(self) -> dict[str, object]:
-        screen = _snapshot()
-        printed = _snapshot(media="print")
+        screen = _dense_snapshot()
+        printed = _dense_snapshot(media="print")
         for snapshot in (screen, printed):
             snapshot["viewport"] = {
                 "width": 3072,
@@ -520,6 +807,27 @@ class PosterDomRunnerTests(unittest.TestCase):
                 "clientWidth": 3072,
                 "clientHeight": 1536,
             }
+            snapshot["text_nodes"] = [
+                {
+                    "block_id": f"dense-{row}-{column}",
+                    "text": "Grounded editable poster content fills this scientific region.",
+                    "rect": _rect(
+                        45 + column * 755,
+                        25 + row * 245,
+                        700,
+                        215,
+                    ),
+                    "visible_rect": _rect(
+                        45 + column * 755,
+                        25 + row * 245,
+                        700,
+                        215,
+                    ),
+                    "clipped_by": "",
+                }
+                for row in range(6)
+                for column in range(4)
+            ]
         return {
             "screen_snapshot": screen,
             "print_snapshot": printed,
@@ -584,6 +892,59 @@ class PosterDomRunnerTests(unittest.TestCase):
         self.assertEqual(
             self.audit.load_verified_poster_dom_audit(run, attempt), report
         )
+
+    def test_run_audit_blocks_print_only_defects_and_exposes_both_media_metrics(self) -> None:
+        run, attempt, _artifact = self._run("print-only-defects")
+        payload = self._probe_payload()
+        printed = payload["print_snapshot"]
+        printed["text_nodes"] = [
+            {
+                "block_id": "print-clipped-copy",
+                "text": "Print-only editable text is clipped by its authored panel.",
+                "rect": _rect(80, 80, 600, 100),
+                "visible_rect": _rect(80, 80, 600, 40),
+                "clipped_by": "print-panel",
+            }
+        ]
+        printed["tables"] = [
+            {
+                "block_id": "print-wide-table",
+                "rect": _rect(80, 220, 600, 240),
+                "container_rect": _rect(80, 220, 600, 240),
+                "scrollWidth": 720,
+                "scrollHeight": 240,
+                "clientWidth": 600,
+                "clientHeight": 240,
+                "font_px": 24,
+            }
+        ]
+
+        with mock.patch.object(
+            self.audit, "_invoke_browser_worker", return_value=payload
+        ):
+            report = self.audit.run_poster_dom_audit(
+                run,
+                attempt,
+                cache_root=self.root / "browser",
+                allow_browser_install=False,
+            )
+
+        self.assertFalse(report["passed"], report)
+        findings = {
+            item["code"]: item
+            for item in report["findings"]
+            if item["code"]
+            in {"poster-dom-text-clipping", "poster-dom-table-overflow"}
+        }
+        self.assertEqual(
+            set(findings),
+            {"poster-dom-text-clipping", "poster-dom-table-overflow"},
+        )
+        self.assertTrue(
+            all(item["geometry"]["media"] == "print" for item in findings.values())
+        )
+        self.assertIn("screen_text_node_count", report["metrics"])
+        self.assertIn("print_text_node_count", report["metrics"])
 
     def test_run_audit_rejects_symlinked_qa_without_outside_mutation(self) -> None:
         run, attempt, _artifact = self._run("symlink-qa")
@@ -815,6 +1176,69 @@ class PosterDomRealBrowserTests(unittest.TestCase):
                 attempt_root / "qa" / "previews" / "poster-print.png"
             ),
         )
+
+    def test_sparse_top_canvas_without_recognized_panels_fails_fill_checks(self) -> None:
+        body = "".join(
+            f'<p data-block-id="top-copy-{column}" style="position:absolute;left:{80 + column * 740}px;'
+            'top:60px;width:660px;height:100px">Grounded content occupies only the top '
+            "of this deliberately sparse conference poster.</p>"
+            for column in range(4)
+        )
+
+        report, _before = self._run("real-sparse-top", self._html(body))
+
+        self.assertEqual(report["metrics"]["screen_panel_count"], 0)
+        self.assertEqual(report["metrics"]["print_panel_count"], 0)
+        self.assertIn("poster-dom-blank-band", self._codes(report), report)
+        self.assertIn("poster-dom-sparse-oversized-panel", self._codes(report), report)
+        self.assertGreater(
+            report["metrics"]["screen_canvas_lower_blank_ratio"], 0.75
+        )
+
+    def test_body_margin_offset_escapes_the_real_browser_canvas(self) -> None:
+        report, _before = self._run(
+            "real-body-margin",
+            self._html(
+                '<p data-block-id="copy">Grounded content remains editable.</p>',
+                extra_style="body { margin-left: 12px; }",
+            ),
+        )
+
+        escapes = [
+            finding
+            for finding in report["findings"]
+            if finding["code"] == "poster-dom-viewport-escape"
+            and finding["block_id"] == "paper-poster-root"
+        ]
+        self.assertTrue(escapes, report)
+        self.assertTrue(
+            all(finding["geometry"]["right_gap_px"] >= 12 for finding in escapes),
+            escapes,
+        )
+
+    def test_print_only_clipping_is_labeled_and_blocks(self) -> None:
+        report, _before = self._run(
+            "real-print-only-clipping",
+            self._html(
+                '<div id="print-clip" data-block-id="print-clip" '
+                'style="position:absolute;left:80px;top:80px;width:650px">'
+                '<p style="margin:0">Grounded print-only text continues across several rendered '
+                "lines and is clipped only after the print media style is applied to this "
+                "editable authored container.</p></div>",
+                extra_style="@media print { #print-clip { height: 38px; overflow: hidden; } }",
+            ),
+        )
+
+        clipping = [
+            finding
+            for finding in report["findings"]
+            if finding["code"] == "poster-dom-text-clipping"
+        ]
+        self.assertTrue(clipping, report)
+        self.assertEqual(
+            {finding["geometry"]["media"] for finding in clipping}, {"print"}
+        )
+        self.assertFalse(report["passed"])
 
     def test_required_rendered_defects_are_detected(self) -> None:
         transparent_png = (

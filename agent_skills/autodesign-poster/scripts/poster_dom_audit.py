@@ -51,6 +51,10 @@ STABLE_FINDING_CODES = (
     "poster-dom-template-boxiness",
 )
 _FINDING_ORDER = {code: index for index, code in enumerate(STABLE_FINDING_CODES)}
+_FONT_READY_SCRIPT = (
+    "async () => { if (document.fonts && document.fonts.ready) "
+    "await document.fonts.ready; return true; }"
+)
 
 
 _READ_ONLY_MEASUREMENT_SCRIPT = r"""
@@ -287,6 +291,12 @@ _READ_ONLY_MEASUREMENT_SCRIPT = r"""
 """
 
 
+def browser_probe_script() -> str:
+    """Return the one read-only JavaScript measurement source used by the probe."""
+
+    return _READ_ONLY_MEASUREMENT_SCRIPT
+
+
 def _number(value: Any, default: float = 0.0) -> float:
     if isinstance(value, bool):
         return default
@@ -393,26 +403,169 @@ def _panel_content_area_ratio(
     return round(min(1.0, area / max(1.0, panel_rect["w"] * panel_rect["h"])), 4)
 
 
+def _clip_rect_to_bounds(
+    rect: Mapping[str, float], bounds: Mapping[str, float]
+) -> dict[str, float] | None:
+    left = max(rect["x"], bounds["x"])
+    top = max(rect["y"], bounds["y"])
+    right = min(rect["right"], bounds["right"])
+    bottom = min(rect["bottom"], bounds["bottom"])
+    if right <= left or bottom <= top:
+        return None
+    return {
+        "x": left,
+        "y": top,
+        "w": right - left,
+        "h": bottom - top,
+        "right": right,
+        "bottom": bottom,
+    }
+
+
+def _canvas_content_boxes(
+    snapshot: Mapping[str, Any], canvas_rect: Mapping[str, float]
+) -> list[dict[str, float]]:
+    candidates: list[Mapping[str, Any]] = []
+    for text in snapshot.get("text_nodes", []):
+        if isinstance(text, Mapping) and _word_count(text.get("text")) >= 2:
+            candidates.append({"rect": text.get("visible_rect", text.get("rect"))})
+    for key in ("images", "tables"):
+        candidates.extend(
+            item for item in snapshot.get(key, []) if isinstance(item, Mapping)
+        )
+
+    boxes: list[dict[str, float]] = []
+    seen: set[tuple[float, float, float, float]] = set()
+    for candidate in candidates:
+        clipped = _clip_rect_to_bounds(_rect(candidate.get("rect")), canvas_rect)
+        if clipped is None or clipped["w"] * clipped["h"] < 120:
+            continue
+        key = tuple(round(clipped[name], 2) for name in ("x", "y", "w", "h"))
+        if key not in seen:
+            seen.add(key)
+            boxes.append(clipped)
+    return boxes
+
+
+def _band_grid_coverage(
+    boxes: list[dict[str, float]],
+    canvas_rect: Mapping[str, float],
+    *,
+    start_ratio: float,
+    end_ratio: float,
+) -> float:
+    band_top = canvas_rect["y"] + canvas_rect["h"] * start_ratio
+    band_bottom = canvas_rect["y"] + canvas_rect["h"] * end_ratio
+    columns = 48
+    rows = 12
+    cell_width = canvas_rect["w"] / columns
+    cell_height = max(1.0, band_bottom - band_top) / rows
+    marked = 0
+    for row in range(rows):
+        for column in range(columns):
+            cell = {
+                "x": canvas_rect["x"] + column * cell_width,
+                "y": band_top + row * cell_height,
+                "w": cell_width,
+                "h": cell_height,
+                "right": canvas_rect["x"] + (column + 1) * cell_width,
+                "bottom": band_top + (row + 1) * cell_height,
+            }
+            cell_area = max(1.0, cell_width * cell_height)
+            if any(_overlap_area(box, cell) >= cell_area * 0.03 for box in boxes):
+                marked += 1
+    return round(marked / float(columns * rows), 4)
+
+
+def _canvas_fill_metrics(
+    snapshot: Mapping[str, Any], canvas_rect: Mapping[str, float]
+) -> tuple[dict[str, Any], list[dict[str, float]]]:
+    boxes = _canvas_content_boxes(snapshot, canvas_rect)
+    if boxes:
+        content_bottom = max(box["bottom"] for box in boxes)
+        bottom_ratio = min(
+            1.0,
+            max(0.0, (content_bottom - canvas_rect["y"]) / canvas_rect["h"]),
+        )
+    else:
+        content_bottom = canvas_rect["y"]
+        bottom_ratio = 0.0
+    portrait = canvas_rect["h"] > canvas_rect["w"]
+    minimums = {
+        "min_content_bottom_ratio": 0.92 if portrait else 0.90,
+        "min_lower_quarter_content_coverage": 0.10 if portrait else 0.12,
+        "min_lower_half_content_coverage": 0.18 if portrait else 0.22,
+        "min_middle_lower_content_coverage": 0.16 if portrait else 0.18,
+    }
+    metrics = {
+        "canvas_content_box_count": len(boxes),
+        "canvas_content_bottom_px": round(content_bottom - canvas_rect["y"], 2),
+        "canvas_content_bottom_ratio": round(bottom_ratio, 4),
+        "canvas_lower_blank_ratio": round(1.0 - bottom_ratio, 4),
+        "canvas_lower_quarter_content_coverage": _band_grid_coverage(
+            boxes, canvas_rect, start_ratio=0.75, end_ratio=1.0
+        ),
+        "canvas_lower_half_content_coverage": _band_grid_coverage(
+            boxes, canvas_rect, start_ratio=0.50, end_ratio=1.0
+        ),
+        "canvas_middle_lower_content_coverage": _band_grid_coverage(
+            boxes, canvas_rect, start_ratio=0.42, end_ratio=0.74
+        ),
+        **minimums,
+    }
+    reasons: list[str] = []
+    if metrics["canvas_content_bottom_ratio"] < minimums["min_content_bottom_ratio"]:
+        reasons.append("content_stops_before_bottom")
+    if (
+        metrics["canvas_lower_quarter_content_coverage"]
+        < minimums["min_lower_quarter_content_coverage"]
+    ):
+        reasons.append("lower_quarter_sparse")
+    if (
+        metrics["canvas_lower_half_content_coverage"]
+        < minimums["min_lower_half_content_coverage"]
+    ):
+        reasons.append("lower_half_sparse")
+    if (
+        metrics["canvas_middle_lower_content_coverage"]
+        < minimums["min_middle_lower_content_coverage"]
+    ):
+        reasons.append("middle_lower_sparse")
+    metrics["canvas_fill_reasons"] = reasons
+    return metrics, boxes
+
+
 def _matches_size(rect: Mapping[str, float], width: float, height: float) -> bool:
     return abs(rect["w"] - width) <= 2.0 and abs(rect["h"] - height) <= 2.0
 
 
 def evaluate_dom_snapshot(
-    screen_snapshot: Mapping[str, Any],
-    print_snapshot: Mapping[str, Any],
+    snapshot: Mapping[str, Any],
     *,
     canvas: Mapping[str, Any],
     print_size: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Evaluate immutable browser measurements without any filesystem or DOM writes."""
+    """Evaluate one immutable media snapshot without filesystem or DOM writes."""
 
     canvas_width = _number(canvas.get("width_px"))
     canvas_height = _number(canvas.get("height_px"))
+    print_width = _number(print_size.get("width_mm")) / 25.4 * 96.0
+    print_height = _number(print_size.get("height_mm")) / 25.4 * 96.0
+    media = str(snapshot.get("media") or "")
+    if media not in {"screen", "print"}:
+        raise ValueError("DOM snapshot media must be 'screen' or 'print'")
     findings: list[dict[str, Any]] = []
 
-    root = screen_snapshot.get("root")
+    root = snapshot.get("root")
     root = root if isinstance(root, Mapping) else {}
     root_rect = _rect(root.get("rect"))
+    matches_canvas = _matches_size(root_rect, canvas_width, canvas_height)
+    matches_physical_print = _matches_size(root_rect, print_width, print_height)
+    use_physical_print = (
+        media == "print" and matches_physical_print and not matches_canvas
+    )
+    evaluation_width = print_width if use_physical_print else canvas_width
+    evaluation_height = print_height if use_physical_print else canvas_height
     root_client_width = _number(root.get("clientWidth")) or root_rect["w"]
     root_client_height = _number(root.get("clientHeight")) or root_rect["h"]
     root_width_gap = max(
@@ -423,23 +576,78 @@ def evaluate_dom_snapshot(
         0.0,
         _number(root.get("scrollHeight")) - root_client_height,
     )
-    if max(root_width_gap, root_height_gap) > ROOT_OVERFLOW_TOLERANCE_PX:
+    viewport = snapshot.get("viewport")
+    viewport = viewport if isinstance(viewport, Mapping) else {}
+    viewport_width = _number(viewport.get("width")) or canvas_width
+    viewport_height = _number(viewport.get("height")) or canvas_height
+    document_bound_width = max(viewport_width, evaluation_width)
+    document_bound_height = max(viewport_height, evaluation_height)
+    document_width_gap = max(
+        0.0,
+        _number(viewport.get("document_width"), document_bound_width)
+        - document_bound_width,
+    )
+    document_height_gap = max(
+        0.0,
+        _number(viewport.get("document_height"), document_bound_height)
+        - document_bound_height,
+    )
+    maximum_root_gap = max(
+        root_width_gap,
+        root_height_gap,
+        document_width_gap,
+        document_height_gap,
+    )
+    if maximum_root_gap > ROOT_OVERFLOW_TOLERANCE_PX:
         findings.append(
             _finding(
                 "poster-dom-root-overflow",
                 str(root.get("block_id") or "paper-poster-root"),
-                "P0" if max(root_width_gap, root_height_gap) >= 24 else "P1",
+                "P0" if maximum_root_gap >= 24 else "P1",
                 {
                     "root_rect": _rounded_rect(root_rect),
                     "width_gap_px": round(root_width_gap, 2),
                     "height_gap_px": round(root_height_gap, 2),
+                    "document_width_px": round(
+                        _number(viewport.get("document_width")), 2
+                    ),
+                    "document_height_px": round(
+                        _number(viewport.get("document_height")), 2
+                    ),
+                    "document_width_gap_px": round(document_width_gap, 2),
+                    "document_height_gap_px": round(document_height_gap, 2),
                 },
-                "Poster root has rendered scroll overflow beyond the fixed canvas.",
+                "Poster root or document has rendered scroll overflow beyond the fixed viewport.",
+            )
+        )
+
+    root_viewport_gaps = {
+        "left_gap_px": max(0.0, -root_rect["x"]),
+        "top_gap_px": max(0.0, -root_rect["y"]),
+        "right_gap_px": max(0.0, root_rect["right"] - evaluation_width),
+        "bottom_gap_px": max(0.0, root_rect["bottom"] - evaluation_height),
+    }
+    if max(root_viewport_gaps.values()) > VIEWPORT_TOLERANCE_PX:
+        findings.append(
+            _finding(
+                "poster-dom-viewport-escape",
+                str(root.get("block_id") or "paper-poster-root"),
+                "P0" if max(root_viewport_gaps.values()) >= 24 else "P1",
+                {
+                    **{
+                        key: round(value, 2)
+                        for key, value in root_viewport_gaps.items()
+                    },
+                    "rect": _rounded_rect(root_rect),
+                    "evaluation_width_px": round(evaluation_width, 2),
+                    "evaluation_height_px": round(evaluation_height, 2),
+                },
+                "Rendered Poster root escapes the fixed canvas viewport.",
             )
         )
 
     text_nodes = [
-        item for item in screen_snapshot.get("text_nodes", []) if isinstance(item, Mapping)
+        item for item in snapshot.get("text_nodes", []) if isinstance(item, Mapping)
     ]
     for item in text_nodes:
         rect = _rect(item.get("rect"))
@@ -507,15 +715,15 @@ def evaluate_dom_snapshot(
     viewport_candidates: list[Mapping[str, Any]] = []
     for key in ("elements", "images", "tables"):
         viewport_candidates.extend(
-            item for item in screen_snapshot.get(key, []) if isinstance(item, Mapping)
+            item for item in snapshot.get(key, []) if isinstance(item, Mapping)
         )
     for item in viewport_candidates:
         rect = _rect(item.get("rect"))
         gaps = {
             "left_gap_px": max(0.0, -rect["x"]),
             "top_gap_px": max(0.0, -rect["y"]),
-            "right_gap_px": max(0.0, rect["right"] - canvas_width),
-            "bottom_gap_px": max(0.0, rect["bottom"] - canvas_height),
+            "right_gap_px": max(0.0, rect["right"] - evaluation_width),
+            "bottom_gap_px": max(0.0, rect["bottom"] - evaluation_height),
         }
         if max(gaps.values()) <= VIEWPORT_TOLERANCE_PX:
             continue
@@ -529,8 +737,81 @@ def evaluate_dom_snapshot(
             )
         )
 
+    canvas_rect = root_rect if root_rect["w"] > 0 and root_rect["h"] > 0 else _rect(
+        {"x": 0, "y": 0, "w": evaluation_width, "h": evaluation_height}
+    )
+    canvas_fill_metrics, canvas_content_boxes = _canvas_fill_metrics(
+        snapshot, canvas_rect
+    )
+    canvas_blank = _content_blank_band(canvas_rect, canvas_content_boxes)
+    canvas_fill_metrics["canvas_max_blank_run_ratio"] = canvas_blank[
+        "max_blank_run_ratio"
+    ]
+    canvas_fill_metrics["canvas_blank_start_ratio"] = canvas_blank[
+        "blank_start_ratio"
+    ]
+    canvas_fill_metrics["canvas_blank_end_ratio"] = canvas_blank["blank_end_ratio"]
+    if canvas_blank["max_blank_run_ratio"] >= BLANK_BAND_MIN_RATIO:
+        findings.append(
+            _finding(
+                "poster-dom-blank-band",
+                str(root.get("block_id") or "paper-poster-root"),
+                "P1",
+                {
+                    "scope": "canvas",
+                    "canvas_rect": _rounded_rect(canvas_rect),
+                    **canvas_blank,
+                    "lower_blank_ratio": canvas_fill_metrics[
+                        "canvas_lower_blank_ratio"
+                    ],
+                },
+                "The Poster canvas contains a substantial rendered blank band.",
+            )
+        )
+    fill_reasons = list(canvas_fill_metrics["canvas_fill_reasons"])
+    near_bottom_only = (
+        fill_reasons == ["content_stops_before_bottom"]
+        and canvas_fill_metrics["canvas_content_bottom_ratio"]
+        >= canvas_fill_metrics["min_content_bottom_ratio"] - 0.035
+        and canvas_fill_metrics["canvas_lower_quarter_content_coverage"]
+        >= canvas_fill_metrics["min_lower_quarter_content_coverage"] * 2.0
+        and canvas_fill_metrics["canvas_lower_half_content_coverage"]
+        >= canvas_fill_metrics["min_lower_half_content_coverage"] * 2.0
+        and canvas_fill_metrics["canvas_middle_lower_content_coverage"]
+        >= canvas_fill_metrics["min_middle_lower_content_coverage"] * 2.0
+    )
+    if fill_reasons and not near_bottom_only:
+        findings.append(
+            _finding(
+                "poster-dom-sparse-oversized-panel",
+                str(root.get("block_id") or "paper-poster-root"),
+                "P1",
+                {
+                    "scope": "canvas",
+                    "canvas_rect": _rounded_rect(canvas_rect),
+                    "content_box_count": canvas_fill_metrics[
+                        "canvas_content_box_count"
+                    ],
+                    "content_bottom_ratio": canvas_fill_metrics[
+                        "canvas_content_bottom_ratio"
+                    ],
+                    "lower_quarter_content_coverage": canvas_fill_metrics[
+                        "canvas_lower_quarter_content_coverage"
+                    ],
+                    "lower_half_content_coverage": canvas_fill_metrics[
+                        "canvas_lower_half_content_coverage"
+                    ],
+                    "middle_lower_content_coverage": canvas_fill_metrics[
+                        "canvas_middle_lower_content_coverage"
+                    ],
+                    "reasons": fill_reasons,
+                },
+                "The Poster canvas is underfilled across its columns or lower bands.",
+            )
+        )
+
     panels = [
-        item for item in screen_snapshot.get("panels", []) if isinstance(item, Mapping)
+        item for item in snapshot.get("panels", []) if isinstance(item, Mapping)
     ]
     canvas_area = max(1.0, canvas_width * canvas_height)
     for panel in panels:
@@ -573,7 +854,7 @@ def evaluate_dom_snapshot(
                 )
             )
 
-    for image in screen_snapshot.get("images", []):
+    for image in snapshot.get("images", []):
         if not isinstance(image, Mapping) or image.get("complete") is not True:
             continue
         rect = _rect(image.get("rect"))
@@ -600,7 +881,7 @@ def evaluate_dom_snapshot(
             )
         )
 
-    for table in screen_snapshot.get("tables", []):
+    for table in snapshot.get("tables", []):
         if not isinstance(table, Mapping):
             continue
         rect = _rect(table.get("rect"))
@@ -673,7 +954,7 @@ def evaluate_dom_snapshot(
                 )
             )
 
-    for item in screen_snapshot.get("lists", []):
+    for item in snapshot.get("lists", []):
         if not isinstance(item, Mapping):
             continue
         if not (
@@ -705,7 +986,7 @@ def evaluate_dom_snapshot(
             )
         )
 
-    for flow in screen_snapshot.get("source_flows", []):
+    for flow in snapshot.get("source_flows", []):
         if not isinstance(flow, Mapping):
             continue
         source_count = int(_number(flow.get("source_child_count")))
@@ -735,32 +1016,25 @@ def evaluate_dom_snapshot(
             )
         )
 
-    print_root = print_snapshot.get("root")
-    print_root = print_root if isinstance(print_root, Mapping) else {}
-    print_rect = _rect(print_root.get("rect"))
-    print_width = _number(print_size.get("width_mm")) / 25.4 * 96.0
-    print_height = _number(print_size.get("height_mm")) / 25.4 * 96.0
-    screen_matches = _matches_size(root_rect, canvas_width, canvas_height)
-    print_matches = _matches_size(print_rect, canvas_width, canvas_height) or _matches_size(
-        print_rect, print_width, print_height
+    matches_allowed = matches_canvas if media == "screen" else (
+        matches_canvas or matches_physical_print
     )
-    if not screen_matches or not print_matches:
+    if not matches_allowed:
         findings.append(
             _finding(
                 "poster-dom-screen-print-mismatch",
-                str(print_root.get("block_id") or "paper-poster-root"),
+                str(root.get("block_id") or "paper-poster-root"),
                 "P0",
                 {
-                    "screen_root_rect": _rounded_rect(root_rect),
-                    "print_root_rect": _rounded_rect(print_rect),
+                    "root_rect": _rounded_rect(root_rect),
                     "expected_canvas_width_px": round(canvas_width, 2),
                     "expected_canvas_height_px": round(canvas_height, 2),
                     "expected_print_width_css_px": round(print_width, 2),
                     "expected_print_height_css_px": round(print_height, 2),
-                    "screen_matches_canvas": screen_matches,
-                    "print_matches_allowed_canvas": print_matches,
+                    "matches_canvas": matches_canvas,
+                    "matches_physical_print": matches_physical_print,
                 },
-                "The print-media Poster canvas does not match an allowed screen or physical print canvas.",
+                "The rendered Poster canvas does not match the size allowed for this media.",
             )
         )
 
@@ -768,7 +1042,7 @@ def evaluate_dom_snapshot(
     boxy_units: list[Mapping[str, Any]] = []
     micro_units: list[Mapping[str, Any]] = []
     size_bins: set[tuple[int, int]] = set()
-    for element in screen_snapshot.get("elements", []):
+    for element in snapshot.get("elements", []):
         if not isinstance(element, Mapping):
             continue
         tag = str(element.get("tag") or "").lower()
@@ -824,6 +1098,10 @@ def evaluate_dom_snapshot(
             )
         )
 
+    for finding in findings:
+        finding["geometry"] = {"media": media, **finding["geometry"]}
+        finding["message"] = f"{media.capitalize()} media: {finding['message']}"
+
     findings.sort(
         key=lambda item: (
             _FINDING_ORDER[item["code"]],
@@ -836,12 +1114,54 @@ def evaluate_dom_snapshot(
         "passed": not findings,
         "findings": findings,
         "metrics": {
-            "screen_text_node_count": len(text_nodes),
-            "screen_element_count": len(screen_snapshot.get("elements", [])),
-            "screen_image_count": len(screen_snapshot.get("images", [])),
-            "screen_table_count": len(screen_snapshot.get("tables", [])),
-            "screen_panel_count": len(panels),
+            f"{media}_text_node_count": len(text_nodes),
+            f"{media}_element_count": len(snapshot.get("elements", [])),
+            f"{media}_image_count": len(snapshot.get("images", [])),
+            f"{media}_table_count": len(snapshot.get("tables", [])),
+            f"{media}_panel_count": len(panels),
+            **{
+                f"{media}_{key}": value
+                for key, value in canvas_fill_metrics.items()
+            },
         },
+    }
+
+
+def _evaluate_media_snapshots(
+    screen_snapshot: Mapping[str, Any],
+    print_snapshot: Mapping[str, Any],
+    *,
+    canvas: Mapping[str, Any],
+    print_size: Mapping[str, Any],
+) -> dict[str, Any]:
+    evaluations = [
+        evaluate_dom_snapshot(screen_snapshot, canvas=canvas, print_size=print_size),
+        evaluate_dom_snapshot(print_snapshot, canvas=canvas, print_size=print_size),
+    ]
+    findings = [
+        finding
+        for evaluation in evaluations
+        for finding in evaluation["findings"]
+    ]
+    media_order = {"screen": 0, "print": 1}
+    findings.sort(
+        key=lambda item: (
+            _FINDING_ORDER[item["code"]],
+            media_order.get(str(item["geometry"].get("media")), 2),
+            item["block_id"],
+            repr(item["geometry"]),
+        )
+    )
+    metrics = {
+        key: value
+        for evaluation in evaluations
+        for key, value in evaluation["metrics"].items()
+    }
+    return {
+        "format_version": REPORT_FORMAT_VERSION,
+        "passed": all(evaluation["passed"] for evaluation in evaluations),
+        "findings": findings,
+        "metrics": metrics,
     }
 
 
@@ -1033,6 +1353,14 @@ def _dedupe_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return result
 
 
+def _capture_media_snapshot(page: Any, media: str) -> tuple[Mapping[str, Any], bytes]:
+    page.emulate_media(media=media)
+    page.evaluate(_FONT_READY_SCRIPT)
+    snapshot = page.evaluate(browser_probe_script(), media)
+    screenshot = page.screenshot(full_page=True)
+    return snapshot, screenshot
+
+
 def _run_browser_probe(
     *,
     poster: Path,
@@ -1191,10 +1519,6 @@ def _run_browser_probe(
                 try:
                     page.goto(html.as_uri(), wait_until="load", timeout=30000)
                     page.wait_for_timeout(350)
-                    page.evaluate(
-                        "async () => { if (document.fonts && document.fonts.ready) "
-                        "await document.fonts.ready; return true; }"
-                    )
                 except Exception as error:
                     page_errors.append(
                         {
@@ -1203,12 +1527,8 @@ def _run_browser_probe(
                             )
                         }
                     )
-                page.emulate_media(media="screen")
-                screen_snapshot = page.evaluate(_READ_ONLY_MEASUREMENT_SCRIPT, "screen")
-                screen_bytes = page.screenshot(full_page=True)
-                page.emulate_media(media="print")
-                print_snapshot = page.evaluate(_READ_ONLY_MEASUREMENT_SCRIPT, "print")
-                print_bytes = page.screenshot(full_page=True)
+                screen_snapshot, screen_bytes = _capture_media_snapshot(page, "screen")
+                print_snapshot, print_bytes = _capture_media_snapshot(page, "print")
             finally:
                 context.close()
         finally:
@@ -1294,7 +1614,7 @@ def run_poster_dom_audit(
     if artifact_entries_after != artifact_entries_before or artifact_hash_after != artifact_hash_before:
         raise core.IntegrityError("Poster artifact bytes changed during the read-only DOM audit")
 
-    evaluated = evaluate_dom_snapshot(
+    evaluated = _evaluate_media_snapshots(
         screen_snapshot,
         print_snapshot,
         canvas=verified["plan"]["canvas"],

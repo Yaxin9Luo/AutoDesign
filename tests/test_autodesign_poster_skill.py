@@ -1957,7 +1957,20 @@ elif name == "pdfimages" and "-list" in sys.argv:
             cache_root=Path(__import__("os").environ["AUTODESIGN_SKILL_BROWSER_CACHE"]),
             allow_browser_install=False,
         )
-        self.assertTrue(result["passed"], result)
+        self.assertFalse(result["passed"], result)
+        dom_fill_codes = {
+            str(check.get("id"))
+            for check in result["checks"]
+            if check.get("passed") is False
+        }
+        self.assertTrue(
+            {
+                "poster-dom-blank-band",
+                "poster-dom-sparse-oversized-panel",
+            }
+            & dom_fill_codes,
+            result,
+        )
         attempt_root = run / "attempts" / attempt["attempt_id"]
         self.assertGreater((attempt_root / "artifact" / "poster.pdf").stat().st_size, 1000)
         self.assertGreater((attempt_root / "artifact" / "preview.png").stat().st_size, 1000)
