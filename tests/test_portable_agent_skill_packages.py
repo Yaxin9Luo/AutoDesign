@@ -13,6 +13,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 SKILLS_ROOT = REPO_ROOT / "agent_skills"
 SKILLS_README = SKILLS_ROOT / "README.md"
 ROOT_README = REPO_ROOT / "README.md"
+POSTER_ROOT = SKILLS_ROOT / "autodesign-poster"
 APPROVED_SKILLS = (
     "autodesign-poster",
     "autodesign-ppt",
@@ -35,7 +36,96 @@ def _frontmatter(skill_file: Path) -> dict[str, str]:
     return result
 
 
+def _transitive_local_markdown_documents(entrypoint: Path) -> dict[Path, str]:
+    pending = [entrypoint.resolve()]
+    documents: dict[Path, str] = {}
+    while pending:
+        path = pending.pop()
+        if path in documents:
+            continue
+        text = path.read_text(encoding="utf-8")
+        documents[path] = text
+        for target in re.findall(r"\[[^\]]+\]\(([^)]+\.md(?:#[^)]*)?)\)", text):
+            relative = target.split("#", 1)[0]
+            linked = (path.parent / relative).resolve()
+            linked.relative_to(POSTER_ROOT.resolve())
+            pending.append(linked)
+    return documents
+
+
 class PortableAgentSkillPackageTests(unittest.TestCase):
+    def test_poster_skill_teaches_the_agent_first_workflow_without_legacy_shortcuts(self) -> None:
+        skill = (POSTER_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        lower = skill.lower()
+        normalized = " ".join(lower.split())
+        self.assertIn("## workflow", lower)
+        workflow = lower.split("## workflow", 1)[1]
+        ordered_commands = (
+            "doctor",
+            "init",
+            "inspect-source",
+            "crop-source",
+            "list-source-assets",
+            "source-review-context",
+            "record-source-review",
+            "plan",
+            "begin-attempt",
+            "dom-audit",
+            "validate",
+            "review-context",
+            "record-review",
+            "reopen-curation",
+            "finalize",
+        )
+        positions = []
+        for command in ordered_commands:
+            match = re.search(rf"`{re.escape(command)}(?:`|\s)", workflow)
+            self.assertIsNotNone(match, command)
+            assert match is not None
+            positions.append(match.start())
+        self.assertEqual(positions, sorted(positions))
+
+        for marker in (
+            "pdf and complete page renders are the primary semantic surface",
+            "pdfimages is discovery-only and never authorizes evidence",
+            "no mandatory image-count quota",
+            "fresh source review must pass before `plan`",
+            "scripts never edit the poster",
+            "may escalate a repair route but never downgrade it",
+            "`diagnose-v1` is read-only",
+            "does not replace the full autodesign harness",
+        ):
+            self.assertIn(marker, normalized)
+        self.assertRegex(lower, r"fresh (?:vision-capable )?(?:agent|subagent)")
+        self.assertIn("python3", skill)
+        self.assertIn("python", skill)
+        self.assertIn("py -3", skill)
+        for reference in (
+            "references/agent-first-source.md",
+            "references/output-contract.md",
+            "references/review-rubric.md",
+        ):
+            self.assertIn(reference, skill)
+        self.assertNotIn("```json", lower)
+
+        documents = _transitive_local_markdown_documents(POSTER_ROOT / "SKILL.md")
+        self.assertNotIn(
+            (POSTER_ROOT / "references" / "source-grounding.md").resolve(),
+            documents,
+        )
+        for required in (
+            POSTER_ROOT / "references" / "agent-first-source.md",
+            POSTER_ROOT / "references" / "output-contract.md",
+            POSTER_ROOT / "references" / "review-rubric.md",
+        ):
+            self.assertIn(required.resolve(), documents)
+        for document in documents.values():
+            self.assertNotIn("--asset", document)
+            self.assertNotIn("bind-visuals", document)
+            self.assertNotIn("Explicit attached images begin eligible", document)
+            self.assertNotIn("reviewer sidecar binds the visual", document)
+            self.assertNotRegex(document, r"(?i)attempt\s*0?1\b")
+
     def test_news_links_directly_to_agent_skills_readme(self) -> None:
         root_documentation = ROOT_README.read_text(encoding="utf-8")
         launch_rows = [
@@ -189,6 +279,11 @@ class PortableAgentSkillPackageTests(unittest.TestCase):
                     text = path.read_text(encoding="utf-8", errors="ignore").lower()
                     for marker in forbidden:
                         self.assertNotIn(marker, text, f"{path}: {marker}")
+
+    def test_portable_png_is_vendored_only_with_the_poster_package(self) -> None:
+        self.assertTrue((SKILLS_ROOT / "autodesign-poster" / "scripts" / "portable_png.py").is_file())
+        for name in ("autodesign-ppt", "autodesign-webpage", "autodesign-video"):
+            self.assertFalse((SKILLS_ROOT / name / "scripts" / "portable_png.py").exists())
 
     def test_validator_accepts_repository_packages(self) -> None:
         completed = subprocess.run(

@@ -37,6 +37,8 @@ _RELEASE_TOOLS = (
     "package_agent_skills.py",
     "validate_agent_skills.py",
 )
+_INSTALL_RECEIPT_RELATIVE = Path("scripts/install-receipt.json")
+_INSTALL_RECEIPT_SCHEMA = "autodesign-agent-skill-install-receipt-v1"
 
 
 class PackageError(RuntimeError):
@@ -51,7 +53,7 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _verify_checksum(archive_path: Path, checksum_path: Path) -> None:
+def _verify_checksum(archive_path: Path, checksum_path: Path) -> str:
     checksum_path = checksum_path.resolve()
     if not checksum_path.is_file():
         raise PackageError(f"checksum sidecar does not exist: {checksum_path}")
@@ -68,6 +70,38 @@ def _verify_checksum(archive_path: Path, checksum_path: Path) -> None:
     actual = _sha256(archive_path)
     if not hmac.compare_digest(match.group("digest").lower(), actual):
         raise PackageError(f"archive checksum mismatch: {archive_path}")
+    return actual
+
+
+def _release_version_from_archive_name(archive_path: Path, skill_name: str) -> str:
+    prefix = f"{skill_name}-"
+    suffix = ".zip"
+    name = archive_path.name
+    if not name.startswith(prefix) or not name.endswith(suffix):
+        raise PackageError(
+            f"verified install requires a versioned release archive name: {name}"
+        )
+    version = name[len(prefix) : -len(suffix)]
+    if not _VERSION.fullmatch(version):
+        raise PackageError(
+            f"verified install requires a versioned release archive name: {name}"
+        )
+    return version
+
+
+def _install_receipt_bytes(
+    skill_name: str, release_version: str, archive_sha256: str
+) -> bytes:
+    receipt = {
+        "archive_sha256": archive_sha256,
+        "release_version": release_version,
+        "schema": _INSTALL_RECEIPT_SCHEMA,
+        "skill_name": skill_name,
+        "verification_status": "sha256_verified",
+    }
+    return (
+        json.dumps(receipt, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
 
 
 def _package_files(package_root: Path) -> list[Path]:
@@ -139,10 +173,16 @@ def build_release(source_root: Path, output_dir: Path, version: str) -> Path:
 
         manifest_skills: dict[str, dict[str, object]] = {}
         for skill_name in APPROVED_SKILLS:
+            package_root = source_root / skill_name
+            receipt = package_root / _INSTALL_RECEIPT_RELATIVE
+            if receipt.exists() or receipt.is_symlink():
+                raise PackageError(
+                    f"install receipt must not be included in a source archive: {receipt}"
+                )
             archive_name = f"{skill_name}-{version}.zip"
             archive_path = stage / archive_name
             archived_files = _write_archive(
-                source_root / skill_name, skill_name, archive_path
+                package_root, skill_name, archive_path
             )
             digest = _sha256(archive_path)
             (stage / f"{archive_name}.sha256").write_text(
@@ -236,17 +276,23 @@ def install_archive(
         raise PackageError(f"archive does not exist: {archive_path}")
     if checksum_path is not None and allow_unverified:
         raise PackageError("choose checksum verification or --allow-unverified, not both")
+    verified_archive_sha256: str | None = None
     if not allow_unverified:
         if checksum_path is None:
             raise PackageError(
                 "release checksum is required; pass --checksum or explicitly use --allow-unverified"
             )
-        _verify_checksum(archive_path, checksum_path)
+        verified_archive_sha256 = _verify_checksum(archive_path, checksum_path)
     destination = destination.resolve()
     destination.mkdir(parents=True, exist_ok=True)
 
     with zipfile.ZipFile(archive_path) as archive:
         skill_name, infos = _validate_archive(archive)
+        release_version = (
+            _release_version_from_archive_name(archive_path, skill_name)
+            if verified_archive_sha256 is not None
+            else None
+        )
         installed = destination / skill_name
         if installed.exists() or installed.is_symlink():
             raise PackageError(f"installation destination already exists: {installed}")
@@ -271,6 +317,20 @@ def install_archive(
                 target.chmod(_FILE_MODE)
 
             extracted = temporary / skill_name
+            if verified_archive_sha256 is not None:
+                assert release_version is not None
+                receipt_path = extracted / _INSTALL_RECEIPT_RELATIVE
+                if receipt_path.exists() or receipt_path.is_symlink():
+                    raise PackageError(
+                        "source archive contains the reserved install receipt path"
+                    )
+                receipt_path.parent.mkdir(parents=True, exist_ok=True)
+                receipt_path.write_bytes(
+                    _install_receipt_bytes(
+                        skill_name, release_version, verified_archive_sha256
+                    )
+                )
+                receipt_path.chmod(_FILE_MODE)
             validation_errors = validate_skill_package(extracted, skill_name)
             if validation_errors:
                 raise PackageError(
