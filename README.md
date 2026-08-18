@@ -8,6 +8,7 @@
 
 | Date | Update |
 | :--- | :--- |
+| **2026-08-18** | [Poster Skill Agent-first v2: direct PDF curation, revision-bound attempts, and read-only DOM QA](./agent_skills/README.md#poster-agent-first-v2) |
 | **2026-08-17** | [Standalone Agent Skills for Poster, PPT, Webpage, and Video are now installable](./agent_skills/README.md) |
 | **2026-08-15** | [Added official DeepSeek Harness support for coding agents](https://github.com/Yaxin9Luo/AutoDesign/pull/2) |
 | **2026-08-14** | [Initial public release](https://github.com/Yaxin9Luo/AutoDesign/commit/55586f66fa4a126997f0d252e070701c4ae68920) |
@@ -94,6 +95,11 @@ Install the standalone Poster, PPT, Webpage, or Video Skill directly in Codex,
 Claude Code, or DeepSeek Harness. Each Skill carries its own lightweight local
 harness and keeps editable artifacts, evidence, attempts, and review state in
 your chosen output directory—no AutoDesign application server required.
+
+Poster is the first Skill to receive the new Agent-first v2 workflow: the host
+agent can inspect the paper PDF, request deterministic crops, review the source
+catalog, and repair the correct workflow stage while a read-only browser audit
+checks both screen and print output. [See what changed →](./agent_skills/README.md#poster-agent-first-v2)
 
 [Open the Agent Skills install guide →](./agent_skills/README.md)
 
