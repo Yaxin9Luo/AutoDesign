@@ -8,6 +8,7 @@
 
 | 날짜 | 업데이트 |
 | :--- | :--- |
+| **2026-08-18** | [Poster Skill Agent-first v2: PDF 직접 검토, revision-bound 시도, 읽기 전용 DOM QA](./agent_skills/README.md#poster-agent-first-v2) |
 | **2026-08-17** | [Poster, PPT, Webpage, Video용 독립형 Agent Skills 설치 지원](./agent_skills/README.md) |
 | **2026-08-15** | [코딩 에이전트를 위한 공식 DeepSeek Harness 지원 추가](https://github.com/Yaxin9Luo/AutoDesign/pull/2) |
 | **2026-08-14** | [첫 공개 릴리스](https://github.com/Yaxin9Luo/AutoDesign/commit/55586f66fa4a126997f0d252e070701c4ae68920) |
@@ -94,6 +95,11 @@ Figure 2 포스터, 24장짜리 정식 학술 발표 자료, 완전한 에디토
 Harness에 직접 설치할 수 있습니다. 각 Skill에는 가벼운 로컬 하니스가 포함되며,
 편집 가능한 결과물, 근거, 시도 기록, 검토 상태를 사용자가 지정한 출력 디렉터리에
 보관합니다. AutoDesign 애플리케이션 서버는 필요하지 않습니다.
+
+Poster는 Agent-first v2 워크플로를 처음 적용한 Skill입니다. 호스트 Agent가 논문 PDF를
+직접 확인하고, 결정론적 crop을 요청하고, source catalog를 검토하며, 실패 원인에 맞는
+단계로 돌아가 수정할 수 있습니다. 읽기 전용 브라우저 감사는 화면과 인쇄 결과를 모두
+검사합니다. [업데이트 내용 보기 →](./agent_skills/README.md#poster-agent-first-v2)
 
 [Agent Skills 설치 가이드 열기 →](./agent_skills/README.md)
 

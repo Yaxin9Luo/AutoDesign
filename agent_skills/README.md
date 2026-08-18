@@ -28,6 +28,50 @@ workflow never writes generated output into the installed Skill.
 > Harness. Read [Skills vs. the full AutoDesign Harness](#skills-vs-the-full-autodesign-harness)
 > before evaluating output quality.
 
+<a id="poster-agent-first-v2"></a>
+
+## Poster Agent-first v2 · 2026-08-18
+
+Poster is the first portable Skill to receive the Agent-first source workflow.
+The paper PDF remains the source of truth: the host Coding Agent decides what
+matters, while local tools provide deterministic inspection, cropping,
+provenance, validation, and recovery. No paper-specific figure list or
+acceptance label is built into the Skill.
+
+What improved:
+
+- **Direct PDF curation.** The Agent can inspect immutable page rasters and
+  request exact pixel crops instead of being limited to one automatically
+  extracted visual catalog. Fragmented diagrams can be re-ingested as a clean,
+  single source visual.
+- **Reviewed source catalogs.** Canonical selection and review records bind
+  every approved visual to the source page, crop, hash, evidence role, and
+  catalog revision before an authoring attempt can use it.
+- **Revision-bound plans and attempts.** Each attempt snapshots its source,
+  catalog, plan, and authorized assets. Failed reviews route to the right level:
+  retry layout, create a new content plan, or return to the PDF for replacement
+  crops. Earlier attempts remain immutable and inspectable.
+- **Read-only screen and print QA.** One browser probe checks both media modes
+  for 13 stable failure types, including clipping, overflow, undersized text,
+  table escape, broken source-flow structure, and underfilled canvases. It
+  reports findings without rewriting the authored HTML, CSS, text, or layout.
+- **Stronger portable provenance.** Atomic recovery, append-only revision
+  records, archive and release receipts, read-only installation checks, and
+  zero-bytecode operation make runs easier to resume and audit across hosts.
+
+These changes address the main quality bottlenecks observed in the first Skill
+release: weak important-figure selection, fragmented PDF extraction, repairs at
+the wrong workflow level, and layout checks that could not distinguish screen
+from print. The merged code passed a 481-test integration matrix, all 53 product
+smoke checks, the four standalone Skill validators, and real Chromium Poster
+screen/print regression suites.
+
+This is a **Poster-first** update. PPT, Webpage, and Video remain installable and
+retain their existing generation workflows. The 70–80% Harness-equivalence
+goal remains a roadmap target, not a measured claim. The downloadable
+`agent-skills-v0.1.0` bundle is still the initial release; Poster Agent-first v2
+is now on `main` and will be included in the next packaged Skills release.
+
 ## Quick install
 
 Download the checksum-verified release bundle with GitHub CLI:

@@ -8,6 +8,7 @@
 
 | 日期 | 更新 |
 | :--- | :--- |
+| **2026-08-18** | [Poster Skill Agent-first v2：直接理解 PDF、可追溯多轮修订与只读 DOM QA](./agent_skills/README.zh-CN.md#poster-agent-first-v2) |
 | **2026-08-17** | [可独立安装的 Poster、PPT、Webpage 与 Video Agent Skills 现已发布](./agent_skills/README.zh-CN.md) |
 | **2026-08-15** | [正式支持 DeepSeek Harness 作为 Coding Agent](https://github.com/Yaxin9Luo/AutoDesign/pull/2) |
 | **2026-08-14** | [首次公开发布](https://github.com/Yaxin9Luo/AutoDesign/commit/55586f66fa4a126997f0d252e070701c4ae68920) |
@@ -92,6 +93,10 @@
 可将独立的 Poster、PPT、Webpage 或 Video Skill 直接安装到 Codex、Claude Code
 或 DeepSeek Harness。每个 Skill 都带有轻量级本地 harness，并将可编辑成果、证据、
 多轮尝试和评审状态保存在用户指定的输出目录中，无需运行 AutoDesign 应用服务器。
+
+Poster 是第一个接入 Agent-first v2 工作流的 Skill：宿主 Agent 可以直接检查论文 PDF、
+请求确定性裁图、评审来源目录，并根据失败原因回到正确阶段修复；只读浏览器审计会同时
+检查屏幕与打印结果。[查看本次具体提升 →](./agent_skills/README.zh-CN.md#poster-agent-first-v2)
 
 [打开 Agent Skills 中文安装指南 →](./agent_skills/README.zh-CN.md)
 
