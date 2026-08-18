@@ -891,7 +891,6 @@ def begin_poster_attempt(run_dir: Path | str) -> dict[str, Any]:
             }
         )
     source_manifest = _read_json_object(run / "evidence" / "source_manifest.json")
-    source_map_input = attempt / "source-map-input.json"
     context = {
         "format_version": FORMAT_VERSION,
         "attempt_id": attempt_id,
@@ -917,13 +916,11 @@ def begin_poster_attempt(run_dir: Path | str) -> dict[str, Any]:
             [
                 sys.executable,
                 str(Path(__file__).resolve()),
-                "validate",
+                "dom-audit",
                 "--run-dir",
                 str(run),
                 "--attempt",
                 attempt_id,
-                "--source-map",
-                str(source_map_input),
             ]
         ),
     }

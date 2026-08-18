@@ -935,20 +935,17 @@ elif name == "pdfimages" and "-list" in sys.argv:
 
         attempt = harness.begin_poster_attempt(run)
         context = json.loads((run / attempt["authoring_context"]).read_text())
-        source_map = run.absolute() / "attempts" / attempt["attempt_id"] / "source-map-input.json"
 
         self.assertEqual(
             shlex.split(context["next_command"]),
             [
                 sys.executable,
                 str(HARNESS_PATH.resolve()),
-                "validate",
+                "dom-audit",
                 "--run-dir",
                 str(run.absolute()),
                 "--attempt",
                 attempt["attempt_id"],
-                "--source-map",
-                str(source_map),
             ],
         )
 
