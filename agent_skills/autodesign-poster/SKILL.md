@@ -21,8 +21,8 @@ do not assume it is one shell token. Use
 ## Read at the point of use
 
 - Before source selection, read
-  [agent-first-source.md](references/agent-first-source.md) and
-  [source-grounding.md](references/source-grounding.md).
+  [agent-first-source.md](references/agent-first-source.md). It is the visual
+  evidence authority for Poster v2.
 - Before authoring or validation, read
   [output-contract.md](references/output-contract.md).
 - Before either fresh review, read

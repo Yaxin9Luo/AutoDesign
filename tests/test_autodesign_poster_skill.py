@@ -520,6 +520,18 @@ elif name == "pdfimages" and "-list" in sys.argv:
                 self.assertIn("source_flow_relationship", error["error"])
 
     def test_cli_rejects_asset_evidence_before_creating_a_v2_run(self) -> None:
+        help_result = subprocess.run(
+            [sys.executable, str(HARNESS_PATH), "init", "--help"],
+            cwd=self.root,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(
+            help_result.returncode, 0, help_result.stdout + help_result.stderr
+        )
+        self.assertNotIn("--asset", help_result.stdout)
+
         source = self.root / "paper.txt"
         source.write_text("Grounded paper.", encoding="utf-8")
         asset = self.root / "scratch.png"

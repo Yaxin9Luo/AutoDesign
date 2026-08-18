@@ -36,6 +36,12 @@ import setup_browser  # noqa: E402
 
 FORMAT_VERSION = 1
 RELEASE_VERSION = "0.1.0"
+INSTALL_RECEIPT_PATH = Path("scripts/install-receipt.json")
+INSTALL_RECEIPT_SCHEMA = "autodesign-agent-skill-install-receipt-v1"
+_RELEASE_VERSION_RE = re.compile(
+    r"^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$"
+)
+_ARCHIVE_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 DEFAULT_PRESET = "cvpr-landscape"
 DEFAULT_MAX_ATTEMPTS = 4
 SUPPORTED_IMAGE_SUFFIXES = {".gif", ".jpeg", ".jpg", ".png", ".svg", ".webp"}
@@ -346,6 +352,63 @@ def _read_canonical_json_object(path: Path | str) -> dict[str, Any]:
     return value
 
 
+def _load_install_receipt() -> dict[str, str] | None:
+    path = SKILL_ROOT / INSTALL_RECEIPT_PATH
+    if not path.exists() and not path.is_symlink():
+        return None
+    if path.is_symlink() or not path.is_file() or path.stat().st_nlink != 1:
+        raise PosterContractError(f"invalid installed Skill receipt: {path}")
+    try:
+        data = path.read_bytes()
+        value = json.loads(data.decode("utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise PosterContractError(f"invalid installed Skill receipt: {path}") from error
+    expected_keys = {
+        "archive_sha256",
+        "release_version",
+        "schema",
+        "skill_name",
+        "verification_status",
+    }
+    if not isinstance(value, dict) or set(value) != expected_keys:
+        raise PosterContractError(f"invalid installed Skill receipt: {path}")
+    if data != core._stored_json_bytes(value):
+        raise PosterContractError(f"installed Skill receipt is not canonical JSON: {path}")
+    if (
+        value.get("schema") != INSTALL_RECEIPT_SCHEMA
+        or value.get("verification_status") != "sha256_verified"
+        or value.get("skill_name") != SKILL_ROOT.name
+        or not isinstance(value.get("release_version"), str)
+        or _RELEASE_VERSION_RE.fullmatch(value["release_version"]) is None
+        or not isinstance(value.get("archive_sha256"), str)
+        or _ARCHIVE_SHA256_RE.fullmatch(value["archive_sha256"]) is None
+    ):
+        raise PosterContractError(f"invalid installed Skill receipt: {path}")
+    return value
+
+
+def _resolve_release_provenance(
+    release_version: str | None, archive_sha256: str | None
+) -> tuple[str, str | None]:
+    receipt = _load_install_receipt()
+    if receipt is None:
+        return (
+            RELEASE_VERSION if release_version is None else release_version,
+            archive_sha256,
+        )
+    installed_version = receipt["release_version"]
+    installed_sha256 = receipt["archive_sha256"]
+    if release_version is not None and release_version != installed_version:
+        raise PosterContractError(
+            "--release-version differs from the verified installed Skill receipt"
+        )
+    if archive_sha256 is not None and archive_sha256 != installed_sha256:
+        raise PosterContractError(
+            "--archive-sha256 differs from the verified installed Skill receipt"
+        )
+    return installed_version, installed_sha256
+
+
 def _read_run(run_dir: Path | str) -> dict[str, Any]:
     return _read_json_object(Path(run_dir) / "run.json")
 
@@ -617,7 +680,7 @@ def initialize_poster_run(
     *,
     extra_assets: Sequence[Path | str] = (),
     reference_images: Sequence[Path | str] = (),
-    release_version: str = RELEASE_VERSION,
+    release_version: str | None = None,
     archive_sha256: str | None = None,
 ) -> dict[str, Any]:
     if extra_assets:
@@ -630,6 +693,9 @@ def initialize_poster_run(
         raise PosterContractError(
             "v2 init cannot modify a legacy run; use diagnose-v1 for read-only inspection"
         )
+    release_version, archive_sha256 = _resolve_release_provenance(
+        release_version, archive_sha256
+    )
     core.initialize_run(
         run_dir,
         SKILL_ROOT,
@@ -2141,9 +2207,15 @@ def _build_parser() -> argparse.ArgumentParser:
     initialize = subparsers.add_parser("init", help="initialize a run and prepare source evidence")
     initialize.add_argument("--run-dir", type=Path, required=True)
     initialize.add_argument("--source", type=Path, required=True)
-    initialize.add_argument("--asset", action="append", type=Path, default=[])
+    initialize.add_argument(
+        "--asset",
+        action="append",
+        type=Path,
+        default=[],
+        help=argparse.SUPPRESS,
+    )
     initialize.add_argument("--reference", action="append", type=Path, default=[])
-    initialize.add_argument("--release-version", default=RELEASE_VERSION)
+    initialize.add_argument("--release-version")
     initialize.add_argument("--archive-sha256")
     evidence = subparsers.add_parser("evidence", help="retrieve grounded paper evidence")
     evidence.add_argument("--run-dir", type=Path, required=True)

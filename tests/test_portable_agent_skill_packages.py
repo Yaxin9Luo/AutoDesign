@@ -36,6 +36,23 @@ def _frontmatter(skill_file: Path) -> dict[str, str]:
     return result
 
 
+def _transitive_local_markdown_documents(entrypoint: Path) -> dict[Path, str]:
+    pending = [entrypoint.resolve()]
+    documents: dict[Path, str] = {}
+    while pending:
+        path = pending.pop()
+        if path in documents:
+            continue
+        text = path.read_text(encoding="utf-8")
+        documents[path] = text
+        for target in re.findall(r"\[[^\]]+\]\(([^)]+\.md(?:#[^)]*)?)\)", text):
+            relative = target.split("#", 1)[0]
+            linked = (path.parent / relative).resolve()
+            linked.relative_to(POSTER_ROOT.resolve())
+            pending.append(linked)
+    return documents
+
+
 class PortableAgentSkillPackageTests(unittest.TestCase):
     def test_poster_skill_teaches_the_agent_first_workflow_without_legacy_shortcuts(self) -> None:
         skill = (POSTER_ROOT / "SKILL.md").read_text(encoding="utf-8")
@@ -91,17 +108,22 @@ class PortableAgentSkillPackageTests(unittest.TestCase):
             self.assertIn(reference, skill)
         self.assertNotIn("```json", lower)
 
-        documents = [
-            skill,
-            *(path.read_text(encoding="utf-8") for path in (
-                POSTER_ROOT / "references" / "agent-first-source.md",
-                POSTER_ROOT / "references" / "output-contract.md",
-                POSTER_ROOT / "references" / "review-rubric.md",
-            )),
-        ]
-        for document in documents:
+        documents = _transitive_local_markdown_documents(POSTER_ROOT / "SKILL.md")
+        self.assertNotIn(
+            (POSTER_ROOT / "references" / "source-grounding.md").resolve(),
+            documents,
+        )
+        for required in (
+            POSTER_ROOT / "references" / "agent-first-source.md",
+            POSTER_ROOT / "references" / "output-contract.md",
+            POSTER_ROOT / "references" / "review-rubric.md",
+        ):
+            self.assertIn(required.resolve(), documents)
+        for document in documents.values():
             self.assertNotIn("--asset", document)
             self.assertNotIn("bind-visuals", document)
+            self.assertNotIn("Explicit attached images begin eligible", document)
+            self.assertNotIn("reviewer sidecar binds the visual", document)
             self.assertNotRegex(document, r"(?i)attempt\s*0?1\b")
 
     def test_news_links_directly_to_agent_skills_readme(self) -> None:

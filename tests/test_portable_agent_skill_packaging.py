@@ -27,6 +27,8 @@ APPROVED_SKILLS = (
     "autodesign-webpage",
     "autodesign-video",
 )
+INSTALL_RECEIPT_RELATIVE = Path("scripts/install-receipt.json")
+INSTALL_RECEIPT_SCHEMA = "autodesign-agent-skill-install-receipt-v1"
 
 
 def _build(output_dir: Path, source_root: Path = SKILLS_ROOT) -> subprocess.CompletedProcess[str]:
@@ -175,7 +177,20 @@ class PortableAgentSkillPackagingTests(unittest.TestCase):
             )
 
             self.assertEqual(install.returncode, 0, install.stdout + install.stderr)
-            self.assertTrue((destination / APPROVED_SKILLS[0] / "SKILL.md").is_file())
+            installed = destination / APPROVED_SKILLS[0]
+            self.assertTrue((installed / "SKILL.md").is_file())
+            archive_digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+            self.assertTrue((installed / INSTALL_RECEIPT_RELATIVE).is_file())
+            self.assertEqual(
+                json.loads((installed / INSTALL_RECEIPT_RELATIVE).read_text(encoding="utf-8")),
+                {
+                    "archive_sha256": archive_digest,
+                    "release_version": VERSION,
+                    "schema": INSTALL_RECEIPT_SCHEMA,
+                    "skill_name": APPROVED_SKILLS[0],
+                    "verification_status": "sha256_verified",
+                },
+            )
             after = {
                 path.relative_to(release).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
                 for path in release.rglob("*")
@@ -196,6 +211,12 @@ class PortableAgentSkillPackagingTests(unittest.TestCase):
 
             archive = release_a / f"autodesign-poster-{VERSION}.zip"
             checksum = release_a / f"{archive.name}.sha256"
+            archive_digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+            with zipfile.ZipFile(archive) as bundle:
+                self.assertNotIn(
+                    f"autodesign-poster/{INSTALL_RECEIPT_RELATIVE.as_posix()}",
+                    bundle.namelist(),
+                )
             destination = temp / "host-root" / "skills"
             outside = temp / "unrelated-working-directory"
             mutable = temp / "mutable"
@@ -249,6 +270,9 @@ class PortableAgentSkillPackagingTests(unittest.TestCase):
                 help_result = run_cli("--help")
                 self.assertEqual(help_result.returncode, 0, help_result.stdout + help_result.stderr)
                 self.assertIn("inspect-source", help_result.stdout)
+                init_help = run_cli("init", "--help")
+                self.assertEqual(init_help.returncode, 0, init_help.stdout + init_help.stderr)
+                self.assertNotIn("--asset", init_help.stdout)
 
                 doctor = run_cli(
                     "doctor",
@@ -271,10 +295,6 @@ class PortableAgentSkillPackagingTests(unittest.TestCase):
                     str(run),
                     "--source",
                     str(source),
-                    "--release-version",
-                    VERSION,
-                    "--archive-sha256",
-                    hashlib.sha256(archive.read_bytes()).hexdigest(),
                 )
                 self.assertEqual(
                     initialized.returncode,
@@ -284,6 +304,21 @@ class PortableAgentSkillPackagingTests(unittest.TestCase):
                 self.assertEqual(
                     json.loads(initialized.stdout)["resume"]["next_action"],
                     "inspect_source",
+                )
+                snapshot = json.loads(
+                    (run / "skill_snapshot" / "manifest.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+                self.assertEqual(snapshot["release_version"], VERSION)
+                self.assertEqual(snapshot["archive_sha256"], archive_digest)
+                snapshot_files = {entry["path"]: entry for entry in snapshot["files"]}
+                self.assertIn(INSTALL_RECEIPT_RELATIVE.as_posix(), snapshot_files)
+                self.assertEqual(
+                    snapshot_files[INSTALL_RECEIPT_RELATIVE.as_posix()]["sha256"],
+                    hashlib.sha256(
+                        (installed / INSTALL_RECEIPT_RELATIVE).read_bytes()
+                    ).hexdigest(),
                 )
 
                 inspected = run_cli("inspect-source", "--run-dir", str(run))
@@ -328,6 +363,213 @@ class PortableAgentSkillPackagingTests(unittest.TestCase):
                     )
             finally:
                 _make_tree_removable(installed)
+
+    def test_verified_install_rejects_an_unversioned_archive_name(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            temp = Path(temporary)
+            release = temp / "release"
+            result = _build(release)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            source = release / f"autodesign-poster-{VERSION}.zip"
+            archive = temp / "autodesign-poster-latest.zip"
+            shutil.copyfile(source, archive)
+            digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+            checksum = temp / f"{archive.name}.sha256"
+            checksum.write_text(f"{digest}  {archive.name}\n", encoding="utf-8")
+
+            install = subprocess.run(
+                [
+                    sys.executable,
+                    str(release / "package_agent_skills.py"),
+                    "install",
+                    "--archive",
+                    str(archive),
+                    "--checksum",
+                    str(checksum),
+                    "--destination",
+                    str(temp / "skills"),
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertNotEqual(install.returncode, 0)
+            self.assertIn("versioned release archive name", install.stdout + install.stderr)
+            self.assertFalse((temp / "skills" / "autodesign-poster").exists())
+
+    def test_unverified_manual_install_keeps_existing_init_provenance_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            temp = Path(temporary)
+            release = temp / "release"
+            result = _build(release)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            archive = release / f"autodesign-poster-{VERSION}.zip"
+            destination = temp / "skills"
+            install = subprocess.run(
+                [
+                    sys.executable,
+                    str(release / "package_agent_skills.py"),
+                    "install",
+                    "--archive",
+                    str(archive),
+                    "--allow-unverified",
+                    "--destination",
+                    str(destination),
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(install.returncode, 0, install.stdout + install.stderr)
+            installed = destination / "autodesign-poster"
+            self.assertFalse((installed / INSTALL_RECEIPT_RELATIVE).exists())
+            harness = installed / "scripts" / "poster_harness.py"
+            source = temp / "paper.md"
+            source.write_text("# Manual source\n", encoding="utf-8")
+
+            default_run = temp / "default-run"
+            default_init = subprocess.run(
+                [
+                    sys.executable,
+                    "-B",
+                    str(harness),
+                    "init",
+                    "--run-dir",
+                    str(default_run),
+                    "--source",
+                    str(source),
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(
+                default_init.returncode, 0, default_init.stdout + default_init.stderr
+            )
+            default_snapshot = json.loads(
+                (default_run / "skill_snapshot" / "manifest.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(default_snapshot["release_version"], "0.1.0")
+            self.assertIsNone(default_snapshot["archive_sha256"])
+
+            explicit_run = temp / "explicit-run"
+            explicit_digest = "a" * 64
+            explicit_init = subprocess.run(
+                [
+                    sys.executable,
+                    "-B",
+                    str(harness),
+                    "init",
+                    "--run-dir",
+                    str(explicit_run),
+                    "--source",
+                    str(source),
+                    "--release-version",
+                    "manual-build",
+                    "--archive-sha256",
+                    explicit_digest,
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(
+                explicit_init.returncode, 0, explicit_init.stdout + explicit_init.stderr
+            )
+            explicit_snapshot = json.loads(
+                (explicit_run / "skill_snapshot" / "manifest.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(explicit_snapshot["release_version"], "manual-build")
+            self.assertEqual(explicit_snapshot["archive_sha256"], explicit_digest)
+
+    def test_installed_poster_rejects_tampered_receipt_and_explicit_mismatches(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            temp = Path(temporary)
+            release = temp / "release"
+            result = _build(release)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            archive = release / f"autodesign-poster-{VERSION}.zip"
+            checksum = release / f"{archive.name}.sha256"
+            destination = temp / "skills"
+            install = subprocess.run(
+                [
+                    sys.executable,
+                    str(release / "package_agent_skills.py"),
+                    "install",
+                    "--archive",
+                    str(archive),
+                    "--checksum",
+                    str(checksum),
+                    "--destination",
+                    str(destination),
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(install.returncode, 0, install.stdout + install.stderr)
+            installed = destination / "autodesign-poster"
+            source = temp / "paper.md"
+            source.write_text("# Grounded source\n", encoding="utf-8")
+
+            for label, extra in (
+                ("release-version", ["--release-version", "9.9.9"]),
+                ("archive-digest", ["--archive-sha256", "b" * 64]),
+            ):
+                with self.subTest(mismatch=label):
+                    run = temp / f"mismatch-{label}"
+                    completed = subprocess.run(
+                        [
+                            sys.executable,
+                            "-B",
+                            str(installed / "scripts" / "poster_harness.py"),
+                            "init",
+                            "--run-dir",
+                            str(run),
+                            "--source",
+                            str(source),
+                            *extra,
+                        ],
+                        text=True,
+                        capture_output=True,
+                        check=False,
+                    )
+                    self.assertEqual(completed.returncode, 1)
+                    self.assertEqual(json.loads(completed.stdout)["status"], "error")
+                    self.assertFalse(run.exists())
+
+            receipt_path = installed / INSTALL_RECEIPT_RELATIVE
+            self.assertTrue(receipt_path.is_file())
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            receipt["verification_status"] = "unknown"
+            receipt_path.write_text(
+                json.dumps(receipt, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            tampered_run = temp / "tampered-run"
+            tampered = subprocess.run(
+                [
+                    sys.executable,
+                    "-B",
+                    str(installed / "scripts" / "poster_harness.py"),
+                    "init",
+                    "--run-dir",
+                    str(tampered_run),
+                    "--source",
+                    str(source),
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(tampered.returncode, 1)
+            self.assertEqual(json.loads(tampered.stdout)["status"], "error")
+            self.assertFalse(tampered_run.exists())
 
     def test_build_refuses_to_overwrite_an_existing_release(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
