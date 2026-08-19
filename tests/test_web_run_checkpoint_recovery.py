@@ -147,6 +147,7 @@ class WebRunCheckpointRecoveryTests(unittest.IsolatedAsyncioTestCase):
                 brief="Create a poster",
                 attach_paths=[],
                 conversation_id="conversation-1",
+                canvas_preset_id="auto",
                 palette_id="plum_sage",
                 authoring_max_attempts=4,
             )
@@ -185,6 +186,10 @@ class WebRunCheckpointRecoveryTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(
                     start_worker.await_args.kwargs["resume_run"],
                     run_id,
+                )
+                self.assertEqual(
+                    start_worker.await_args.kwargs["state"].canvas_preset_id,
+                    "auto",
                 )
                 monitor_worker.assert_awaited_once_with(
                     run_id=ack.run_id,

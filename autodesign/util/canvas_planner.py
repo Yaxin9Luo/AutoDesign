@@ -9,11 +9,11 @@ from __future__ import annotations
 
 import re
 from copy import deepcopy
-from math import gcd
+from math import gcd, isfinite
 from pathlib import Path
 from typing import Any
 
-from ..config import resolve_template
+from ..config import POSTER_TEMPLATES, resolve_template
 from .reference_poster import reference_canvas_from_metadata
 
 CanvasPlan = dict[str, Any]
@@ -44,12 +44,64 @@ _EVENT_TOKENS = (
     "活动", "电影", "音乐", "演出", "展览", "讲座",
 )
 _PRODUCT_TOKENS = ("product", "promo", "campaign", "social", "ad", "商品", "促销")
-_CVPR_CANONICAL_PAPER_PRESETS = {
-    "academic-wide-2x1",
-    "academic-wide-3280x1860",
-    "academic-landscape-1.414",
-    "cvpr-landscape",
-}
+
+
+class CanvasIntentError(ValueError):
+    """A stable validation failure for explicit current-request geometry."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+def parse_canvas_intent(brief: str) -> dict[str, Any] | None:
+    """Parse compatible canvas directives from the current user request only."""
+    text = _current_request_text((brief or "").lower())
+    pixels = _explicit_canvas_pixel_values(text)
+    templates = _explicit_template_ids(text)
+    ratios = _explicit_ratio_values(text)
+    orientations = _explicit_orientations(text)
+
+    if len(set(pixels)) > 1:
+        _raise_canvas_conflict("Multiple exact canvas sizes disagree.")
+    if len(set(templates)) > 1:
+        template_ratios = {_template_ratio(value) for value in templates}
+        if len(template_ratios) > 1:
+            _raise_canvas_conflict("Multiple named canvas templates disagree.")
+    if ratios:
+        first_ratio = ratios[0][0]
+        if any(not _ratios_match(first_ratio, ratio) for ratio, _label in ratios[1:]):
+            _raise_canvas_conflict("Multiple canvas aspect ratios disagree.")
+    if len(set(orientations)) > 1:
+        _raise_canvas_conflict("Landscape and portrait were both requested.")
+
+    pixel_value = pixels[0] if pixels else None
+    template_id = templates[0] if templates else None
+    ratio_value = ratios[0] if ratios else None
+    orientation = orientations[0] if orientations else None
+    constraints: list[tuple[str, float]] = []
+    if pixel_value:
+        constraints.append(("exact pixels", pixel_value[0] / pixel_value[1]))
+    if template_id:
+        constraints.append(("named template", _template_ratio(template_id)))
+    if ratio_value:
+        constraints.append(("aspect ratio", ratio_value[0]))
+    if constraints:
+        base_name, base_ratio = constraints[0]
+        for name, ratio in constraints[1:]:
+            if not _ratios_match(base_ratio, ratio):
+                _raise_canvas_conflict(f"{base_name.title()} and {name} disagree.")
+        if orientation and _orientation_for_ratio(base_ratio) != orientation:
+            _raise_canvas_conflict("Canvas orientation disagrees with the requested geometry.")
+
+    if not any((pixel_value, template_id, ratio_value, orientation)):
+        return None
+    return {
+        "pixels": pixel_value,
+        "template_id": template_id,
+        "ratio": ratio_value,
+        "orientation": orientation,
+    }
 
 
 def plan_canvas(
@@ -63,16 +115,21 @@ def plan_canvas(
     text = (brief or "").lower()
     request_text = _current_request_text(text)
     artifact_type = _infer_artifact_type(request_text)
+    prompt_intent = parse_canvas_intent(brief)
+    prompt_template_id = prompt_intent.get("template_id") if prompt_intent else None
+    if prompt_template_id and artifact_type != "poster":
+        _raise_canvas_conflict(
+            "A Poster template cannot be combined with a different explicit artifact type."
+        )
     template_key: str | None = None
     template_canvas: dict[str, object] | None = None
     if requested_template:
-        requested_key = _norm(requested_template)
-        template_key = "cvpr-landscape" if requested_key in _CVPR_CANONICAL_PAPER_PRESETS else requested_key
+        template_key = _norm(requested_template)
         template_canvas = resolve_template(template_key)
         if template_canvas:
             artifact_type = "poster"
 
-    explicit_pixels = _explicit_canvas_pixels(request_text)
+    explicit_pixels = prompt_intent.get("pixels") if prompt_intent else None
     if explicit_pixels is not None:
         width, height = explicit_pixels
         divisor = gcd(width, height)
@@ -95,6 +152,49 @@ def plan_canvas(
             source="explicit_pixels",
             rationale=f"User wording requested an exact {width}x{height} pixel canvas.",
         )
+    prompt_template = prompt_template_id
+    if prompt_template:
+        prompt_canvas = resolve_template(prompt_template) or {}
+        plan = _plan(
+            artifact_type="poster",
+            poster_subtype=_subtype_from_template(prompt_template),
+            preset_id=prompt_template,
+            canvas=prompt_canvas,
+            lock_level="hard",
+            source="explicit_template",
+            rationale=f"User wording selected the registered template {prompt_template!r}.",
+        )
+        if prompt_template == "cvpr-landscape":
+            return _with_body_grid(plan, "editorial_3col")
+        return plan
+    prompt_ratio = prompt_intent.get("ratio") if prompt_intent else None
+    prompt_orientation = prompt_intent.get("orientation") if prompt_intent else None
+    if artifact_type == "poster" and prompt_ratio:
+        ratio, aspect_label = prompt_ratio
+        preset_id = _preset_id_for_ratio(ratio, aspect_label)
+        return _plan(
+            artifact_type="poster",
+            poster_subtype=_subtype_from_template(preset_id, text=text),
+            preset_id=preset_id,
+            canvas=_canvas_for_ratio(ratio, aspect_label),
+            lock_level="hard",
+            source="explicit_ratio",
+            rationale=f"User wording requested a {aspect_label} poster canvas.",
+        )
+    if artifact_type == "poster" and prompt_orientation:
+        preset_id = "cvpr-landscape" if prompt_orientation == "landscape" else "event-2x3"
+        plan = _plan(
+            artifact_type="poster",
+            poster_subtype=_subtype_from_template(preset_id, text=text),
+            preset_id=preset_id,
+            canvas=resolve_template(preset_id) or {},
+            lock_level="hard",
+            source="explicit_orientation",
+            rationale=f"User wording requested {prompt_orientation} poster orientation.",
+        )
+        if preset_id == "cvpr-landscape":
+            return _with_body_grid(plan, "editorial_3col")
+        return plan
     if requested_template and template_key and template_canvas:
         plan = _plan(
             artifact_type="poster",
@@ -138,20 +238,6 @@ def plan_canvas(
             lock_level="advisory",
             source="artifact_default",
             rationale="Video artifacts use a 16:9 scene canvas by default.",
-        )
-
-    explicit = _explicit_poster_preset(request_text)
-    if explicit is not None:
-        preset_id, source = explicit
-        canvas = resolve_template(preset_id) or {}
-        return _plan(
-            artifact_type="poster",
-            poster_subtype=_subtype_from_template(preset_id, text=text),
-            preset_id=preset_id,
-            canvas=canvas,
-            lock_level="hard" if source == "explicit_ratio" else "soft",
-            source=source,
-            rationale=f"User wording selected poster preset {preset_id}.",
         )
 
     reference_canvas = reference_canvas_from_metadata(reference_metadata or {})
@@ -479,9 +565,9 @@ def _plan(
 
 
 def _infer_artifact_type(text: str) -> str:
-    explicit_type = re.search(r"(?:^|\n)\s*type\s*:\s*(poster|landing|deck|video)\b", text)
+    explicit_type = _explicit_artifact_type(text)
     if explicit_type:
-        return explicit_type.group(1)
+        return explicit_type
     if _has_any(text, _DECK_TOKENS):
         return "deck"
     if _has_any(text, _LANDING_TOKENS):
@@ -493,49 +579,169 @@ def _infer_artifact_type(text: str) -> str:
     return "poster"
 
 
+def _explicit_artifact_type(text: str) -> str | None:
+    match = re.search(r"(?:^|\n)\s*type\s*:\s*(poster|landing|deck|video)\b", text)
+    return match.group(1) if match else None
+
+
 def _current_request_text(text: str) -> str:
     marker = "[user's current request:]"
     return text.rsplit(marker, 1)[-1] if marker in text else text
 
 
-def _explicit_poster_preset(text: str) -> tuple[str, str] | None:
-    if "a0" in text:
-        if _has_any(text, ("landscape", "horizontal", "横版", "横向")):
-            return ("a0-landscape", "explicit_ratio")
-        return ("a0-portrait", "explicit_ratio")
-    ratios = (
-        (r"\b2\s*[:x×]\s*1\b", "cvpr-landscape"),
-        (r"\b4\s*[:x×]\s*3\b", "poster-classic-4x3"),
-        (r"\b3\s*[:x×]\s*4\b", "neurips-portrait"),
-        (r"\b2\s*[:x×]\s*3\b", "event-2x3"),
-        (r"\b4\s*[:x×]\s*5\b", "social-4x5"),
-        (r"\b9\s*[:x×]\s*16\b", "story-9x16"),
-        (r"\b1\s*[:x×]\s*1\b", "square-1x1"),
-    )
-    for pattern, preset in ratios:
-        if re.search(pattern, text):
-            return (preset, "explicit_ratio")
-    if _has_any(text, _LANDSCAPE_PAPER_TOKENS):
-        return ("cvpr-landscape", "explicit_orientation")
-    if _has_any(text, ("竖版", "竖向", "portrait", "vertical")):
-        return ("event-2x3", "explicit_orientation")
-    return None
-
-
 def _explicit_canvas_pixels(text: str) -> tuple[int, int] | None:
+    values = _explicit_canvas_pixel_values(text)
+    return values[0] if values else None
+
+
+def _explicit_canvas_pixel_values(text: str) -> list[tuple[int, int]]:
     patterns = (
         r"(?<!\d)(\d{2,5})\s*[x×]\s*(\d{2,5})\s*(?:px|pixels?|像素)(?!\w)",
         r"(?:canvas|size|画布|尺寸)[^\n]{0,40}?(\d{2,5})\s*[x×]\s*(\d{2,5})(?!\d)",
         r"\bw_px\s*[:=]\s*(\d{2,5})\b[^\n]{0,80}?\bh_px\s*[:=]\s*(\d{2,5})\b",
     )
+    values: list[tuple[int, int]] = []
     for pattern in patterns:
-        match = re.search(pattern, text, flags=re.IGNORECASE)
-        if not match:
+        for match in re.finditer(pattern, text, flags=re.IGNORECASE):
+            width, height = int(match.group(1)), int(match.group(2))
+            value = (width, height)
+            if width >= 64 and height >= 64 and value not in values:
+                values.append(value)
+    return values
+
+
+def _explicit_template_ids(text: str) -> list[str]:
+    values: list[str] = []
+    explicit_pattern = re.compile(
+        r"(?:template|preset|模板|预设)\s*[:：=]\s*([a-z0-9][a-z0-9_.-]*)",
+        flags=re.IGNORECASE,
+    )
+    for match in explicit_pattern.finditer(text):
+        key = _norm(match.group(1))
+        if resolve_template(key) is None:
+            raise CanvasIntentError(
+                "unknown_canvas_template",
+                f"Unknown canvas template: {match.group(1)}",
+            )
+        if key not in values:
+            values.append(key)
+    for template_id in POSTER_TEMPLATES:
+        pattern = rf"(?<![a-z0-9_-]){re.escape(template_id)}(?![a-z0-9_-])"
+        if re.search(pattern, text) and template_id not in values:
+            values.append(template_id)
+    if re.search(r"\bcvpr\b", text) and _has_any(text, ("template", "preset", "landscape", "poster")):
+        if "cvpr-landscape" not in values:
+            values.append("cvpr-landscape")
+    if re.search(r"\ba0\b", text):
+        a0_id = (
+            "a0-landscape"
+            if _has_any(text, ("landscape", "horizontal", "横版", "横向"))
+            else "a0-portrait"
+        )
+        if a0_id not in values:
+            values.append(a0_id)
+    return values
+
+
+def _explicit_ratio_values(text: str) -> list[tuple[float, str]]:
+    values: list[tuple[float, str]] = []
+    pattern = re.compile(
+        r"(?<![\w.-])([+-]?\d+(?:\.\d+)?)\s*([:/x×])\s*([+-]?\d+(?:\.\d+)?)(?![\d.])",
+        flags=re.IGNORECASE,
+    )
+    for match in pattern.finditer(text):
+        left = float(match.group(1))
+        right = float(match.group(3))
+        if not isfinite(left) or not isfinite(right) or left <= 0 or right <= 0:
+            raise CanvasIntentError(
+                "invalid_canvas_ratio",
+                "Canvas aspect ratio values must be finite and greater than zero.",
+            )
+        if match.group(2).lower() in {"x", "×"} and left >= 64 and right >= 64:
             continue
-        width, height = int(match.group(1)), int(match.group(2))
-        if width >= 64 and height >= 64:
-            return width, height
-    return None
+        ratio = left / right
+        label = f"{_format_ratio_number(left)}:{_format_ratio_number(right)}"
+        if not any(_ratios_match(ratio, prior) for prior, _prior_label in values):
+            values.append((ratio, label))
+    return values
+
+
+def _explicit_orientations(text: str) -> list[str]:
+    values: list[str] = []
+    if _has_any(text, _LANDSCAPE_PAPER_TOKENS):
+        values.append("landscape")
+    if _has_any(text, ("竖版", "竖向", "portrait", "vertical")):
+        values.append("portrait")
+    return values
+
+
+def _template_ratio(template_id: str) -> float:
+    canvas = resolve_template(template_id) or {}
+    aspect = str(canvas.get("aspect_ratio") or "")
+    match = re.fullmatch(r"\s*([0-9.]+)\s*:\s*([0-9.]+)\s*", aspect)
+    if match and float(match.group(2)) > 0:
+        return float(match.group(1)) / float(match.group(2))
+    return float(canvas["w_px"]) / float(canvas["h_px"])
+
+
+def _ratios_match(left: float, right: float) -> bool:
+    return abs(left - right) <= max(abs(left), abs(right), 1.0) * 0.001
+
+
+def _orientation_for_ratio(ratio: float) -> str:
+    if _ratios_match(ratio, 1.0):
+        return "square"
+    return "landscape" if ratio > 1.0 else "portrait"
+
+
+def _raise_canvas_conflict(message: str) -> None:
+    raise CanvasIntentError("conflicting_canvas_directives", message)
+
+
+def _format_ratio_number(value: float) -> str:
+    return f"{value:g}"
+
+
+def _nearest_even(value: float) -> int:
+    return max(2, int(round(value / 2.0)) * 2)
+
+
+def _canvas_for_ratio(ratio: float, aspect_label: str) -> dict[str, object]:
+    short_edge = 1536
+    max_long_edge = 4096
+    if ratio >= 1.0:
+        width = _nearest_even(short_edge * ratio)
+        height = short_edge
+        if width > max_long_edge:
+            width = max_long_edge
+            height = _nearest_even(width / ratio)
+    else:
+        width = short_edge
+        height = _nearest_even(short_edge / ratio)
+        if height > max_long_edge:
+            height = max_long_edge
+            width = _nearest_even(height * ratio)
+    return {
+        "w_px": width,
+        "h_px": height,
+        "dpi": 150,
+        "aspect_ratio": aspect_label,
+        "color_mode": "RGB",
+    }
+
+
+def _preset_id_for_ratio(ratio: float, aspect_label: str) -> str:
+    canonical = (
+        (2.0, "cvpr-landscape"),
+        (5 / 3, "academic-landscape-5x3"),
+        (1.4, "academic-landscape-1.4"),
+        (4 / 3, "poster-classic-4x3"),
+        (3 / 4, "neurips-portrait"),
+    )
+    for expected, preset_id in canonical:
+        if _ratios_match(ratio, expected):
+            return preset_id
+    return "custom-ratio-" + aspect_label.replace(":", "x").replace(".", "p")
 
 
 def _subtype_from_template(template: str, *, text: str = "") -> str:

@@ -66,6 +66,7 @@ from autodesign.config import (
     load_settings,
     mark_harness_login,
     normalize_model_id,
+    poster_canvas_preset_catalog,
     resolve_codex_runtime,
     resolve_deepseek_harness_runtime,
     resolve_harness_binary,
@@ -79,6 +80,7 @@ from autodesign.harness_matrix import (
     run_harness_matrix,
 )
 from autodesign.runner import _load_resume_state
+from autodesign.util.canvas_planner import CanvasIntentError, parse_canvas_intent
 from autodesign.run_control import (
     CancellationToken,
     InvalidRunTransition,
@@ -590,6 +592,7 @@ class RunReserveRequest(BaseModel):
     prior_artifacts: str | None = None
     conversation_id: str | None = None
     template: str | None = None
+    canvas_preset_id: str | None = None
     authoring_max_attempts: int | None = None
     input_slots: list[RunInputSlotRequest] = Field(default_factory=list)
 
@@ -1711,7 +1714,7 @@ class _RunState:
     __slots__ = ("artifact_type", "task", "created_at", "result_message",
                  "result_artifact", "error", "cancelled", "designer_model",
                  "has_pdf", "brief", "attach_paths", "reference_poster_path", "baseline_artifact_json",
-                 "conversation_id", "template", "palette_id", "authoring_max_attempts",
+                 "conversation_id", "template", "canvas_preset_id", "palette_id", "authoring_max_attempts",
                  "demo_user_id", "queued", "reservation_token", "input_slot_roles",
                  "reference_poster_handle")
 
@@ -1727,6 +1730,7 @@ class _RunState:
         baseline_artifact_json: str | None = None,
         conversation_id: str = "",
         template: str | None = None,
+        canvas_preset_id: str | None = None,
         palette_id: str | None = None,
         authoring_max_attempts: int | None = None,
         input_slot_roles: dict[str, str] | None = None,
@@ -1753,6 +1757,7 @@ class _RunState:
         self.baseline_artifact_json: str | None = baseline_artifact_json
         self.conversation_id: str = conversation_id
         self.template: str | None = template
+        self.canvas_preset_id: str | None = canvas_preset_id
         self.palette_id: str | None = palette_id
         self.authoring_max_attempts: int | None = authoring_max_attempts
         self.demo_user_id: str = ""
@@ -4227,6 +4232,101 @@ def palettes(artifact_type: str = Query(...)) -> dict[str, Any]:
         ) from exc
 
 
+@app.get("/api/canvas-presets")
+def canvas_presets(artifact_type: str = Query(...)) -> dict[str, Any]:
+    if artifact_type != "poster":
+        raise HTTPException(
+            400,
+            detail={
+                "code": "unsupported_canvas_preset_artifact_type",
+                "message": "Canvas presets are available for Poster only.",
+            },
+        )
+    return poster_canvas_preset_catalog()
+
+
+def _validated_web_canvas_selection(
+    artifact_type: str,
+    template: str | None,
+    canvas_preset_id: str | None,
+) -> tuple[str | None, str | None]:
+    requested_template = (
+        template.strip().lower().replace("_", "-")
+        if isinstance(template, str) and template.strip()
+        else None
+    )
+    requested_selection = (
+        canvas_preset_id.strip()
+        if isinstance(canvas_preset_id, str) and canvas_preset_id.strip()
+        else None
+    )
+    if artifact_type != "poster":
+        if requested_template is not None or requested_selection is not None:
+            raise HTTPException(
+                422,
+                detail={
+                    "code": "canvas_preset_not_supported_for_artifact",
+                    "message": "Canvas presets are supported for Poster only.",
+                },
+            )
+        return None, None
+    if requested_template is not None and resolve_template(requested_template) is None:
+        raise HTTPException(
+            422,
+            detail={
+                "code": "unknown_canvas_preset",
+                "message": f"Unknown Poster canvas preset: {requested_template}",
+            },
+        )
+    if requested_selection is None:
+        return requested_template, None
+
+    catalog_ids = {
+        str(item.get("id") or "")
+        for item in poster_canvas_preset_catalog()["presets"]
+        if isinstance(item, dict)
+    }
+    if requested_selection not in catalog_ids:
+        raise HTTPException(
+            422,
+            detail={
+                "code": "unknown_canvas_preset",
+                "message": f"Unknown Poster canvas preset: {requested_selection}",
+            },
+        )
+    expected_template = None if requested_selection == "auto" else requested_selection
+    if requested_template not in {None, expected_template} or (
+        requested_selection == "auto" and requested_template is not None
+    ):
+        raise HTTPException(
+            422,
+            detail={
+                "code": "canvas_preset_mismatch",
+                "message": "Canvas selection does not match the requested template.",
+            },
+        )
+    return expected_template, requested_selection
+
+
+def _validated_canvas_prompt(brief: str, artifact_type: str) -> None:
+    try:
+        intent = parse_canvas_intent(brief)
+        if (
+            artifact_type != "poster"
+            and intent is not None
+            and intent.get("template_id")
+        ):
+            raise CanvasIntentError(
+                "conflicting_canvas_directives",
+                "A Poster template cannot be combined with a different artifact type.",
+            )
+    except CanvasIntentError as exc:
+        raise HTTPException(
+            422,
+            detail={"code": exc.code, "message": str(exc)},
+        ) from exc
+
+
 def _validated_web_palette_id(
     artifact_type: str,
     palette_id: str | None,
@@ -5443,11 +5543,15 @@ def _prepare_reservation(
             )
         a_type: ArtifactType = "poster"
         requested_template = _DEMO_FIXED_TEMPLATE
+        requested_canvas_preset_id = _DEMO_FIXED_TEMPLATE
     else:
         a_type = _coerce_artifact_type(payload.artifact_type, brief=payload.brief)
-        requested_template = (payload.template or "").strip() or None
-    if requested_template and resolve_template(requested_template) is None:
-        raise HTTPException(400, detail=f"unknown template: {requested_template}")
+        requested_template, requested_canvas_preset_id = _validated_web_canvas_selection(
+            a_type,
+            payload.template,
+            payload.canvas_preset_id,
+        )
+    _validated_canvas_prompt(payload.brief, a_type)
     attempts = _validated_authoring_max_attempts(
         payload.authoring_max_attempts,
         a_type,
@@ -5470,8 +5574,6 @@ def _prepare_reservation(
     effective_template = requested_template
     if a_type == "poster" and has_pdf:
         settings = _web_paper_poster_settings(settings)
-        if effective_template is None and not reference_slots:
-            effective_template = _PAPER_POSTER_WEB_TEMPLATE
         author_cmd = _paper_poster_author_cmd_resolution(settings)
         if not author_cmd["available"]:
             raise HTTPException(
@@ -5506,6 +5608,7 @@ def _prepare_reservation(
         "brief": effective_brief,
         "slot_roles": {slot.name: slot.role for slot in payload.input_slots},
         "template": effective_template,
+        "canvas_preset_id": requested_canvas_preset_id,
         "palette_id": palette_id,
         "resume_run": None,
         "baseline_artifact": payload.baseline_artifact,
@@ -5519,6 +5622,7 @@ def _prepare_reservation(
         baseline_artifact_json=payload.baseline_artifact,
         conversation_id="",
         template=effective_template,
+        canvas_preset_id=requested_canvas_preset_id,
         palette_id=palette_id,
         authoring_max_attempts=attempts,
         input_slot_roles={slot.name: slot.role for slot in payload.input_slots},
@@ -5567,6 +5671,7 @@ def _pipeline_request_factory(
         resume_run=payload.get("resume_run"),
         reference_poster=str(references[0]) if references else None,
         settings=settings,
+        canvas_preset_id=payload.get("canvas_preset_id"),
     )
 
 
@@ -5585,6 +5690,7 @@ def _legacy_pipeline_payload(
         "direct_attachments": [str(path) for path in attach_paths],
         "direct_reference": str(reference_poster_path) if reference_poster_path else None,
         "template": template,
+        "canvas_preset_id": state.canvas_preset_id,
         "palette_id": state.palette_id,
         "resume_run": resume_run,
         "baseline_artifact": state.baseline_artifact_json,
@@ -5977,6 +6083,8 @@ def _append_reservation_history(
         "brief": payload.brief.strip(),
         "artifact_type": state.artifact_type,
         "palette_id": state.palette_id,
+        "template": state.template,
+        "canvas_preset_id": state.canvas_preset_id,
         "has_baseline": payload.baseline_artifact is not None,
         "authoring_max_attempts": state.authoring_max_attempts,
         "attachment_count": sum(
@@ -6991,6 +7099,7 @@ async def generate(
     reference_poster_ref: str | None = Form(None),
     conversation_id: str | None = Form(None),
     template: str | None = Form(None),
+    canvas_preset_id: str | None = Form(None),
     authoring_max_attempts: int | None = Form(None),
     files: list[UploadFile] = File(default=[]),
     reference_poster: UploadFile | None = File(default=None),
@@ -7037,9 +7146,15 @@ async def generate(
             )
         a_type: ArtifactType = "poster"
         requested_template = _DEMO_FIXED_TEMPLATE
+        requested_canvas_preset_id = _DEMO_FIXED_TEMPLATE
     else:
         a_type = _coerce_artifact_type(artifact_type, brief=brief)
-        requested_template = (template or "").strip() or None
+        requested_template, requested_canvas_preset_id = _validated_web_canvas_selection(
+            a_type,
+            template,
+            canvas_preset_id,
+        )
+    _validated_canvas_prompt(brief, a_type)
     resolved_authoring_max_attempts = _validated_authoring_max_attempts(
         authoring_max_attempts,
         a_type,
@@ -7052,8 +7167,6 @@ async def generate(
     )
     _require_artifact_runtime(a_type)
     normalized_palette_id = _validated_web_palette_id(a_type, palette_id)
-    if requested_template and resolve_template(requested_template) is None:
-        raise HTTPException(400, detail=f"unknown template: {requested_template}")
     if artifact_type not in _ARTIFACT_TYPES and a_type != "poster":
         log(
             "web.artifact_type.inferred",
@@ -7204,8 +7317,6 @@ async def generate(
     web_paper_poster_profile_applied = False
     if a_type == "poster" and has_pdf_attachment:
         req_settings = _web_paper_poster_settings(req_settings)
-        if effective_template is None and reference_poster_path is None:
-            effective_template = _PAPER_POSTER_WEB_TEMPLATE
         web_paper_poster_profile_applied = True
         author_cmd = _paper_poster_author_cmd_resolution(req_settings)
         if not author_cmd["available"]:
@@ -7288,6 +7399,7 @@ async def generate(
         authoring_max_attempts=resolved_authoring_max_attempts,
         palette_id=normalized_palette_id or "",
         template=effective_template or "",
+        canvas_preset_id=requested_canvas_preset_id or "",
         history_turns=_count_history_turns(conversation_history),
         prior_artifact_count=_count_prior_artifacts(prior_artifacts))
     _has_baseline = baseline_artifact is not None
@@ -7295,6 +7407,8 @@ async def generate(
         "brief": brief.strip(),
         "artifact_type": a_type,
         "palette_id": normalized_palette_id,
+        "template": effective_template,
+        "canvas_preset_id": requested_canvas_preset_id,
         "has_baseline": _has_baseline,
         "authoring_max_attempts": resolved_authoring_max_attempts,
     }
@@ -7346,6 +7460,7 @@ async def generate(
         baseline_artifact_json=baseline_artifact,
         conversation_id=event_conversation_id,
         template=effective_template,
+        canvas_preset_id=requested_canvas_preset_id,
         palette_id=normalized_palette_id,
         authoring_max_attempts=resolved_authoring_max_attempts,
     )
@@ -12158,6 +12273,7 @@ async def run_retry(
         baseline_artifact_json=original.baseline_artifact_json,
         conversation_id=original.conversation_id,
         template=original.template,
+        canvas_preset_id=original.canvas_preset_id,
         palette_id=retry_palette_id,
         authoring_max_attempts=retry_authoring_max_attempts,
     )
@@ -13999,6 +14115,9 @@ def _sanitize_history_conversation(
     poster_palette_id = str(raw.get("poster_palette_id") or "").strip()
     if poster_palette_id:
         conversation["poster_palette_id"] = poster_palette_id
+    poster_canvas_preset_id = str(raw.get("poster_canvas_preset_id") or "").strip()
+    if poster_canvas_preset_id:
+        conversation["poster_canvas_preset_id"] = poster_canvas_preset_id
     if preserve_run_state and raw.get("pending") is True:
         run_id = str(raw.get("run_id") or "").strip()
         if run_id:
@@ -14082,6 +14201,11 @@ def _merge_one_history_conversation(
         or secondary.get("poster_palette_id")
         or ""
     ).strip()
+    poster_canvas_preset_id = str(
+        primary.get("poster_canvas_preset_id")
+        or secondary.get("poster_canvas_preset_id")
+        or ""
+    ).strip()
     active_run = right if right.get("pending") is True else left if left.get("pending") is True else None
     message_count = max(
         len(messages),
@@ -14104,6 +14228,11 @@ def _merge_one_history_conversation(
         "active_artifact_id": active,
         "pending_edits": {},
         **({"poster_palette_id": poster_palette_id} if poster_palette_id else {}),
+        **(
+            {"poster_canvas_preset_id": poster_canvas_preset_id}
+            if poster_canvas_preset_id
+            else {}
+        ),
         **(
             {"pending": True, "run_id": active_run.get("run_id")}
             if active_run and active_run.get("run_id")
@@ -14260,6 +14389,9 @@ def _history_conversation_summary(raw: Any) -> dict[str, Any] | None:
     poster_palette_id = conversation.get("poster_palette_id")
     if isinstance(poster_palette_id, str) and poster_palette_id:
         summary["poster_palette_id"] = poster_palette_id
+    poster_canvas_preset_id = conversation.get("poster_canvas_preset_id")
+    if isinstance(poster_canvas_preset_id, str) and poster_canvas_preset_id:
+        summary["poster_canvas_preset_id"] = poster_canvas_preset_id
     if conversation.get("pending") is True and isinstance(conversation.get("run_id"), str):
         summary["pending"] = True
         summary["run_id"] = conversation["run_id"]
@@ -14286,6 +14418,8 @@ def _history_conversation_summary(raw: Any) -> dict[str, Any] | None:
                         key: task_payload[key]
                         for key in (
                             "artifact_type",
+                            "template",
+                            "canvas_preset_id",
                             "source_artifact_id",
                             "source_run_id",
                             "source_candidate_id",
@@ -14496,6 +14630,7 @@ def _conversation_from_design_events(
     title = "New chat"
     seen_messages: set[str] = set()
     poster_palette_id: str | None = None
+    poster_canvas_preset_id: str | None = None
 
     for event in events:
         name = str(event.get("event") or "")
@@ -14509,6 +14644,10 @@ def _conversation_from_design_events(
             brief = str(data.get("brief") or "").strip() or "Submitted a request."
             event_artifact_type = str(data.get("artifact_type") or "").strip()
             event_palette_id = str(data.get("palette_id") or "").strip() or None
+            event_template = str(data.get("template") or "").strip() or None
+            event_canvas_preset_id = (
+                str(data.get("canvas_preset_id") or "").strip() or None
+            )
             attachments = attachments_by_run.get(run_id, [])
             content_refs = [
                 item for item in attachments
@@ -14529,6 +14668,8 @@ def _conversation_from_design_events(
                 }
             if event_artifact_type == "poster" and event_palette_id:
                 poster_palette_id = event_palette_id
+            if event_artifact_type == "poster" and event_canvas_preset_id:
+                poster_canvas_preset_id = event_canvas_preset_id
             if title == "New chat":
                 title = brief[:50]
             msg_id = f"msg_import_user_{run_id or ts}"
@@ -14544,6 +14685,8 @@ def _conversation_from_design_events(
                     "task_payload": {
                         "artifact_type": event_artifact_type or None,
                         "palette_id": event_palette_id,
+                        "template": event_template,
+                        "canvas_preset_id": event_canvas_preset_id,
                         **(
                             {"authoring_max_attempts": data["authoring_max_attempts"]}
                             if isinstance(data.get("authoring_max_attempts"), int)
@@ -14722,6 +14865,7 @@ def _conversation_from_design_events(
         "active_artifact_id": active_artifact_id,
         "pending_edits": {},
         "poster_palette_id": poster_palette_id,
+        "poster_canvas_preset_id": poster_canvas_preset_id,
     }
 
 
@@ -15109,6 +15253,18 @@ def _conversation_from_disk_run(
         ) or f"server_run_{run_id}"
         task_type = "generate"
         task_payload: dict[str, Any] = {"artifact_type": a_type}
+        run_brief = _read_json_file(run_dir / "run_brief.json")
+        if isinstance(run_brief, dict):
+            persisted_template = str(
+                run_brief.get("effective_template") or ""
+            ).strip()
+            persisted_canvas_preset_id = str(
+                run_brief.get("canvas_preset_id") or ""
+            ).strip()
+            if persisted_template:
+                task_payload["template"] = persisted_template
+            if persisted_canvas_preset_id:
+                task_payload["canvas_preset_id"] = persisted_canvas_preset_id
         if candidate_publish and derived_descriptor is not None:
             task_type = "candidate_publish"
             if direct_publish_descriptor is not None:
@@ -15199,6 +15355,11 @@ def _conversation_from_disk_run(
         if isinstance(run_brief, dict)
         else ""
     )
+    canvas_preset_id = (
+        str(run_brief.get("canvas_preset_id") or "").strip()
+        if isinstance(run_brief, dict)
+        else ""
+    )
     if not palette_id:
         for manifest_name in (
             "code_editor_revision_manifest.json",
@@ -15232,6 +15393,8 @@ def _conversation_from_disk_run(
     }
     if palette_id:
         conversation["poster_palette_id"] = palette_id
+    if canvas_preset_id:
+        conversation["poster_canvas_preset_id"] = canvas_preset_id
     return conversation
 
 

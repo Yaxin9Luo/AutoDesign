@@ -138,7 +138,7 @@ def test_plan_canvas_does_not_treat_source_figure_dimensions_as_canvas() -> None
     assert plan["canvas"] == reference["default_canvas"]
 
 
-def test_plan_canvas_template_beats_explicit_ratio_and_reference() -> None:
+def test_plan_canvas_explicit_ratio_beats_template_and_reference() -> None:
     plan = plan_canvas(
         "Academic poster in a 3:4 ratio",
         [],
@@ -146,8 +146,8 @@ def test_plan_canvas_template_beats_explicit_ratio_and_reference() -> None:
         reference_metadata=_reference_metadata(1200, 1800),
     )
 
-    assert plan["source"] == "template"
-    assert plan["preset_id"] == "cvpr-landscape"
+    assert plan["source"] == "explicit_ratio"
+    assert plan["preset_id"] == "neurips-portrait"
 
 
 def test_plan_canvas_explicit_ratio_beats_reference() -> None:

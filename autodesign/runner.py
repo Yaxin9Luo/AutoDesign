@@ -107,6 +107,7 @@ class PipelineRunner:
             reference_poster: Path | None = None,
             reference_page_index: int = 0,
             palette_id: str | None = None,
+            canvas_preset_id: str | None = None,
             cancellation_token: CancellationToken | None = None,
             supervised: bool = False,
             ) -> RunResult:
@@ -136,6 +137,7 @@ class PipelineRunner:
                 return resume_ctx
             run_id = resume_path.name
             palette_id = _resume_palette_id(resume_ctx)
+            canvas_preset_id = _resume_canvas_preset_id(resume_ctx)
             active_settings, refusal_reason = _settings_for_external_author_resume(
                 self.settings,
                 resume_ctx,
@@ -164,6 +166,7 @@ class PipelineRunner:
                 no_claim_graph, run_id, reuse_ingest_run,
                 resume_ctx, reference_poster, reference_page_index,
                 palette_id=palette_id,
+                canvas_preset_id=canvas_preset_id,
                 cancellation_token=token,
                 supervised=supervised,
             )
@@ -179,6 +182,7 @@ class PipelineRunner:
                    reference_poster: Path | None = None,
                    reference_page_index: int = 0,
                    palette_id: str | None = None,
+                   canvas_preset_id: str | None = None,
                    cancellation_token: CancellationToken | None = None,
                    supervised: bool = False) -> RunResult:
         token = cancellation_token or CancellationToken.never(run_id)
@@ -604,6 +608,7 @@ class PipelineRunner:
                 "reference_poster": str(reference_poster) if reference_poster else None,
                 "reference_page_index": max(0, int(reference_page_index)),
                 "palette_id": palette_id,
+                "canvas_preset_id": canvas_preset_id,
             })
             atomic_write_json(run_dir / "resume_state.json", {
                 "version": 2,
@@ -620,6 +625,7 @@ class PipelineRunner:
                 ),
                 "skill_bundle_ids": list(skill_bundle.ids or []),
                 "palette_id": palette_id,
+                "canvas_preset_id": canvas_preset_id,
                 "designer_author": _designer_author_resume_metadata(self.settings),
             })
             token.raise_if_cancelled("runner.after_resume_snapshot_write")
@@ -1418,6 +1424,15 @@ def _resume_palette_id(resume_ctx: dict[str, Any] | None) -> str | None:
         or ""
     ).strip()
     return persisted_palette_id or None
+
+
+def _resume_canvas_preset_id(resume_ctx: dict[str, Any] | None) -> str | None:
+    persisted_canvas_preset_id = str(
+        (resume_ctx or {}).get("run_brief_json", {}).get("canvas_preset_id")
+        or (resume_ctx or {}).get("resume_state_json", {}).get("canvas_preset_id")
+        or ""
+    ).strip()
+    return persisted_canvas_preset_id or None
 
 
 def _designer_author_resume_metadata(settings: Settings) -> dict[str, Any]:
@@ -3410,10 +3425,7 @@ def _select_effective_template(
     util.canvas_planner so poster scene/aspect decisions are inspectable.
     """
     if requested_template:
-        key = requested_template.strip().lower().replace("_", "-")
-        if key in {"academic-wide-2x1", "academic-wide-3280x1860", "academic-landscape-1.414", "cvpr-landscape"}:
-            return "cvpr-landscape"
-        return requested_template
+        return requested_template.strip().lower().replace("_", "-")
     return None
 
 

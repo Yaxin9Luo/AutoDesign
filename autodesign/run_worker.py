@@ -278,6 +278,7 @@ def _run_pipeline(request: Any, cancellation: Any) -> dict[str, Any]:
     kwargs: dict[str, Any] = {
         "attachments": [Path(value) for value in request.attachments],
         "template": request.template,
+        "canvas_preset_id": request.canvas_preset_id,
         "run_id": request.run_id,
         "resume_run": request.resume_run,
         "reference_poster": Path(request.reference_poster) if request.reference_poster else None,

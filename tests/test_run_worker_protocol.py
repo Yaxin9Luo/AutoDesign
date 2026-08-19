@@ -490,6 +490,7 @@ class RunWorkerProtocolTests(unittest.TestCase):
                 attachments=(str(root / "paper.pdf"),),
                 template="cvpr-landscape",
                 palette_id="academic",
+                canvas_preset_id="cvpr-landscape",
                 resume_run=None,
                 reference_poster=str(root / "reference.png"),
                 settings=settings,
@@ -498,6 +499,7 @@ class RunWorkerProtocolTests(unittest.TestCase):
             decoded = decode_request(BytesIO(encode_request(request)))
 
             self.assertEqual(decoded, request)
+            self.assertEqual(decoded.canvas_preset_id, "cvpr-landscape")
             self.assertEqual(asdict(decoded.settings), asdict(settings))
             self.assertIsInstance(decoded.settings.repo_root, Path)
             self.assertEqual(decoded.settings.anthropic_custom_headers, settings.anthropic_custom_headers)

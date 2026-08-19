@@ -36,6 +36,7 @@ class PipelineWorkerRequest:
     resume_run: str | None
     reference_poster: str | None
     settings: Settings
+    canvas_preset_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -176,7 +177,7 @@ _SENSITIVE_SETTINGS_FIELDS = frozenset({
 _REQUEST_FIELDS: dict[str, tuple[str, ...]] = {
     "pipeline": (
         "job_kind", "run_id", "brief", "attachments", "template", "palette_id",
-        "resume_run", "reference_poster", "settings",
+        "resume_run", "reference_poster", "settings", "canvas_preset_id",
     ),
     "artifact_edit": (
         "job_kind", "run_id", "parent_run_id", "input_path",
@@ -551,7 +552,13 @@ def _validate_request_payload(payload: Any) -> None:
             isinstance(item, str) for item in payload["attachments"]
         ):
             raise ProtocolError("attachments must contain only strings")
-        for name in ("template", "palette_id", "resume_run", "reference_poster"):
+        for name in (
+            "template",
+            "palette_id",
+            "canvas_preset_id",
+            "resume_run",
+            "reference_poster",
+        ):
             _require_optional_string(payload[name], name)
     elif kind == "artifact_edit":
         _require_string(payload["input_path"], "input_path")

@@ -9707,8 +9707,8 @@ def check_conference_poster_defaults_no_api() -> None:
         wide_balanced_canvas.get("h_px"),
         wide_balanced_canvas.get("dpi"),
         wide_balanced_canvas.get("aspect_ratio"),
-    ) != (3072, 1536, 150, "2:1"):
-        _fail(f"academic-wide-3280x1860 legacy alias dims wrong: {wide_balanced_canvas}")
+    ) != (3280, 1860, 150, "164:93"):
+        _fail(f"academic-wide-3280x1860 named geometry is wrong: {wide_balanced_canvas}")
     landscape_canvas = resolve_template("academic-landscape-1.414")
     if not landscape_canvas:
         _fail("academic-landscape-1.414 template not registered")
@@ -9716,8 +9716,8 @@ def check_conference_poster_defaults_no_api() -> None:
         landscape_canvas.get("w_px"),
         landscape_canvas.get("h_px"),
         landscape_canvas.get("aspect_ratio"),
-    ) != (3072, 1536, "2:1"):
-        _fail(f"academic-landscape-1.414 legacy alias dims wrong: {landscape_canvas}")
+    ) != (2172, 1536, "1.414:1"):
+        _fail(f"academic-landscape-1.414 named geometry is wrong: {landscape_canvas}")
     cvpr_canvas = resolve_template("cvpr-landscape")
     if not cvpr_canvas:
         _fail("cvpr-landscape template not registered")
@@ -9754,15 +9754,15 @@ def check_conference_poster_defaults_no_api() -> None:
         _fail(f"explicit template should produce hard a0-landscape plan: {hard_plan}")
     balanced_wide_plan = plan_canvas("poster", pdfs, requested_template="academic-wide-3280x1860")
     if (
-        balanced_wide_plan.get("preset_id") != "cvpr-landscape"
+        balanced_wide_plan.get("preset_id") != "academic-wide-3280x1860"
         or balanced_wide_plan.get("lock_level") != "hard"
-        or balanced_wide_plan.get("poster_subtype") != "academic_paper_cvpr_landscape"
-        or (balanced_wide_plan.get("body_grid") or {}).get("family") != "editorial_3col"
+        or balanced_wide_plan.get("poster_subtype") != "academic_paper_wide"
+        or balanced_wide_plan.get("body_grid")
     ):
-        _fail(f"legacy academic wide template should canonicalize to hard editorial CVPR plan: {balanced_wide_plan}")
+        _fail(f"named academic wide template should keep its hard geometry: {balanced_wide_plan}")
     balanced_budget = balanced_wide_plan.get("density_budget") or {}
-    if balanced_budget.get("target_visuals_min") != 6 or balanced_budget.get("visual_area_min") != 0.42:
-        _fail(f"legacy wide template should use CVPR academic budget: {balanced_wide_plan}")
+    if balanced_budget.get("target_visuals_min") != 8 or balanced_budget.get("visual_area_min") != 0.50:
+        _fail(f"named wide template should use the academic wide budget: {balanced_wide_plan}")
 
     user_hard_plan = plan_canvas("make this as an A0 landscape poster", [])
     if user_hard_plan.get("preset_id") != "a0-landscape" or user_hard_plan.get("lock_level") != "hard":
@@ -9797,6 +9797,21 @@ def check_conference_poster_defaults_no_api() -> None:
         _fail(f"academic paper poster should default to CVPR landscape: {base_plan}")
     if (base_plan.get("body_grid") or {}).get("family") != "editorial_3col":
         _fail(f"academic paper poster should default to the editorial three-column grid: {base_plan}")
+    base_canvas = base_plan.get("canvas") or {}
+    if (base_canvas.get("w_px"), base_canvas.get("h_px")) != (3072, 1536):
+        _fail(f"no-directive PDF poster should remain 3072x1536: {base_plan}")
+    prompt_override = plan_canvas(
+        "Academic paper poster in a 1.4:1 ratio",
+        pdfs,
+        requested_template="cvpr-landscape",
+    )
+    override_canvas = prompt_override.get("canvas") or {}
+    if (
+        prompt_override.get("source") != "explicit_ratio"
+        or prompt_override.get("lock_level") != "hard"
+        or (override_canvas.get("w_px"), override_canvas.get("h_px")) != (2150, 1536)
+    ):
+        _fail(f"prompt ratio should override explicit UI preset: {prompt_override}")
     explicit_landscape = plan_canvas("横版学术海报", pdfs)
     if explicit_landscape.get("preset_id") != "cvpr-landscape":
         _fail(f"explicit landscape paper poster should use cvpr-landscape: {explicit_landscape}")

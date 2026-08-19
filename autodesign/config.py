@@ -2493,12 +2493,20 @@ POSTER_TEMPLATES: dict[str, dict[str, object]] = {
         "aspect_ratio": "2:1", "color_mode": "RGB",
     },
     "academic-wide-3280x1860": {
-        "w_px": 3072, "h_px": 1536, "dpi": 150,
-        "aspect_ratio": "2:1", "color_mode": "RGB",
+        "w_px": 3280, "h_px": 1860, "dpi": 150,
+        "aspect_ratio": "164:93", "color_mode": "RGB",
     },
     "academic-landscape-1.414": {
-        "w_px": 3072, "h_px": 1536, "dpi": 150,
-        "aspect_ratio": "2:1", "color_mode": "RGB",
+        "w_px": 2172, "h_px": 1536, "dpi": 150,
+        "aspect_ratio": "1.414:1", "color_mode": "RGB",
+    },
+    "academic-landscape-5x3": {
+        "w_px": 2560, "h_px": 1536, "dpi": 150,
+        "aspect_ratio": "5:3", "color_mode": "RGB",
+    },
+    "academic-landscape-1.4": {
+        "w_px": 2150, "h_px": 1536, "dpi": 150,
+        "aspect_ratio": "1.4:1", "color_mode": "RGB",
     },
     "poster-classic-4x3": {
         "w_px": 2048, "h_px": 1536, "dpi": 300,
@@ -2563,3 +2571,35 @@ def resolve_template(name: str | None) -> dict[str, object] | None:
 def available_templates() -> list[str]:
     """Sorted list of registered template names — used by CLI --help."""
     return sorted(POSTER_TEMPLATES.keys())
+
+
+_POSTER_CANVAS_PICKER_PRESETS: tuple[tuple[str, str], ...] = (
+    ("cvpr-landscape", "2:1 Wide"),
+    ("academic-landscape-5x3", "5:3 Landscape"),
+    ("academic-landscape-1.4", "1.4:1 Landscape"),
+    ("poster-classic-4x3", "4:3 Landscape"),
+    ("neurips-portrait", "3:4 Portrait"),
+)
+
+
+def poster_canvas_preset_catalog() -> dict[str, object]:
+    """Return the canonical, ordered Poster canvas picker catalog."""
+    presets: list[dict[str, object]] = [{
+        "id": "auto",
+        "label": "Auto · Prompt first",
+        "template": None,
+        "canvas": None,
+    }]
+    for preset_id, label in _POSTER_CANVAS_PICKER_PRESETS:
+        presets.append({
+            "id": preset_id,
+            "label": label,
+            "template": preset_id,
+            "canvas": dict(POSTER_TEMPLATES[preset_id]),
+        })
+    return {
+        "version": 1,
+        "kind": "poster_canvas_presets",
+        "default_preset_id": "cvpr-landscape",
+        "presets": presets,
+    }
