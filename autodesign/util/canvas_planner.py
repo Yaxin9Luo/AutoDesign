@@ -679,7 +679,7 @@ def _explicit_ratio_values(text: str) -> list[tuple[float, str]]:
             values.append((ratio, label))
     decimal_pattern = re.compile(
         r"(?:aspect\s+ratios?|ratios?|宽高比|比例)\s*(?:of|is|[:=])?\s*"
-        r"([+-]?\d+\.\d+)(?!\s*[:/x×]\s*[+-]?\d)",
+        r"([+-]?\d+\.\d+)(?![\d.]|\s*[:/x×]\s*[+-]?\d)",
         flags=re.IGNORECASE,
     )
     for match in decimal_pattern.finditer(text):
@@ -713,10 +713,14 @@ def _ratio_has_canvas_context(text: str, match: re.Match[str]) -> bool:
 
 def _pixel_match_describes_source_asset(text: str, match: re.Match[str]) -> bool:
     before = text[max(0, match.start() - 64):match.start()]
-    return bool(re.search(
-        r"\b(?:source|paper|original)\s+(?:figure|image|asset|visual)\b[^\n]{0,32}$",
+    source_matches = list(re.finditer(
+        r"\b(?:source|paper|original)\s+(?:figure|image|asset|visual)\b",
         before,
     ))
+    if not source_matches:
+        return False
+    tail = before[source_matches[-1].end():]
+    return not re.search(r"[\n,.;!?。；，！？]|\bcanvas\b|画布", tail)
 
 
 def _explicit_orientations(text: str) -> list[str]:

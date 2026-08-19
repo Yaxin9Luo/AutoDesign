@@ -60,6 +60,12 @@ class CanvasIntentTest(unittest.TestCase):
                 self.assertIsNotNone(intent)
                 self.assertEqual(intent["ratio"][1], aspect_ratio)
 
+    def test_explicit_decimal_ratio_does_not_backtrack_into_a_second_ratio(self) -> None:
+        intent = parse_canvas_intent("Academic poster, aspect ratio 1.41:1")
+
+        self.assertIsNotNone(intent)
+        self.assertEqual(intent["ratio"], (1.41, "1.41:1"))
+
     def test_source_asset_dimensions_are_not_canvas_pixels(self) -> None:
         for brief in (
             "Use source figure size 1200x800 in the academic poster",
@@ -67,6 +73,14 @@ class CanvasIntentTest(unittest.TestCase):
         ):
             with self.subTest(brief=brief):
                 self.assertIsNone(parse_canvas_intent(brief))
+
+    def test_explicit_canvas_pixels_after_source_asset_sentence_are_honored(self) -> None:
+        intent = parse_canvas_intent(
+            "Use the source figure. Canvas 1200x800 px for the academic poster."
+        )
+
+        self.assertIsNotNone(intent)
+        self.assertEqual(intent["pixels"], (1200, 800))
 
     def test_prompt_ratio_uses_short_edge_and_long_edge_cap(self) -> None:
         cases = [
