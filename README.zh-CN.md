@@ -8,6 +8,7 @@
 
 | 日期 | 更新 |
 | :--- | :--- |
+| **2026-08-19** | [海报画布控制：Prompt 中的模板、宽高比与精确像素尺寸优先执行，Web UI 新增常用学术海报预设](https://github.com/Yaxin9Luo/AutoDesign/compare/51dc4212c86f850bb7915d0e1e7096c1a29cd040...55b18da6bff0e541e6d204c525b0f9d715fc17da) |
 | **2026-08-19** | [Agent Skills v0.2.0：Poster Agent-first PDF 摄取与四个 Skills 的白色主画布](./agent_skills/README.zh-CN.md#agent-skills-v0-2-0) |
 | **2026-08-18** | [Poster Skill Agent-first v2：直接理解 PDF、可追溯多轮修订与只读 DOM QA](./agent_skills/README.zh-CN.md#poster-agent-first-v2) |
 | **2026-08-17** | [可独立安装的 Poster、PPT、Webpage 与 Video Agent Skills 现已发布](./agent_skills/README.zh-CN.md) |

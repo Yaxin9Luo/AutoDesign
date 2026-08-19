@@ -8,6 +8,7 @@
 
 | 날짜 | 업데이트 |
 | :--- | :--- |
+| **2026-08-19** | [포스터 캔버스 제어: 프롬프트의 템플릿·가로세로 비율·정확한 픽셀 크기를 우선 적용하고 Web UI에 학술 포스터 프리셋 추가](https://github.com/Yaxin9Luo/AutoDesign/compare/51dc4212c86f850bb7915d0e1e7096c1a29cd040...55b18da6bff0e541e6d204c525b0f9d715fc17da) |
 | **2026-08-19** | [Agent Skills v0.2.0: Poster Agent-first PDF 수집과 네 가지 Skill의 흰색 기본 캔버스](./agent_skills/README.md#agent-skills-v0-2-0) |
 | **2026-08-18** | [Poster Skill Agent-first v2: PDF 직접 검토, revision-bound 시도, 읽기 전용 DOM QA](./agent_skills/README.md#poster-agent-first-v2) |
 | **2026-08-17** | [Poster, PPT, Webpage, Video용 독립형 Agent Skills 설치 지원](./agent_skills/README.md) |

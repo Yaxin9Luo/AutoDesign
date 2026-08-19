@@ -8,6 +8,7 @@
 
 | Date | Update |
 | :--- | :--- |
+| **2026-08-19** | [Poster canvas controls: prompt-first templates, aspect ratios, and exact pixel sizes, plus academic presets in the Web UI](https://github.com/Yaxin9Luo/AutoDesign/compare/51dc4212c86f850bb7915d0e1e7096c1a29cd040...55b18da6bff0e541e6d204c525b0f9d715fc17da) |
 | **2026-08-19** | [Agent Skills v0.2.0: Poster Agent-first PDF ingestion and white primary canvases across all four Skills](./agent_skills/README.md#agent-skills-v0-2-0) |
 | **2026-08-18** | [Poster Skill Agent-first v2: direct PDF curation, revision-bound attempts, and read-only DOM QA](./agent_skills/README.md#poster-agent-first-v2) |
 | **2026-08-17** | [Standalone Agent Skills for Poster, PPT, Webpage, and Video are now installable](./agent_skills/README.md) |
