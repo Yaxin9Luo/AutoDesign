@@ -82,6 +82,17 @@ class CanvasIntentTest(unittest.TestCase):
         self.assertIsNotNone(intent)
         self.assertEqual(intent["pixels"], (1200, 800))
 
+    def test_explicit_canvas_or_poster_pixels_override_source_asset_context(self) -> None:
+        for brief in (
+            "Use source figure as loose visual inspiration and set canvas 1200x800",
+            "Use source figure as loose visual inspiration and set poster at 1200x800",
+        ):
+            with self.subTest(brief=brief):
+                intent = parse_canvas_intent(brief)
+
+                self.assertIsNotNone(intent)
+                self.assertEqual(intent["pixels"], (1200, 800))
+
     def test_prompt_ratio_uses_short_edge_and_long_edge_cap(self) -> None:
         cases = [
             ("Academic poster, aspect ratio 1.4:1", 2150, 1536, "1.4:1"),

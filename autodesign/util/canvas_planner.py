@@ -712,6 +712,8 @@ def _ratio_has_canvas_context(text: str, match: re.Match[str]) -> bool:
 
 
 def _pixel_match_describes_source_asset(text: str, match: re.Match[str]) -> bool:
+    if re.search(r"\b(?:canvas|poster)\b|画布|海报", match.group(0), flags=re.IGNORECASE):
+        return False
     before = text[max(0, match.start() - 64):match.start()]
     source_matches = list(re.finditer(
         r"\b(?:source|paper|original)\s+(?:figure|image|asset|visual)\b",
