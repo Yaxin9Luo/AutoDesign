@@ -129,11 +129,46 @@ test("builds requests with shared attachments and poster-only options", () => {
   }
 
   const poster = requests[0];
-  assert.equal(poster.template, "cvpr-landscape");
+  assert.equal(poster.canvas_preset_id, "auto");
+  assert.equal("template" in poster, false);
   assert.equal(poster.palette_id, "academic_blue");
   for (const request of requests.slice(1)) {
     assert.equal("template" in request, false);
     assert.equal("palette_id" in request, false);
+  }
+});
+
+test("Paper All-in-One preserves Auto or an explicit Poster canvas selection only on its Poster child", () => {
+  const paper: Attachment = {
+    id: "paper",
+    name: "paper.pdf",
+    size: 100,
+    kind: "pdf",
+    role: "content",
+  };
+  const auto = createPaperBundleRequestSpecs(
+    "conv_auto",
+    [paper],
+    "academic_blue",
+    "auto",
+    undefined,
+  );
+  assert.equal(auto[0].canvas_preset_id, "auto");
+  assert.equal("template" in auto[0], false);
+
+  const explicit = createPaperBundleRequestSpecs(
+    "conv_4x3",
+    [paper],
+    "academic_blue",
+    "poster-classic-4x3",
+    "poster-classic-4x3",
+  );
+  assert.equal(explicit[0].canvas_preset_id, "poster-classic-4x3");
+  assert.equal(explicit[0].template, "poster-classic-4x3");
+
+  for (const child of [...auto.slice(1), ...explicit.slice(1)]) {
+    assert.equal("canvas_preset_id" in child, false);
+    assert.equal("template" in child, false);
   }
 });
 

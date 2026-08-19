@@ -1,7 +1,6 @@
 import {
   PAPER_BUNDLE_PROMPTS_V1,
   PAPER_BUNDLE_PROMPT_VERSION,
-  PAPER_POSTER_TEMPLATE,
 } from "./presets.ts";
 import type {
   ArtifactType,
@@ -27,6 +26,7 @@ export interface PaperBundleRequestSpec {
   artifact_type: ArtifactType;
   palette_id?: string;
   template?: string;
+  canvas_preset_id?: string;
 }
 
 export function paperBundleChildConversationId(
@@ -149,6 +149,8 @@ export function createPaperBundleRequestSpecs(
   parentConversationId: string,
   attachments: Attachment[],
   posterPaletteId?: string | null,
+  posterCanvasPresetId = "auto",
+  posterCanvasTemplate?: string,
 ): PaperBundleRequestSpec[] {
   return PAPER_BUNDLE_ARTIFACT_ORDER.map((artifactType) => ({
     brief: PAPER_BUNDLE_PROMPTS_V1[artifactType],
@@ -160,7 +162,8 @@ export function createPaperBundleRequestSpecs(
     artifact_type: artifactType,
     ...(artifactType === "poster"
       ? {
-          template: PAPER_POSTER_TEMPLATE,
+          canvas_preset_id: posterCanvasPresetId,
+          ...(posterCanvasTemplate ? { template: posterCanvasTemplate } : {}),
           ...(posterPaletteId ? { palette_id: posterPaletteId } : {}),
         }
       : {}),

@@ -1,7 +1,5 @@
 import type { ArtifactType } from "./types.ts";
 
-export const PAPER_POSTER_TEMPLATE = "cvpr-landscape";
-
 export const DENSE_PAPER_POSTER_PROMPT = `Generate a polished academic paper poster from the attached paper. Make it a dense conference-style editorial poster: compact paper identity header, three-column body, multiple normal-flow sections, strong section headers, source figures/tables with short local readouts, and enough paper-specific content to make every major section feel intentionally occupied. Use a real academic-poster layout, not a landing page. The first screen should be the poster itself.
 
 Header requirements:
@@ -58,12 +56,3 @@ export const PAPER_BUNDLE_PROMPTS_V1 = Object.freeze({
   landing: "Create a polished interactive academic paper landing page in standalone HTML. Make the paper identity, method, evidence, and results immediately understandable; use many eligible original paper figures with local interpretations, restrained inline SVG icons, meaningful source-grounded interactions, responsive layout, and subtle motion with reduced-motion support.",
   video: "Create a rigorous 5–10 minute academic conference video, choosing the duration to match the paper's complexity, with English narration, English subtitles, and extensive use of original paper visuals.",
 } satisfies Record<ArtifactType, string>);
-
-export function shouldUsePaperPosterTemplate(
-  artifact_type: string | null | undefined,
-  attachments: Array<{ kind?: string; role?: string }>,
-): boolean {
-  return artifact_type === "poster" && attachments.some(
-    (a) => a.kind === "pdf" && a.role !== "style_reference",
-  );
-}

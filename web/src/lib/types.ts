@@ -380,10 +380,31 @@ export interface PosterPaletteCatalog {
   palettes: PosterPalette[];
 }
 
+export interface PosterCanvasPreset {
+  id: string;
+  label: string;
+  template: string | null;
+  canvas: {
+    w_px: number;
+    h_px: number;
+    dpi: number;
+    aspect_ratio: string;
+    color_mode: string;
+  } | null;
+}
+
+export interface PosterCanvasPresetCatalog {
+  version: number;
+  kind: "poster_canvas_presets";
+  default_preset_id: string;
+  presets: PosterCanvasPreset[];
+}
+
 export interface MessageTaskPayload {
   artifact_type?: ArtifactType;
   palette_id?: string;
   template?: string;
+  canvas_preset_id?: string | null;
   authoring_max_attempts?: number;
   baseline_artifact_id?: string;
   source_artifact_id?: string;
@@ -517,6 +538,7 @@ export interface Conversation {
   /** Last published artifact remains stable while an attempt fork is edited. */
   published_artifact_id?: string | null;
   poster_palette_id?: string | null;
+  poster_canvas_preset_id?: string | null;
   paper_bundle?: PaperBundleState;
   /** Per-artifact uncommitted edit buffer. Keyed by artifact_id, then
    *  layer_id. Cleared after a successful Apply or when the user

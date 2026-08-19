@@ -29,12 +29,19 @@ import type {
 		  PosterAreaSelectionKind,
 		  PosterSelectionContext,
 		  PosterSelectionSummary,
+		  PosterCanvasPreset,
 		  PosterPalette,
 		  RecoverableTaskType,
 		  MessageTaskPayload,
 		} from "./types";
 import { nextId, sampleLandingPage, samplePoster, sampleSlides, sampleVideo } from "./mock";
 import { restoredPosterPaletteId } from "./poster_palette_state";
+import {
+  isCanvasValidationError,
+  posterCanvasRequestSelection,
+  restoredPosterCanvasPresetId,
+  validatePosterCanvasCatalog,
+} from "./poster_canvas_state";
 import { detectSlideFrames } from "./slide_frames";
 import {
   ApiError,
@@ -50,6 +57,7 @@ import {
   createPaperBundle,
   fetchOpenResearchProject,
   fetchHealth,
+  fetchPosterCanvasPresets,
   fetchPosterPalettes,
   fetchRunArtifact,
   fetchRunStatus,
@@ -91,10 +99,8 @@ import {
 import type { OpenResearchSubmitOptions } from "./openresearch";
 import { applyEvent, initialProgress, type RunProgress } from "./progress";
 import {
-  PAPER_POSTER_TEMPLATE,
   VIDEO_SCENE_DURATION_MAX_S,
   VIDEO_SCENE_DURATION_MIN_S,
-  shouldUsePaperPosterTemplate,
 } from "./presets";
 import { isSupportedLanguage, type UiLanguage } from "./i18n";
 import { currentDemoUserScope } from "./api_settings";
@@ -1139,6 +1145,10 @@ interface AppStore {
   poster_palettes: PosterPalette[];
   poster_palettes_status: PosterPaletteStatus;
   poster_palettes_error: string | null;
+  poster_canvas_presets: PosterCanvasPreset[];
+  poster_canvas_presets_status: PosterCanvasPresetStatus;
+  poster_canvas_presets_error: string | null;
+  canvas_validation_errors: Record<string, { brief: string; message: string }>;
 
   // multi-conversation
   conversations: Record<string, Conversation>;
@@ -1150,6 +1160,7 @@ interface AppStore {
   loadServerHistory: () => Promise<void>;
   hydrateServerHistoryConversation: (id: string) => Promise<void>;
   loadPosterPalettes: () => Promise<void>;
+  loadPosterCanvasPresets: () => Promise<void>;
   recoverActiveRuns: () => void;
   recoverPaperBundles: () => Promise<void>;
   loadRunAttempts: (runId: string) => Promise<void>;
@@ -1236,6 +1247,8 @@ interface AppStore {
   deleteConversation: (id: string) => void;
   renameConversation: (id: string, title: string) => void;
   setPosterPalette: (paletteId: string | null) => void;
+  setPosterCanvasPreset: (presetId: string) => void;
+  clearCanvasValidationError: (conversationId?: string) => void;
   /** Inject a hard-coded demo artifact (no agent call, no money spent).
    *  Used to dry-run the canvas UI — DeckNavBar, in-place editor, etc. */
   loadDemoDeck: () => void;
@@ -1394,10 +1407,12 @@ const freshConversation = (): Conversation => {
     artifacts: {},
     active_artifact_id: null,
     poster_palette_id: null,
+    poster_canvas_preset_id: "auto",
   };
 };
 
 type PosterPaletteStatus = "idle" | "loading" | "ready" | "error";
+type PosterCanvasPresetStatus = "idle" | "loading" | "ready" | "error";
 
 const ARTIFACT_TYPES = new Set<ArtifactType>(["poster", "deck", "landing", "video"]);
 const VIDEO_ARTIFACT_MARKERS = [
@@ -1947,6 +1962,10 @@ const normalizeConversation = (raw: unknown): Conversation | null => {
     active_artifact_id: active,
     published_artifact_id: published,
     poster_palette_id: restoredPosterPaletteId(messages, raw.poster_palette_id),
+    poster_canvas_preset_id: restoredPosterCanvasPresetId(
+      messages,
+      raw.poster_canvas_preset_id,
+    ),
     paper_bundle: paperBundle,
     pending: paperBundle?.kind === "parent"
       ? paperBundleHasActiveTasks(paperBundle)
@@ -2009,6 +2028,10 @@ const conversationFromServerHistorySummary = (
     artifacts,
     active_artifact_id,
     poster_palette_id: summary.poster_palette_id,
+    poster_canvas_preset_id: restoredPosterCanvasPresetId(
+      pendingMessage,
+      summary.poster_canvas_preset_id,
+    ),
     pending: summary.pending,
     run_id: summary.run_id,
     pending_edits: {},
@@ -2088,6 +2111,30 @@ const validatePosterPaletteSelections = (
       }
       changed = true;
       return [id, { ...conversation, poster_palette_id: null, updated_at: now }];
+    }),
+  );
+  return changed ? validated : conversations;
+};
+
+const validatePosterCanvasSelections = (
+  conversations: Record<string, Conversation>,
+  status: PosterCanvasPresetStatus,
+  presets: PosterCanvasPreset[],
+): Record<string, Conversation> => {
+  if (status !== "ready") return conversations;
+  const presetIds = new Set(presets.map((preset) => preset.id));
+  const now = Date.now();
+  let changed = false;
+  const validated = Object.fromEntries(
+    Object.entries(conversations).map(([id, conversation]) => {
+      const selected = conversation.poster_canvas_preset_id ?? "auto";
+      if (presetIds.has(selected)) return [id, conversation];
+      changed = true;
+      return [id, {
+        ...conversation,
+        poster_canvas_preset_id: "auto",
+        updated_at: now,
+      }];
     }),
   );
   return changed ? validated : conversations;
@@ -2364,6 +2411,9 @@ function conversationForRecoveredBundleTask(
     artifacts: {},
     active_artifact_id: null,
     poster_palette_id: artifactType === "poster" ? parent.poster_palette_id : null,
+    poster_canvas_preset_id: artifactType === "poster"
+      ? parent.poster_canvas_preset_id ?? "auto"
+      : "auto",
     paper_bundle: createPaperBundleChildState(parent.id, artifactType),
     pending: active,
     run_id: active ? task?.run_id : undefined,
@@ -5250,6 +5300,10 @@ export const useApp = create<AppStore>()(persist((set, get) => {
     poster_palettes: [],
     poster_palettes_status: "idle",
     poster_palettes_error: null,
+    poster_canvas_presets: [],
+    poster_canvas_presets_status: "idle",
+    poster_canvas_presets_error: null,
+    canvas_validation_errors: {},
     conversations: { [initialConversation.id]: initialConversation },
     current_conversation_id: initialConversation.id,
     history_user_scope: null,
@@ -6012,10 +6066,14 @@ export const useApp = create<AppStore>()(persist((set, get) => {
               ? s.current_conversation_id
               : visibleConversations[0].id;
             return {
-              conversations: validatePosterPaletteSelections(
-                conversations,
-                s.poster_palettes_status,
-                s.poster_palettes,
+              conversations: validatePosterCanvasSelections(
+                validatePosterPaletteSelections(
+                  conversations,
+                  s.poster_palettes_status,
+                  s.poster_palettes,
+                ),
+                s.poster_canvas_presets_status,
+                s.poster_canvas_presets,
               ),
               current_conversation_id: current,
               ...(history.user_isolated
@@ -6930,6 +6988,37 @@ export const useApp = create<AppStore>()(persist((set, get) => {
       }
     },
 
+    loadPosterCanvasPresets: async () => {
+      const status = get().poster_canvas_presets_status;
+      if (status === "loading" || status === "ready") return;
+      set({
+        poster_canvas_presets_status: "loading",
+        poster_canvas_presets_error: null,
+      });
+      try {
+        const catalog = await fetchPosterCanvasPresets();
+        const presets = validatePosterCanvasCatalog(catalog);
+        set((state) => ({
+          poster_canvas_presets: presets,
+          poster_canvas_presets_status: "ready",
+          poster_canvas_presets_error: null,
+          conversations: validatePosterCanvasSelections(
+            state.conversations,
+            "ready",
+            presets,
+          ),
+        }));
+      } catch (error) {
+        set({
+          poster_canvas_presets: [],
+          poster_canvas_presets_status: "error",
+          poster_canvas_presets_error: error instanceof Error
+            ? error.message
+            : "Failed to load Poster canvas presets.",
+        });
+      }
+    },
+
     // ---- settings drawer ----
 
     openSettings: () => set({ settings_open: true }),
@@ -7317,6 +7406,42 @@ export const useApp = create<AppStore>()(persist((set, get) => {
         ...conversation,
         poster_palette_id,
       }));
+    },
+
+    setPosterCanvasPreset: (presetId) => {
+      const clean = presetId.trim();
+      if (!clean) return;
+      const current = get();
+      if (
+        clean !== "auto"
+        && (
+          current.poster_canvas_presets_status !== "ready"
+          || !current.poster_canvas_presets.some((preset) => preset.id === clean)
+        )
+      ) {
+        return;
+      }
+      const conversationId = current.current_conversation_id;
+      patchConversation(conversationId, (conversation) => ({
+        ...conversation,
+        poster_canvas_preset_id: clean,
+      }));
+      set((state) => {
+        if (!state.canvas_validation_errors[conversationId]) return state;
+        const errors = { ...state.canvas_validation_errors };
+        delete errors[conversationId];
+        return { canvas_validation_errors: errors };
+      });
+    },
+
+    clearCanvasValidationError: (conversationId) => {
+      const id = conversationId ?? get().current_conversation_id;
+      set((state) => {
+        if (!state.canvas_validation_errors[id]) return state;
+        const errors = { ...state.canvas_validation_errors };
+        delete errors[id];
+        return { canvas_validation_errors: errors };
+      });
     },
 
     deleteConversation: (id) => {
@@ -7722,9 +7847,19 @@ export const useApp = create<AppStore>()(persist((set, get) => {
       if (initialParent.paper_bundle) {
         throw new Error("This conversation already owns a Paper All-in-One bundle.");
       }
+      const initialCanvasPresetId = initialParent.poster_canvas_preset_id ?? "auto";
       if (get().poster_palettes_status !== "ready") {
         await get().loadPosterPalettes();
         while (get().poster_palettes_status === "loading") {
+          await new Promise((resolve) => window.setTimeout(resolve, 25));
+        }
+      }
+      if (
+        initialCanvasPresetId !== "auto"
+        && get().poster_canvas_presets_status !== "ready"
+      ) {
+        await get().loadPosterCanvasPresets();
+        while (get().poster_canvas_presets_status === "loading") {
           await new Promise((resolve) => window.setTimeout(resolve, 25));
         }
       }
@@ -7734,6 +7869,18 @@ export const useApp = create<AppStore>()(persist((set, get) => {
         throw new Error(
           paletteState.poster_palettes_error
             || "Poster palette catalog is unavailable. No paper bundle was started.",
+        );
+      }
+      if (
+        initialCanvasPresetId !== "auto"
+        && (
+          paletteState.poster_canvas_presets_status !== "ready"
+          || paletteState.poster_canvas_presets.length === 0
+        )
+      ) {
+        throw new Error(
+          paletteState.poster_canvas_presets_error
+            || "Poster canvas preset catalog is unavailable. No paper bundle was started.",
         );
       }
       const currentParent = paletteState.conversations[parentConversationId];
@@ -7752,6 +7899,10 @@ export const useApp = create<AppStore>()(persist((set, get) => {
         ?? paletteState.poster_palettes[
           Math.floor(Math.random() * paletteState.poster_palettes.length)
         ];
+      const selectedCanvas = posterCanvasRequestSelection(
+        paletteState.poster_canvas_presets,
+        currentParent.poster_canvas_preset_id,
+      );
       const attachment: Attachment = {
         id: nextId("att"),
         name: file.name,
@@ -7771,6 +7922,8 @@ export const useApp = create<AppStore>()(persist((set, get) => {
         parentConversationId,
         [attachment],
         selectedPalette.id,
+        selectedCanvas.canvas_preset_id,
+        selectedCanvas.template,
       );
       const authoringBudgets = readAuthoringBudgets();
       const now = Date.now();
@@ -7799,6 +7952,7 @@ export const useApp = create<AppStore>()(persist((set, get) => {
             spec.artifact_type,
           ),
           template: spec.template,
+          canvas_preset_id: spec.canvas_preset_id,
           palette_id: spec.palette_id,
           attachment_refs: [{
             name: attachmentMetadata.name,
@@ -7842,6 +7996,7 @@ export const useApp = create<AppStore>()(persist((set, get) => {
           updated_at: now,
           pending: true,
           poster_palette_id: selectedPalette.id,
+          poster_canvas_preset_id: selectedCanvas.canvas_preset_id,
           paper_bundle: bundle,
           messages: [...parent.messages, parentMessage],
         };
@@ -7856,6 +8011,9 @@ export const useApp = create<AppStore>()(persist((set, get) => {
             artifacts: {},
             active_artifact_id: null,
             poster_palette_id: artifactType === "poster" ? selectedPalette.id : null,
+            poster_canvas_preset_id: artifactType === "poster"
+              ? selectedCanvas.canvas_preset_id
+              : "auto",
             paper_bundle: createPaperBundleChildState(parentConversationId, artifactType),
             pending: true,
           };
@@ -7880,6 +8038,9 @@ export const useApp = create<AppStore>()(persist((set, get) => {
               input_slots: [prepared.slot],
               ...(spec.palette_id ? { palette_id: spec.palette_id } : {}),
               ...(spec.template ? { template: spec.template } : {}),
+              ...(spec.canvas_preset_id
+                ? { canvas_preset_id: spec.canvas_preset_id }
+                : {}),
               ...(taskPayload.authoring_max_attempts === undefined
                 ? {}
                 : { authoring_max_attempts: taskPayload.authoring_max_attempts }),
@@ -9044,6 +9205,7 @@ export const useApp = create<AppStore>()(persist((set, get) => {
       const intent = get().intent_type;
       const trimmed = text.trim();
       const convId = get().current_conversation_id;
+      get().clearCanvasValidationError(convId);
       const baselineBeforeSend = get().conversations[convId];
 	      const baseline = baselineBeforeSend?.active_artifact_id
 	        ? baselineBeforeSend.artifacts[baselineBeforeSend.active_artifact_id]
@@ -9083,11 +9245,13 @@ export const useApp = create<AppStore>()(persist((set, get) => {
 		      const taskType: RecoverableTaskType = shouldUsePosterCodeEditor
 		        ? POSTER_CODE_EDIT_TASK
 		        : GENERATE_TASK;
-		      const hasStyleReference = Boolean(partitionReferenceAttachments(submissionAttachments).reference);
-		      const generateTemplate = !hasStyleReference && shouldUsePaperPosterTemplate(requestedArtifactType, submissionAttachments)
-		        ? PAPER_POSTER_TEMPLATE
-		        : undefined;
 		      const posterRequest = requestedArtifactType === "poster";
+		      const canvasSelection = posterRequest
+		        ? posterCanvasRequestSelection(
+		            get().poster_canvas_presets,
+		            baselineBeforeSend?.poster_canvas_preset_id,
+		          )
+		        : null;
 		      const posterPaletteId = posterRequest
 		        ? baselineBeforeSend?.poster_palette_id?.trim() || undefined
 		        : undefined;
@@ -9114,11 +9278,13 @@ export const useApp = create<AppStore>()(persist((set, get) => {
 		            source_artifact_id: baseline?.artifact_id,
 		            selection_context: selectionContext ?? null,
 		            palette_id: posterPaletteId,
+		            canvas_preset_id: canvasSelection?.canvas_preset_id,
 		          }
 		        : {
 		            artifact_type: requestedArtifactType,
 		            authoring_max_attempts: options.authoring_max_attempts,
-		            template: generateTemplate,
+		            template: canvasSelection?.template,
+		            canvas_preset_id: canvasSelection?.canvas_preset_id,
 		            baseline_artifact_id: baseline?.artifact_id,
 	            attachment_refs: contentAttachmentRefs.length ? contentAttachmentRefs : undefined,
 	            reference_poster_ref: referencePosterRef,
@@ -9319,7 +9485,8 @@ export const useApp = create<AppStore>()(persist((set, get) => {
 		              conversation_id: convId,
 		              artifact_type: requestedArtifactType,
 		              authoring_max_attempts: taskPayload.authoring_max_attempts,
-		              template: generateTemplate,
+		              template: canvasSelection?.template,
+		              canvas_preset_id: canvasSelection?.canvas_preset_id,
 	              palette_id: posterRequest ? posterPaletteId : undefined,
 		              baseline_artifact: requestBaseline,
 		              conversation_history: requestMemory.history,
@@ -9447,6 +9614,29 @@ export const useApp = create<AppStore>()(persist((set, get) => {
 	          return;
 	        }
 	        failure = terminalResult.error;
+	      }
+	      if (isCanvasValidationError(failure)) {
+	        patchConversation(convId, (conversation) => ({
+	          ...conversation,
+	          pending: false,
+	          run_id: undefined,
+	          messages: conversation.messages.filter((message) => (
+	            message.id !== userMsg.id && message.id !== placeholderId
+	          )),
+	        }));
+	        set((state) => {
+	          const progress = { ...state.runs_progress };
+	          delete progress[convId];
+	          return {
+	            runs_progress: progress,
+	            canvas_validation_errors: {
+	              ...state.canvas_validation_errors,
+	              [convId]: { brief, message: failure.message },
+	            },
+	          };
+	        });
+	        if (activeRunId) cleanupReservedRun(activeRunId);
+	        return;
 	      }
 	      const waitOwner = activeRunId ? _SSE_WAIT_ABORTS.get(convId) : undefined;
 	      if (waitOwner && waitOwner.runId === activeRunId) {
@@ -10230,16 +10420,22 @@ export const useApp = create<AppStore>()(persist((set, get) => {
 	            : undefined;
 	        const attachmentRefs = payload.attachment_refs ?? [];
 	        const { palette_id: payloadPaletteId, ...payloadWithoutPalette } = payload;
-		        const template = payload.reference_poster_ref
-		          ? undefined
-		          : payload.template || (shouldUsePaperPosterTemplate(artifactType, attachmentRefs)
-		            ? PAPER_POSTER_TEMPLATE
-		            : undefined);
+		        const canvasSelection = artifactType === "poster"
+		          ? posterCanvasRequestSelection(
+		              get().poster_canvas_presets,
+		              payload.canvas_preset_id ?? sourceConv.poster_canvas_preset_id,
+		              payload.template,
+		            )
+		          : null;
+		        const template = artifactType === "poster"
+		          ? canvasSelection?.template
+		          : payload.template;
 	        const taskPayload: MessageTaskPayload = {
 	          ...payloadWithoutPalette,
 	          artifact_type: artifactType,
 	          authoring_max_attempts: payload.authoring_max_attempts,
 	          template,
+	          canvas_preset_id: canvasSelection?.canvas_preset_id,
 	          baseline_artifact_id: baseline?.artifact_id,
 	          attachment_refs: attachmentRefs.length ? attachmentRefs : undefined,
 	          ...(artifactType === "poster" && payloadPaletteId
@@ -10256,6 +10452,7 @@ export const useApp = create<AppStore>()(persist((set, get) => {
 	            artifact_type: artifactType,
 	            authoring_max_attempts: taskPayload.authoring_max_attempts,
 	            template,
+	            canvas_preset_id: canvasSelection?.canvas_preset_id,
 	            palette_id: artifactType === "poster" ? taskPayload.palette_id : undefined,
 	            baseline_artifact: baseline,
 	            conversation_history: memory.history,

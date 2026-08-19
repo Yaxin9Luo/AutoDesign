@@ -22,6 +22,7 @@ import type {
   Message,
   OpenResearchArtifactState,
   PendingEditsPayload,
+  PosterCanvasPresetCatalog,
   PosterPaletteCatalog,
   PosterSelectionContext,
   RecoverableTaskType,
@@ -231,6 +232,14 @@ export async function fetchPosterPalettes(): Promise<PosterPaletteCatalog> {
   return (await res.json()) as PosterPaletteCatalog;
 }
 
+export async function fetchPosterCanvasPresets(): Promise<PosterCanvasPresetCatalog> {
+  const res = await fetch("/api/canvas-presets?artifact_type=poster", {
+    headers: keyHeaders(),
+  });
+  if (!res.ok) throw await asApiError(res, "/api/canvas-presets");
+  return (await res.json()) as PosterCanvasPresetCatalog;
+}
+
 export interface CodingAgentSmokeResponse {
   ok: boolean;
   status: "passed" | "failed" | "timeout" | "missing_command" | "disabled" | string;
@@ -398,6 +407,7 @@ export interface ServerHistoryConversationSummary {
   artifacts: Record<string, ServerHistoryArtifactPreview>;
   active_artifact_id: string | null;
   poster_palette_id?: string | null;
+  poster_canvas_preset_id?: string | null;
   pending?: boolean;
   run_id?: string;
   pending_artifact_type?: ArtifactType;
@@ -513,6 +523,8 @@ export interface GenerateRequest {
   palette_id?: string;
   /** Optional runner canvas preset, e.g. cvpr-landscape for paper posters. */
   template?: string;
+  /** Explicit client picker snapshot. `auto` intentionally carries no template. */
+  canvas_preset_id?: string;
   /** External authoring attempt allowance for this invocation. */
   authoring_max_attempts?: number;
   /** Persisted attachment metadata from a prior user turn. Used by
@@ -637,6 +649,7 @@ export interface PaperBundleReserveRequest {
   conversation_history?: string | null;
   prior_artifacts?: string | null;
   template?: string | null;
+  canvas_preset_id?: string | null;
   authoring_max_attempts?: number | null;
 }
 
@@ -1248,6 +1261,7 @@ async function startReservedGenerate(
       prior_artifacts: req.prior_artifacts ? JSON.stringify(req.prior_artifacts) : null,
       conversation_id: req.conversation_id ?? null,
       template: req.template ?? null,
+      canvas_preset_id: req.canvas_preset_id ?? null,
       authoring_max_attempts: req.authoring_max_attempts ?? null,
       input_slots: inputs.map(({ slot }) => slot),
     }),
@@ -1290,6 +1304,7 @@ export async function startGenerate(
   if (req.artifact_type) fd.append("artifact_type", req.artifact_type);
   if (req.palette_id) fd.append("palette_id", req.palette_id);
   if (req.template) fd.append("template", req.template);
+  if (req.canvas_preset_id) fd.append("canvas_preset_id", req.canvas_preset_id);
   if (req.authoring_max_attempts !== undefined) {
     fd.append("authoring_max_attempts", String(req.authoring_max_attempts));
   }

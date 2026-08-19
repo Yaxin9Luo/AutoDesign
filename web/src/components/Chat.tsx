@@ -14,6 +14,7 @@ import type {
   Message,
   PosterAreaSelectionItem,
   PosterSelectionSummary,
+  PosterCanvasPreset,
   PosterPalette,
 } from "@/lib/types";
 import { nextId } from "@/lib/mock";
@@ -51,6 +52,7 @@ import { ArtifactDownloadMenu } from "./ArtifactDownloadMenu";
 import { PaperBundleCard } from "./PaperBundleCard";
 import { LanguageMenu } from "./LanguageMenu";
 import { PalettePicker } from "./PalettePicker";
+import { CanvasPicker } from "./CanvasPicker";
 import { AuthoringBudgetControl } from "./AuthoringBudgetControl";
 import { AttemptInspector } from "./AttemptInspector";
 import {
@@ -189,6 +191,15 @@ export function Chat({ variant }: ChatProps) {
   const posterPalettesError = useApp((s) => s.poster_palettes_error);
   const loadPosterPalettes = useApp((s) => s.loadPosterPalettes);
   const setPosterPalette = useApp((s) => s.setPosterPalette);
+  const posterCanvasPresets = useApp((s) => s.poster_canvas_presets);
+  const posterCanvasPresetsStatus = useApp((s) => s.poster_canvas_presets_status);
+  const posterCanvasPresetsError = useApp((s) => s.poster_canvas_presets_error);
+  const loadPosterCanvasPresets = useApp((s) => s.loadPosterCanvasPresets);
+  const setPosterCanvasPreset = useApp((s) => s.setPosterCanvasPreset);
+  const clearCanvasValidationError = useApp((s) => s.clearCanvasValidationError);
+  const canvasValidationError = useApp(
+    (s) => s.canvas_validation_errors[current_conversation_id] ?? null,
+  );
   const startPaperBundle = useApp((s) => s.startPaperBundle);
   const backendNeedsSetup = useApp((s) => s.backend_needs_setup);
   const openSettings = useApp((s) => s.openSettings);
@@ -204,6 +215,8 @@ export function Chat({ variant }: ChatProps) {
   const referenceDraftConversationIdRef = useRef<string | null>(current_conversation_id);
   const [paletteOpenRequest, setPaletteOpenRequest] = useState(0);
   const [paletteInvalid, setPaletteInvalid] = useState(false);
+  const [canvasOpenRequest, setCanvasOpenRequest] = useState(0);
+  const [canvasInvalid, setCanvasInvalid] = useState(false);
   const fileRef = useRef<HTMLInputElement | null>(null);
   const attachmentRoleRef = useRef<Attachment["role"]>("content");
   const paperBundlePickerIntentRef = useRef(false);
@@ -424,6 +437,26 @@ export function Chat({ variant }: ChatProps) {
     && selectedPaletteId
     && posterPalettes.some((palette) => palette.id === selectedPaletteId)
   );
+  const selectedCanvasPresetId = conv?.poster_canvas_preset_id ?? "auto";
+  const selectedCanvasPresetIsCanonical = !!(
+    posterCanvasPresetsStatus === "ready"
+    && posterCanvasPresets.some((preset) => preset.id === selectedCanvasPresetId)
+  );
+  const canvasComposerProps = {
+    canvasPresets: posterCanvasPresets,
+    canvasPresetStatus: posterCanvasPresetsStatus,
+    canvasPresetError: posterCanvasPresetsError,
+    selectedCanvasPresetId,
+    canvasOpenRequest,
+    canvasInvalid,
+    canvasValidationError: canvasValidationError?.message ?? null,
+    onSelectCanvasPreset: (presetId: string) => {
+      setPosterCanvasPreset(presetId);
+      setCanvasInvalid(false);
+    },
+    onRetryCanvasPresets: () => { void loadPosterCanvasPresets(); },
+    onClearCanvasValidationError: () => clearCanvasValidationError(),
+  };
 
   useEffect(() => {
     if (posterContext && posterPalettesStatus === "idle") {
@@ -432,10 +465,27 @@ export function Chat({ variant }: ChatProps) {
   }, [loadPosterPalettes, posterContext, posterPalettesStatus]);
 
   useEffect(() => {
+    if (posterContext && posterCanvasPresetsStatus === "idle") {
+      void loadPosterCanvasPresets();
+    }
+  }, [loadPosterCanvasPresets, posterCanvasPresetsStatus, posterContext]);
+
+  useEffect(() => {
     if (paletteInvalid && selectedPaletteIsCanonical) {
       setPaletteInvalid(false);
     }
   }, [paletteInvalid, selectedPaletteIsCanonical]);
+
+  useEffect(() => {
+    if (canvasInvalid && selectedCanvasPresetIsCanonical) {
+      setCanvasInvalid(false);
+    }
+  }, [canvasInvalid, selectedCanvasPresetIsCanonical]);
+
+  useEffect(() => {
+    if (!canvasValidationError || input !== "") return;
+    setInput(canvasValidationError.brief);
+  }, [canvasValidationError, input]);
 
   useEffect(() => {
     if (
@@ -637,7 +687,13 @@ export function Chat({ variant }: ChatProps) {
       setPaletteOpenRequest((value) => value + 1);
       return;
     }
+    if (resolvedComposerArtifactType === "poster" && !selectedCanvasPresetIsCanonical) {
+      setCanvasInvalid(true);
+      setCanvasOpenRequest((value) => value + 1);
+      return;
+    }
     setPaletteInvalid(false);
+    setCanvasInvalid(false);
     if (!intent_type) {
       setIntent(resolvedComposerArtifactType);
     }
@@ -714,6 +770,7 @@ export function Chat({ variant }: ChatProps) {
             selectedPaletteId={selectedPaletteId}
             paletteOpenRequest={paletteOpenRequest}
             paletteInvalid={paletteInvalid}
+            {...canvasComposerProps}
             authoringBudgets={authoringBudgets}
             onAuthoringBudgetsChange={updateAuthoringBudgets}
             onSelectPalette={(paletteId) => {
@@ -773,6 +830,7 @@ export function Chat({ variant }: ChatProps) {
                     selectedPaletteId={selectedPaletteId}
                     paletteOpenRequest={paletteOpenRequest}
                     paletteInvalid={paletteInvalid}
+                    {...canvasComposerProps}
                     authoringBudgets={authoringBudgets}
                     onAuthoringBudgetsChange={updateAuthoringBudgets}
                     onSelectPalette={(paletteId) => {
@@ -868,6 +926,7 @@ export function Chat({ variant }: ChatProps) {
           selectedPaletteId={selectedPaletteId}
           paletteOpenRequest={paletteOpenRequest}
           paletteInvalid={paletteInvalid}
+          {...canvasComposerProps}
           authoringBudgets={authoringBudgets}
           onAuthoringBudgetsChange={updateAuthoringBudgets}
           onSelectPalette={(paletteId) => {
@@ -2048,6 +2107,16 @@ interface ComposerProps {
   paletteInvalid: boolean;
   onSelectPalette: (paletteId: string) => void;
   onRetryPalettes: () => void;
+  canvasPresets: PosterCanvasPreset[];
+  canvasPresetStatus: "idle" | "loading" | "ready" | "error";
+  canvasPresetError: string | null;
+  selectedCanvasPresetId: string;
+  canvasOpenRequest: number;
+  canvasInvalid: boolean;
+  canvasValidationError: string | null;
+  onSelectCanvasPreset: (presetId: string) => void;
+  onRetryCanvasPresets: () => void;
+  onClearCanvasValidationError: () => void;
   authoringBudgets: AuthoringBudgets;
   onAuthoringBudgetsChange: (budgets: AuthoringBudgets) => void;
 }
@@ -2081,6 +2150,16 @@ function Composer({
   paletteInvalid,
   onSelectPalette,
   onRetryPalettes,
+  canvasPresets,
+  canvasPresetStatus,
+  canvasPresetError,
+  selectedCanvasPresetId,
+  canvasOpenRequest,
+  canvasInvalid,
+  canvasValidationError,
+  onSelectCanvasPreset,
+  onRetryCanvasPresets,
+  onClearCanvasValidationError,
   authoringBudgets,
   onAuthoringBudgetsChange,
 }: ComposerProps) {
@@ -2105,6 +2184,14 @@ function Composer({
       }`}
     >
       <MemoryHint compact={compact} />
+      {canvasValidationError && (
+        <div
+          role="alert"
+          className="border-b border-red-200 bg-red-50 px-3 py-2 text-[11.5px] leading-4 text-red-800"
+        >
+          {canvasValidationError}
+        </div>
+      )}
       {areaItems.length > 0 && (
         <AreaSelectionTray
           items={areaItems}
@@ -2136,7 +2223,10 @@ function Composer({
       <textarea
         rows={compact ? 2 : 3}
         value={input}
-        onChange={(e) => setInput(e.target.value)}
+        onChange={(e) => {
+          setInput(e.target.value);
+          onClearCanvasValidationError();
+        }}
         onKeyDown={(e) => {
           // Enter sends; Shift+Enter inserts newline.
           // Skip while an IME composition (CJK input) is active —
@@ -2189,6 +2279,19 @@ function Composer({
               invalid={paletteInvalid}
               onSelect={onSelectPalette}
               onRetry={onRetryPalettes}
+            />
+          )}
+          {posterContext && (
+            <CanvasPicker
+              presets={canvasPresets}
+              status={canvasPresetStatus}
+              error={canvasPresetError}
+              selectedId={selectedCanvasPresetId}
+              compact={compact}
+              openRequest={canvasOpenRequest}
+              invalid={canvasInvalid}
+              onSelect={onSelectCanvasPreset}
+              onRetry={onRetryCanvasPresets}
             />
           )}
           {isReferenceStyleControlEligible(posterContext, demoMode) && (
