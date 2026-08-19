@@ -37,6 +37,7 @@ import {
   artifactMessage,
   artifactValidationState,
 } from "@/lib/artifact_status";
+import { canSubmitPosterCanvasSelection } from "@/lib/poster_canvas_state";
 import {
   openResearchNeedsPaperId,
   openResearchResultHref,
@@ -438,9 +439,10 @@ export function Chat({ variant }: ChatProps) {
     && posterPalettes.some((palette) => palette.id === selectedPaletteId)
   );
   const selectedCanvasPresetId = conv?.poster_canvas_preset_id ?? "auto";
-  const selectedCanvasPresetIsCanonical = !!(
-    posterCanvasPresetsStatus === "ready"
-    && posterCanvasPresets.some((preset) => preset.id === selectedCanvasPresetId)
+  const selectedCanvasPresetIsCanonical = canSubmitPosterCanvasSelection(
+    posterCanvasPresetsStatus,
+    posterCanvasPresets,
+    selectedCanvasPresetId,
   );
   const canvasComposerProps = {
     canvasPresets: posterCanvasPresets,

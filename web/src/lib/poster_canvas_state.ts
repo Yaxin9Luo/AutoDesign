@@ -17,6 +17,15 @@ const catalogError = (): Error => new Error(
   "Poster canvas preset catalog is missing or inconsistent.",
 );
 
+export function canSubmitPosterCanvasSelection(
+  status: "idle" | "loading" | "ready" | "error",
+  presets: PosterCanvasPreset[],
+  presetId: string,
+): boolean {
+  return presetId === "auto"
+    || (status === "ready" && presets.some((preset) => preset.id === presetId));
+}
+
 export function validatePosterCanvasCatalog(
   raw: unknown,
 ): PosterCanvasPreset[] {

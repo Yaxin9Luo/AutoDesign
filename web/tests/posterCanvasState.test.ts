@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  canSubmitPosterCanvasSelection,
   canvasPickerKeyAction,
   posterCanvasRequestSelection,
   restoredPosterCanvasPresetId,
@@ -98,6 +99,21 @@ test("restores explicit Auto instead of a stale historical canvas preset", () =>
     restoredPosterCanvasPresetId([historical], undefined),
     "poster-classic-4x3",
   );
+});
+
+test("keeps Auto usable while explicit canvas presets require a ready catalog", () => {
+  assert.equal(canSubmitPosterCanvasSelection("idle", [], "auto"), true);
+  assert.equal(canSubmitPosterCanvasSelection("loading", [], "auto"), true);
+  assert.equal(canSubmitPosterCanvasSelection("error", [], "auto"), true);
+  assert.equal(
+    canSubmitPosterCanvasSelection("loading", catalog.presets, "poster-classic-4x3"),
+    false,
+  );
+  assert.equal(
+    canSubmitPosterCanvasSelection("ready", catalog.presets, "poster-classic-4x3"),
+    true,
+  );
+  assert.equal(canSubmitPosterCanvasSelection("ready", catalog.presets, "missing"), false);
 });
 
 test("resolves one request snapshot for ordinary, bundle, and resume paths", () => {

@@ -10202,6 +10202,38 @@ export const useApp = create<AppStore>()(persist((set, get) => {
 	      const artifactDeliveryRunId = failedMsg.failure?.status === "artifact_delivery_failed"
 	        ? failedMsg.failure.run_id || runIdFromMessage(failedMsg)
 	        : "";
+	      const resumeCanvasPresetId = artifactType === "poster"
+	        && typeof recoverable.task_payload?.canvas_preset_id === "string"
+	        ? recoverable.task_payload.canvas_preset_id.trim()
+	        : "";
+	      if (
+	        !artifactDeliveryRunId
+	        && resumeCanvasPresetId
+	        && resumeCanvasPresetId !== "auto"
+	      ) {
+	        if (get().poster_canvas_presets_status !== "ready") {
+	          await get().loadPosterCanvasPresets();
+	        }
+	        const canvasState = get();
+	        if (
+	          canvasState.poster_canvas_presets_status !== "ready"
+	          || !canvasState.poster_canvas_presets.some(
+	            (preset) => preset.id === resumeCanvasPresetId,
+	          )
+	        ) {
+	          set((state) => ({
+	            canvas_validation_errors: {
+	              ...state.canvas_validation_errors,
+	              [convId]: {
+	                brief: recoverable.instruction,
+	                message: canvasState.poster_canvas_presets_error
+	                  || "Canvas preset catalog unavailable. Retry when it can be validated.",
+	              },
+	            },
+	          }));
+	          return;
+	        }
+	      }
 	      const placeholderId = nextId("msg");
 	      patchConversation(convId, (c) => ({
 	        ...c,
@@ -10420,13 +10452,20 @@ export const useApp = create<AppStore>()(persist((set, get) => {
 	            : undefined;
 	        const attachmentRefs = payload.attachment_refs ?? [];
 	        const { palette_id: payloadPaletteId, ...payloadWithoutPalette } = payload;
-		        const canvasSelection = artifactType === "poster"
-		          ? posterCanvasRequestSelection(
-		              get().poster_canvas_presets,
-		              payload.canvas_preset_id ?? sourceConv.poster_canvas_preset_id,
-		              payload.template,
-		            )
-		          : null;
+		        const canvasSelection = artifactType !== "poster"
+		          ? null
+		          : resumeCanvasPresetId
+		            ? posterCanvasRequestSelection(
+		                get().poster_canvas_presets,
+		                resumeCanvasPresetId,
+		                payload.template,
+		              )
+		            : payload.template
+		              ? { canvas_preset_id: undefined, template: payload.template }
+		              : posterCanvasRequestSelection(
+		                  get().poster_canvas_presets,
+		                  sourceConv.poster_canvas_preset_id,
+		                );
 		        const template = artifactType === "poster"
 		          ? canvasSelection?.template
 		          : payload.template;

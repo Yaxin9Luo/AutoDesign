@@ -98,6 +98,46 @@ function resetStore() {
   return conversationId;
 }
 
+function installFailedPosterResume(
+  conversationId: string,
+  taskPayload: { template?: string; canvas_preset_id?: string },
+) {
+  const conversation = useApp.getState().conversations[conversationId]!;
+  useApp.setState({
+    poster_canvas_presets: [],
+    poster_canvas_presets_status: "idle",
+    poster_canvas_presets_error: null,
+    conversations: {
+      [conversationId]: {
+        ...conversation,
+        poster_canvas_preset_id: taskPayload.canvas_preset_id,
+        messages: [{
+          id: "resume-user",
+          role: "user",
+          text: "Resume this poster",
+          ts: 1,
+          status: "done",
+          task_type: "generate",
+          task_payload: { artifact_type: "poster", ...taskPayload },
+        }, {
+          id: "resume-failure",
+          role: "assistant",
+          text: "Connection lost",
+          ts: 2,
+          status: "error",
+          task_type: "generate",
+          task_payload: { artifact_type: "poster", ...taskPayload },
+          failure: {
+            status: "connection_lost",
+            artifact_type: "poster",
+            produced_files: [],
+          },
+        }],
+      },
+    },
+  });
+}
+
 test("stores explicit Auto independently from a legacy absent selection", () => {
   const conversationId = resetStore();
   useApp.getState().setPosterCanvasPreset("poster-classic-4x3");
@@ -200,6 +240,99 @@ test("keeps the prompt and picker state after a canvas 422 without a connection-
       conversation.messages.some((message) => message.failure?.status === "connection_lost"),
       false,
     );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("resume validates an explicit canvas preset before replacing a stale legacy template", async () => {
+  const conversationId = resetStore();
+  installFailedPosterResume(conversationId, {
+    canvas_preset_id: "poster-classic-4x3",
+    template: "cvpr-landscape",
+  });
+  const originalFetch = globalThis.fetch;
+  const requests: string[] = [];
+  let generateBody: FormData | null = null;
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = String(input);
+    requests.push(url);
+    if (url === "/api/canvas-presets?artifact_type=poster") {
+      return new Response(JSON.stringify({
+        version: 1,
+        kind: "poster_canvas_presets",
+        default_preset_id: "cvpr-landscape",
+        presets: canvasPresets,
+      }), { status: 200, headers: { "Content-Type": "application/json" } });
+    }
+    if (url === "/api/generate") {
+      generateBody = init?.body as FormData;
+      return new Response(JSON.stringify({ detail: "stop after request inspection" }), {
+        status: 500,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    throw new Error(`unexpected fetch ${url}`);
+  }) as typeof fetch;
+  try {
+    await useApp.getState().resumeRun("resume-failure");
+    assert.equal(requests[0], "/api/canvas-presets?artifact_type=poster");
+    assert.equal(generateBody?.get("canvas_preset_id"), "poster-classic-4x3");
+    assert.equal(generateBody?.get("template"), "poster-classic-4x3");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("resume stops with visible validation when an explicit canvas catalog cannot load", async () => {
+  const conversationId = resetStore();
+  installFailedPosterResume(conversationId, {
+    canvas_preset_id: "poster-classic-4x3",
+    template: "cvpr-landscape",
+  });
+  const originalFetch = globalThis.fetch;
+  let generateCalls = 0;
+  globalThis.fetch = (async (input: string | URL | Request) => {
+    const url = String(input);
+    if (url === "/api/canvas-presets?artifact_type=poster") {
+      return new Response(JSON.stringify({ detail: "catalog offline" }), {
+        status: 503,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    if (url === "/api/generate") generateCalls += 1;
+    throw new Error(`unexpected fetch ${url}`);
+  }) as typeof fetch;
+  try {
+    await useApp.getState().resumeRun("resume-failure");
+    const state = useApp.getState();
+    assert.equal(generateCalls, 0);
+    assert.match(state.canvas_validation_errors[conversationId]?.message ?? "", /catalog/i);
+    assert.notEqual(state.conversations[conversationId]?.pending, true);
+    assert.equal(state.conversations[conversationId]?.messages.at(-1)?.id, "resume-failure");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("resume keeps a true legacy template when no canvas selection snapshot exists", async () => {
+  const conversationId = resetStore();
+  installFailedPosterResume(conversationId, { template: "cvpr-landscape" });
+  const originalFetch = globalThis.fetch;
+  let generateBody: FormData | null = null;
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = String(input);
+    assert.equal(url, "/api/generate");
+    generateBody = init?.body as FormData;
+    return new Response(JSON.stringify({ detail: "stop after request inspection" }), {
+      status: 500,
+      headers: { "Content-Type": "application/json" },
+    });
+  }) as typeof fetch;
+  try {
+    await useApp.getState().resumeRun("resume-failure");
+    assert.equal(generateBody?.get("template"), "cvpr-landscape");
+    assert.equal(generateBody?.has("canvas_preset_id"), false);
   } finally {
     globalThis.fetch = originalFetch;
   }
