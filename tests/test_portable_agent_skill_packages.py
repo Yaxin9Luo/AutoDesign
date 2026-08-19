@@ -12,7 +12,10 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SKILLS_ROOT = REPO_ROOT / "agent_skills"
 SKILLS_README = SKILLS_ROOT / "README.md"
+SKILLS_README_ZH = SKILLS_ROOT / "README.zh-CN.md"
 ROOT_README = REPO_ROOT / "README.md"
+ROOT_README_ZH = REPO_ROOT / "README.zh-CN.md"
+ROOT_README_KO = REPO_ROOT / "README.ko.md"
 POSTER_ROOT = SKILLS_ROOT / "autodesign-poster"
 APPROVED_SKILLS = (
     "autodesign-poster",
@@ -128,6 +131,8 @@ class PortableAgentSkillPackageTests(unittest.TestCase):
 
     def test_news_links_directly_to_agent_skills_readme(self) -> None:
         root_documentation = ROOT_README.read_text(encoding="utf-8")
+        root_documentation_zh = ROOT_README_ZH.read_text(encoding="utf-8")
+        root_documentation_ko = ROOT_README_KO.read_text(encoding="utf-8")
         launch_rows = [
             line
             for line in root_documentation.splitlines()
@@ -137,6 +142,17 @@ class PortableAgentSkillPackageTests(unittest.TestCase):
         self.assertEqual(len(launch_rows), 1)
         self.assertIn("./agent_skills/README.md", launch_rows[0])
         self.assertNotIn("/pull/", launch_rows[0])
+        for documentation, target in (
+            (root_documentation, "./agent_skills/README.md#agent-skills-v0-2-0"),
+            (root_documentation_zh, "./agent_skills/README.zh-CN.md#agent-skills-v0-2-0"),
+            (root_documentation_ko, "./agent_skills/README.md#agent-skills-v0-2-0"),
+        ):
+            release_rows = [
+                line for line in documentation.splitlines() if "**2026-08-19**" in line
+            ]
+            self.assertEqual(len(release_rows), 1)
+            self.assertIn(target, release_rows[0])
+            self.assertNotIn("/pull/", release_rows[0])
         self.assertIn(
             "| **2026-08-15** | [Added official DeepSeek Harness support for "
             "coding agents](https://github.com/Yaxin9Luo/AutoDesign/pull/2) |",
@@ -151,6 +167,7 @@ class PortableAgentSkillPackageTests(unittest.TestCase):
 
     def test_launch_guide_is_installable_and_honest(self) -> None:
         skills_documentation = SKILLS_README.read_text(encoding="utf-8")
+        skills_documentation_zh = SKILLS_README_ZH.read_text(encoding="utf-8")
 
         for name in APPROVED_SKILLS:
             with self.subTest(skill=name):
@@ -166,13 +183,15 @@ class PortableAgentSkillPackageTests(unittest.TestCase):
         ):
             self.assertIn(heading, skills_documentation)
         for marker in (
-            "gh release download agent-skills-v0.1.0",
+            "## Agent Skills v0.2.0 · 2026-08-19",
+            "gh release download agent-skills-v0.2.0",
             'DESTINATION="${DESTINATION:-$HOME/.agents/skills}"',
             'DESTINATION="$HOME/.claude/skills"',
             'DESTINATION="$HOME/.dsh/skills"',
-            '--archive "./${skill}-0.1.0.zip"',
-            "Set-Location autodesign-skills-v0.1.0",
+            '--archive "./${skill}-0.2.0.zip"',
+            "Set-Location autodesign-skills-v0.2.0",
             "package_agent_skills.py install",
+            "white primary canvas",
             "70–80%",
             "future target",
             "does not replace",
@@ -187,6 +206,14 @@ class PortableAgentSkillPackageTests(unittest.TestCase):
             "gh skill install Yaxin9Luo/AutoDesign agent_skills/",
             skills_documentation,
         )
+        for marker in (
+            "## Agent Skills v0.2.0 · 2026-08-19",
+            "gh release download agent-skills-v0.2.0",
+            '--archive "./${skill}-0.2.0.zip"',
+            "Set-Location autodesign-skills-v0.2.0",
+            "白色主画布",
+        ):
+            self.assertIn(marker, skills_documentation_zh)
 
     def test_public_docs_cover_agent_discovery_interpreters_and_prerequisites(self) -> None:
         skills_documentation = SKILLS_README.read_text(encoding="utf-8")

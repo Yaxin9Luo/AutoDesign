@@ -8,6 +8,7 @@
 
 | 日期 | 更新 |
 | :--- | :--- |
+| **2026-08-19** | [Agent Skills v0.2.0：Poster Agent-first PDF 摄取与四个 Skills 的白色主画布](./agent_skills/README.zh-CN.md#agent-skills-v0-2-0) |
 | **2026-08-18** | [Poster Skill Agent-first v2：直接理解 PDF、可追溯多轮修订与只读 DOM QA](./agent_skills/README.zh-CN.md#poster-agent-first-v2) |
 | **2026-08-17** | [可独立安装的 Poster、PPT、Webpage 与 Video Agent Skills 现已发布](./agent_skills/README.zh-CN.md) |
 | **2026-08-15** | [正式支持 DeepSeek Harness 作为 Coding Agent](https://github.com/Yaxin9Luo/AutoDesign/pull/2) |

@@ -28,6 +28,38 @@ workflow never writes generated output into the installed Skill.
 > Harness. Read [Skills vs. the full AutoDesign Harness](#skills-vs-the-full-autodesign-harness)
 > before evaluating output quality.
 
+<a id="agent-skills-v0-2-0"></a>
+
+## Agent Skills v0.2.0 · 2026-08-19
+
+v0.2.0 is the first feature release after the initial standalone Skills
+bundle. It packages the current Poster, PPT, Webpage, and Video Skills as four
+independently installable, checksum-verified archives.
+
+Highlights:
+
+- **Poster Agent-first PDF ingestion.** The host Agent now works from complete
+  PDF page renders, creates reviewed source crops, and can return to the paper
+  when a visual is incomplete or unsuitable.
+- **Revision-bound Poster work.** Source catalogs, plans, attempts, review
+  routes, and final delivery are hash-bound and recoverable. Earlier attempts
+  remain immutable, so a repair does not silently rewrite prior evidence.
+- **Read-only Poster DOM QA.** Screen and print probes report layout defects
+  without modifying the Agent-authored poster.
+- **White primary canvas across all four Skills.** Poster, PPT, Webpage, and
+  Video now require an opaque white primary canvas with no background image or
+  paint effect that changes the rendered white. This keeps the paper's usual
+  white-background figures visually coherent. Restrained light cards, panels,
+  controls, captions, and overlays remain allowed as local surfaces.
+- **Portable release integrity.** Deterministic packages, SHA-256 sidecars,
+  install receipts, read-only installed-tree checks, and standalone validators
+  keep the release independently installable and auditable.
+
+Download the
+[`agent-skills-v0.2.0` release](https://github.com/Yaxin9Luo/AutoDesign/releases/tag/agent-skills-v0.2.0).
+The original `agent-skills-v0.1.0` release remains available as a historical
+snapshot.
+
 <a id="poster-agent-first-v2"></a>
 
 ## Poster Agent-first v2 · 2026-08-18
@@ -68,20 +100,19 @@ screen/print regression suites.
 
 This is a **Poster-first** update. PPT, Webpage, and Video remain installable and
 retain their existing generation workflows. The 70–80% Harness-equivalence
-goal remains a roadmap target, not a measured claim. The downloadable
-`agent-skills-v0.1.0` bundle is still the initial release; Poster Agent-first v2
-is now on `main` and will be included in the next packaged Skills release.
+goal remains a roadmap target, not a measured claim. Poster Agent-first v2 is
+included in the downloadable `agent-skills-v0.2.0` release.
 
 ## Quick install
 
 Download the checksum-verified release bundle with GitHub CLI:
 
 ```bash
-mkdir -p autodesign-skills-v0.1.0
-gh release download agent-skills-v0.1.0 \
+mkdir -p autodesign-skills-v0.2.0
+gh release download agent-skills-v0.2.0 \
   --repo Yaxin9Luo/AutoDesign \
-  --dir autodesign-skills-v0.1.0
-cd autodesign-skills-v0.1.0
+  --dir autodesign-skills-v0.2.0
+cd autodesign-skills-v0.2.0
 ```
 
 Then install all four Skills into the shared Codex and DeepSeek Harness user
@@ -92,8 +123,8 @@ DESTINATION="${DESTINATION:-$HOME/.agents/skills}"
 
 for skill in autodesign-poster autodesign-ppt autodesign-webpage autodesign-video; do
   python3 -I ./package_agent_skills.py install \
-    --archive "./${skill}-0.1.0.zip" \
-    --checksum "./${skill}-0.1.0.zip.sha256" \
+    --archive "./${skill}-0.2.0.zip" \
+    --checksum "./${skill}-0.2.0.zip.sha256" \
     --destination "$DESTINATION"
 done
 ```
@@ -153,16 +184,16 @@ for Codex and DeepSeek Harness. See the official
 
 ### Installer details and Windows
 
-The [`agent-skills-v0.1.0` release](https://github.com/Yaxin9Luo/AutoDesign/releases/tag/agent-skills-v0.1.0)
+The [`agent-skills-v0.2.0` release](https://github.com/Yaxin9Luo/AutoDesign/releases/tag/agent-skills-v0.2.0)
 contains four ZIPs, four SHA-256 sidecars, a manifest, and a standalone
 installer. Download it with GitHub CLI:
 
 ```bash
-mkdir -p autodesign-skills-v0.1.0
-gh release download agent-skills-v0.1.0 \
+mkdir -p autodesign-skills-v0.2.0
+gh release download agent-skills-v0.2.0 \
   --repo Yaxin9Luo/AutoDesign \
-  --dir autodesign-skills-v0.1.0
-cd autodesign-skills-v0.1.0
+  --dir autodesign-skills-v0.2.0
+cd autodesign-skills-v0.2.0
 ```
 
 Choose a Python 3 launcher: `python3` on most macOS/Linux systems, `python` as
@@ -171,8 +202,8 @@ checksum:
 
 ```bash
 python3 -I ./package_agent_skills.py install \
-  --archive ./autodesign-poster-0.1.0.zip \
-  --checksum ./autodesign-poster-0.1.0.zip.sha256 \
+  --archive ./autodesign-poster-0.2.0.zip \
+  --checksum ./autodesign-poster-0.2.0.zip.sha256 \
   --destination "$HOME/.agents/skills"
 ```
 
@@ -184,17 +215,17 @@ Windows example for all four Skills (change `$Destination` for Codex or
 DeepSeek Harness):
 
 ```powershell
-New-Item -ItemType Directory -Force autodesign-skills-v0.1.0 | Out-Null
-gh release download agent-skills-v0.1.0 `
+New-Item -ItemType Directory -Force autodesign-skills-v0.2.0 | Out-Null
+gh release download agent-skills-v0.2.0 `
   --repo Yaxin9Luo/AutoDesign `
-  --dir autodesign-skills-v0.1.0
-Set-Location autodesign-skills-v0.1.0
+  --dir autodesign-skills-v0.2.0
+Set-Location autodesign-skills-v0.2.0
 
 $Destination = "$HOME\.claude\skills"
 foreach ($Skill in @("autodesign-poster", "autodesign-ppt", "autodesign-webpage", "autodesign-video")) {
   py -3 -I .\package_agent_skills.py install `
-    --archive ".\$Skill-0.1.0.zip" `
-    --checksum ".\$Skill-0.1.0.zip.sha256" `
+    --archive ".\$Skill-0.2.0.zip" `
+    --checksum ".\$Skill-0.2.0.zip.sha256" `
     --destination $Destination
 }
 ```
@@ -291,8 +322,8 @@ Build deterministic, non-overwriting release archives:
 ```bash
 python3 -B scripts/package_agent_skills.py build \
   --source-root agent_skills \
-  --output-dir dist/agent-skills-v0.1.0 \
-  --version 0.1.0
+  --output-dir dist/agent-skills-v0.2.0 \
+  --version 0.2.0
 ```
 
 The output directory contains one versioned ZIP and SHA-256 sidecar per Skill,

@@ -25,6 +25,32 @@
 > 和使用方便。它不能替代完整的 AutoDesign Harness。评估生成质量前，请先阅读
 > [Skills 与完整 AutoDesign Harness 的区别](#skills-vs-full-autodesign-harness)。
 
+<a id="agent-skills-v0-2-0"></a>
+
+## Agent Skills v0.2.0 · 2026-08-19
+
+v0.2.0 是独立 Skills 首发后的第一个功能版本。当前 Poster、PPT、Webpage 与 Video
+会作为四个可独立安装、带校验文件的压缩包一起发布。
+
+主要更新：
+
+- **Poster Agent-first PDF 摄取。** 宿主 Agent 现在会从完整的 PDF 页面渲染开始，
+  创建经过评审的来源裁图；遇到残缺或不合适的视觉素材时，可以回到论文重新摄取。
+- **与修订绑定的 Poster 工作流。** 来源目录、计划、尝试、评审路由和最终交付都与
+  哈希绑定并支持恢复。早期尝试保持不可变，后续修复不会悄悄改写已有证据。
+- **只读 Poster DOM QA。** 屏幕与打印探针会报告布局问题，但不会修改 Agent 创作的
+  Poster。
+- **四个 Skills 统一使用白色主画布。** Poster、PPT、Webpage 与 Video 的主画布
+  必须为不透明白色，不能使用背景图片或改变白色实际渲染效果的绘制属性。这样能让
+  论文中常见的白底截图保持视觉一致。局部仍可使用克制的浅色卡片、面板、控件、
+  图注和叠加层。
+- **便携 Release 完整性。** 确定性构建、SHA-256 校验文件、安装 receipt、只读安装树
+  检查与独立校验器，让 Release 可以独立安装并方便审计。
+
+下载
+[`agent-skills-v0.2.0` Release](https://github.com/Yaxin9Luo/AutoDesign/releases/tag/agent-skills-v0.2.0)。
+最初的 `agent-skills-v0.1.0` Release 会继续保留，作为历史快照。
+
 <a id="poster-agent-first-v2"></a>
 
 ## Poster Agent-first v2 · 2026-08-18
@@ -56,19 +82,18 @@ Poster 是第一个接入 Agent-first 来源工作流的便携 Skill。论文 PD
 
 这是一次 **Poster-first** 更新。PPT、Webpage 与 Video 仍可正常安装，并继续使用各自
 现有的生成工作流。达到完整 Harness 约 70–80% 效果仍是路线图目标，不是当前已测得
-的结论。当前可下载的 `agent-skills-v0.1.0` 仍是首发包；Poster Agent-first v2 已进入
-`main`，并将在下一版打包的 Skills Release 中提供。
+的结论。Poster Agent-first v2 已包含在可下载的 `agent-skills-v0.2.0` Release 中。
 
 ## 快速安装
 
 使用 GitHub CLI 下载带校验文件的发布包：
 
 ```bash
-mkdir -p autodesign-skills-v0.1.0
-gh release download agent-skills-v0.1.0 \
+mkdir -p autodesign-skills-v0.2.0
+gh release download agent-skills-v0.2.0 \
   --repo Yaxin9Luo/AutoDesign \
-  --dir autodesign-skills-v0.1.0
-cd autodesign-skills-v0.1.0
+  --dir autodesign-skills-v0.2.0
+cd autodesign-skills-v0.2.0
 ```
 
 然后将四个 Skills 安装到 Codex 与 DeepSeek Harness 共用的用户目录：
@@ -78,8 +103,8 @@ DESTINATION="${DESTINATION:-$HOME/.agents/skills}"
 
 for skill in autodesign-poster autodesign-ppt autodesign-webpage autodesign-video; do
   python3 -I ./package_agent_skills.py install \
-    --archive "./${skill}-0.1.0.zip" \
-    --checksum "./${skill}-0.1.0.zip.sha256" \
+    --archive "./${skill}-0.2.0.zip" \
+    --checksum "./${skill}-0.2.0.zip.sha256" \
     --destination "$DESTINATION"
 done
 ```
@@ -135,16 +160,16 @@ DESTINATION="$HOME/.dsh/skills"
 
 ### 安装器说明与 Windows
 
-[`agent-skills-v0.1.0` Release](https://github.com/Yaxin9Luo/AutoDesign/releases/tag/agent-skills-v0.1.0)
+[`agent-skills-v0.2.0` Release](https://github.com/Yaxin9Luo/AutoDesign/releases/tag/agent-skills-v0.2.0)
 包含四个 ZIP、四个 SHA-256 校验文件、一个 manifest 和一个独立安装器。使用
 GitHub CLI 下载：
 
 ```bash
-mkdir -p autodesign-skills-v0.1.0
-gh release download agent-skills-v0.1.0 \
+mkdir -p autodesign-skills-v0.2.0
+gh release download agent-skills-v0.2.0 \
   --repo Yaxin9Luo/AutoDesign \
-  --dir autodesign-skills-v0.1.0
-cd autodesign-skills-v0.1.0
+  --dir autodesign-skills-v0.2.0
+cd autodesign-skills-v0.2.0
 ```
 
 选择 Python 3 启动命令：大多数 macOS/Linux 系统使用 `python3`，必要时使用
@@ -152,8 +177,8 @@ cd autodesign-skills-v0.1.0
 
 ```bash
 python3 -I ./package_agent_skills.py install \
-  --archive ./autodesign-poster-0.1.0.zip \
-  --checksum ./autodesign-poster-0.1.0.zip.sha256 \
+  --archive ./autodesign-poster-0.2.0.zip \
+  --checksum ./autodesign-poster-0.2.0.zip.sha256 \
   --destination "$HOME/.agents/skills"
 ```
 
@@ -164,17 +189,17 @@ python3 -I ./package_agent_skills.py install \
 Harness 修改 `$Destination`）：
 
 ```powershell
-New-Item -ItemType Directory -Force autodesign-skills-v0.1.0 | Out-Null
-gh release download agent-skills-v0.1.0 `
+New-Item -ItemType Directory -Force autodesign-skills-v0.2.0 | Out-Null
+gh release download agent-skills-v0.2.0 `
   --repo Yaxin9Luo/AutoDesign `
-  --dir autodesign-skills-v0.1.0
-Set-Location autodesign-skills-v0.1.0
+  --dir autodesign-skills-v0.2.0
+Set-Location autodesign-skills-v0.2.0
 
 $Destination = "$HOME\.claude\skills"
 foreach ($Skill in @("autodesign-poster", "autodesign-ppt", "autodesign-webpage", "autodesign-video")) {
   py -3 -I .\package_agent_skills.py install `
-    --archive ".\$Skill-0.1.0.zip" `
-    --checksum ".\$Skill-0.1.0.zip.sha256" `
+    --archive ".\$Skill-0.2.0.zip" `
+    --checksum ".\$Skill-0.2.0.zip.sha256" `
     --destination $Destination
 }
 ```
@@ -267,8 +292,8 @@ python3 -B scripts/validate_agent_skills.py --root agent_skills
 ```bash
 python3 -B scripts/package_agent_skills.py build \
   --source-root agent_skills \
-  --output-dir dist/agent-skills-v0.1.0 \
-  --version 0.1.0
+  --output-dir dist/agent-skills-v0.2.0 \
+  --version 0.2.0
 ```
 
 输出目录会包含每个 Skill 对应的版本化 ZIP 与 SHA-256 校验文件，以及

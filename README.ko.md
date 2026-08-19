@@ -8,6 +8,7 @@
 
 | 날짜 | 업데이트 |
 | :--- | :--- |
+| **2026-08-19** | [Agent Skills v0.2.0: Poster Agent-first PDF 수집과 네 가지 Skill의 흰색 기본 캔버스](./agent_skills/README.md#agent-skills-v0-2-0) |
 | **2026-08-18** | [Poster Skill Agent-first v2: PDF 직접 검토, revision-bound 시도, 읽기 전용 DOM QA](./agent_skills/README.md#poster-agent-first-v2) |
 | **2026-08-17** | [Poster, PPT, Webpage, Video용 독립형 Agent Skills 설치 지원](./agent_skills/README.md) |
 | **2026-08-15** | [코딩 에이전트를 위한 공식 DeepSeek Harness 지원 추가](https://github.com/Yaxin9Luo/AutoDesign/pull/2) |
