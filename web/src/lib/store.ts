@@ -2277,8 +2277,18 @@ const mergeServerConversation = (
   remote: Conversation,
 ): Conversation => {
   const safeRemote = normalizeConversation(remote) ?? remote;
-  const safeLocal = local ? normalizeConversation(local) ?? local : undefined;
-  if (!safeLocal) return safeRemote;
+  if (!local) return safeRemote;
+  const safeLocal = normalizeConversation(local) ?? local;
+  const localHasCanvasSelection = Object.prototype.hasOwnProperty.call(
+    local,
+    "poster_canvas_preset_id",
+  ) && (
+    local.poster_canvas_preset_id === null
+    || (
+      typeof local.poster_canvas_preset_id === "string"
+      && local.poster_canvas_preset_id.trim().length > 0
+    )
+  );
   const remoteWins = safeRemote.updated_at >= safeLocal.updated_at;
   const primary = remoteWins ? safeRemote : safeLocal;
   const secondary = remoteWins ? safeLocal : safeRemote;
@@ -2336,6 +2346,9 @@ const mergeServerConversation = (
     published_artifact_id: safeLocal.published_artifact_id
       ?? safeRemote.published_artifact_id,
     paper_bundle: safeLocal.paper_bundle ?? safeRemote.paper_bundle,
+    poster_canvas_preset_id: localHasCanvasSelection
+      ? safeLocal.poster_canvas_preset_id
+      : safeRemote.poster_canvas_preset_id,
     pending: safeLocal.pending || safeRemote.pending || undefined,
     run_id: safeLocal.pending && safeLocal.run_id
       ? safeLocal.run_id
@@ -9928,11 +9941,15 @@ export const useApp = create<AppStore>()(persist((set, get) => {
       // user can retry from a previous chat without switching first.
       let convId = "";
       let oldMsg: Message | undefined;
+      let oldConversation: Conversation | undefined;
+      let oldMessageIndex = -1;
       for (const c of Object.values(get().conversations)) {
-        const m = c.messages.find((x) => x.id === message_id);
-        if (m) {
+        const index = c.messages.findIndex((x) => x.id === message_id);
+        if (index >= 0) {
           convId = c.id;
-          oldMsg = m;
+          oldMsg = c.messages[index];
+          oldConversation = c;
+          oldMessageIndex = index;
           break;
         }
       }
@@ -10117,6 +10134,29 @@ export const useApp = create<AppStore>()(persist((set, get) => {
         });
         return ack.run_id;
       } catch (err) {
+        if (isCanvasValidationError(err)) {
+          const brief = [...(oldConversation?.messages.slice(0, oldMessageIndex) ?? [])]
+            .reverse()
+            .find((message) => message.role === "user")?.text ?? "";
+          patchConversation(convId, (conversation) => ({
+            ...conversation,
+            pending: false,
+            run_id: undefined,
+            messages: conversation.messages.filter((message) => message.id !== placeholderId),
+          }));
+          set((state) => {
+            const progress = { ...state.runs_progress };
+            delete progress[convId];
+            return {
+              runs_progress: progress,
+              canvas_validation_errors: {
+                ...state.canvas_validation_errors,
+                [convId]: { brief, message: err.message },
+              },
+            };
+          });
+          return;
+        }
         const cancellation = runCancellationDisposition(convId, activeRetryRunId, err);
         if (cancellation === "pending") return;
         const cancelled = cancellation === "confirmed";
@@ -10536,6 +10576,26 @@ export const useApp = create<AppStore>()(persist((set, get) => {
 	          startReplay,
 	        });
 	      } catch (err) {
+	        if (isCanvasValidationError(err)) {
+	          patchConversation(convId, (conversation) => ({
+	            ...conversation,
+	            pending: false,
+	            run_id: undefined,
+	            messages: conversation.messages.filter((message) => message.id !== placeholderId),
+	          }));
+	          set((state) => {
+	            const progress = { ...state.runs_progress };
+	            delete progress[convId];
+	            return {
+	              runs_progress: progress,
+	              canvas_validation_errors: {
+	                ...state.canvas_validation_errors,
+	                [convId]: { brief: recoverable.instruction, message: err.message },
+	              },
+	            };
+	          });
+	          return;
+	        }
 	        const cancellation = runCancellationDisposition(convId, activeRunId, err);
 	        if (cancellation === "pending") return;
 	        const cancelled = cancellation === "confirmed";

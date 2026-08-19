@@ -163,4 +163,12 @@ test("provides canvas picker labels in English, Chinese, and Korean", () => {
   assert.equal(translate("ko", "Canvas"), "캔버스");
   assert.equal(translate("zh", "Auto · Prompt first"), "自动 · 优先遵循提示词");
   assert.equal(translate("ko", "3:4 Portrait"), "3:4 세로형");
+  assert.equal(
+    translate("zh", "Prompt first · Academic/PDF defaults to CVPR"),
+    "优先遵循提示词 · 学术/PDF 海报默认使用 CVPR 画布",
+  );
+  assert.equal(
+    translate("ko", "Prompt first · Academic/PDF defaults to CVPR"),
+    "프롬프트 우선 · 학술/PDF 포스터는 CVPR 캔버스를 기본값으로 사용",
+  );
 });

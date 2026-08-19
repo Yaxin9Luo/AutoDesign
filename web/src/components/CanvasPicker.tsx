@@ -275,7 +275,7 @@ export function CanvasPicker({
                       <span className="mt-0.5 block text-[10px] text-ink-500">
                         {preset.canvas
                           ? `${preset.canvas.aspect_ratio} · ${preset.canvas.w_px}×${preset.canvas.h_px}`
-                          : t("Prompt first · CVPR default when unspecified")}
+                          : t("Prompt first · Academic/PDF defaults to CVPR")}
                       </span>
                     </span>
                     {preset.id === selectedId && (

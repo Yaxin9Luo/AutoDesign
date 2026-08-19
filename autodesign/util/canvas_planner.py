@@ -605,6 +605,8 @@ def _explicit_canvas_pixel_values(text: str) -> list[tuple[int, int]]:
     values: list[tuple[int, int]] = []
     for pattern in patterns:
         for match in re.finditer(pattern, text, flags=re.IGNORECASE):
+            if _pixel_match_describes_source_asset(text, match):
+                continue
             width, height = int(match.group(1)), int(match.group(2))
             value = (width, height)
             if width >= 64 and height >= 64 and value not in values:
@@ -675,6 +677,20 @@ def _explicit_ratio_values(text: str) -> list[tuple[float, str]]:
         label = f"{_format_ratio_number(left)}:{_format_ratio_number(right)}"
         if not any(_ratios_match(ratio, prior) for prior, _prior_label in values):
             values.append((ratio, label))
+    decimal_pattern = re.compile(
+        r"(?:aspect\s+ratios?|ratios?|宽高比|比例)\s*(?:of|is|[:=])?\s*"
+        r"([+-]?\d+\.\d+)(?!\s*[:/x×]\s*[+-]?\d)",
+        flags=re.IGNORECASE,
+    )
+    for match in decimal_pattern.finditer(text):
+        ratio = float(match.group(1))
+        if not isfinite(ratio) or ratio <= 0:
+            raise CanvasIntentError(
+                "invalid_canvas_ratio",
+                "Canvas aspect ratio values must be finite and greater than zero.",
+            )
+        if not any(_ratios_match(ratio, prior) for prior, _prior_label in values):
+            values.append((ratio, f"{_format_ratio_number(ratio)}:1"))
     return values
 
 
@@ -690,9 +706,17 @@ def _ratio_has_canvas_context(text: str, match: re.Match[str]) -> bool:
         re.search(rf"{explicit_cue}\s*(?:of|is|[:=])?\s*$", before)
         or re.match(rf"\s*{explicit_cue}\b", after)
         or re.search(rf"{orientation}\s*$", before)
-        or re.match(rf"\s*(?:{orientation}\s+)?(?:poster|海报)\b", after)
+        or re.match(rf"\s*(?:{orientation}\s+)?(?:academic\s+)?(?:poster|海报)\b", after)
         or re.search(r"(?:poster|海报)\s+in\s*(?:an?\s+)?$", before)
     )
+
+
+def _pixel_match_describes_source_asset(text: str, match: re.Match[str]) -> bool:
+    before = text[max(0, match.start() - 64):match.start()]
+    return bool(re.search(
+        r"\b(?:source|paper|original)\s+(?:figure|image|asset|visual)\b[^\n]{0,32}$",
+        before,
+    ))
 
 
 def _explicit_orientations(text: str) -> list[str]:

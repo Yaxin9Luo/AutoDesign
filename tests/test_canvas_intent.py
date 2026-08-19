@@ -50,6 +50,8 @@ class CanvasIntentTest(unittest.TestCase):
             ("I want a 1.4:1 landscape poster", "1.4:1"),
             ("Academic poster, aspect ratio 5:3", "5:3"),
             ("landscape 4:3 poster", "4:3"),
+            ("Create a 5:3 academic poster", "5:3"),
+            ("Academic poster, aspect ratio 1.4", "1.4:1"),
         )
         for brief, aspect_ratio in cases:
             with self.subTest(brief=brief):
@@ -57,6 +59,14 @@ class CanvasIntentTest(unittest.TestCase):
 
                 self.assertIsNotNone(intent)
                 self.assertEqual(intent["ratio"][1], aspect_ratio)
+
+    def test_source_asset_dimensions_are_not_canvas_pixels(self) -> None:
+        for brief in (
+            "Use source figure size 1200x800 in the academic poster",
+            "Use the source figure at 1200x800 px in the academic poster",
+        ):
+            with self.subTest(brief=brief):
+                self.assertIsNone(parse_canvas_intent(brief))
 
     def test_prompt_ratio_uses_short_edge_and_long_edge_cap(self) -> None:
         cases = [
@@ -233,6 +243,21 @@ class CanvasIntentTest(unittest.TestCase):
             ),
             "academic-landscape-1.414",
         )
+
+    def test_auto_defaults_remain_scene_specific(self) -> None:
+        cases = (
+            ("Create an academic poster", [], "cvpr-landscape"),
+            ("Create a poster", [Path("paper.pdf")], "cvpr-landscape"),
+            ("Create a concert event poster", [], "event-2x3"),
+            ("Create a product campaign poster", [], "social-4x5"),
+            ("Create a neighborhood poster", [], "poster-classic-4x3"),
+        )
+        for brief, attachments, preset_id in cases:
+            with self.subTest(brief=brief):
+                self.assertEqual(
+                    plan_canvas(brief, attachments)["preset_id"],
+                    preset_id,
+                )
 
 
 if __name__ == "__main__":

@@ -158,6 +158,73 @@ test("stores explicit Auto independently from a legacy absent selection", () => 
   );
 });
 
+test("newer server history cannot replace a current local canvas selection", async () => {
+  for (const selectedId of ["auto", "poster-classic-4x3"]) {
+    const conversationId = resetStore();
+    useApp.getState().setPosterCanvasPreset(selectedId);
+    const local = useApp.getState().conversations[conversationId]!;
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      const url = String(input);
+      assert.match(url, /^\/api\/history/);
+      return new Response(JSON.stringify({
+        conversations: {
+          [conversationId]: {
+            ...local,
+            updated_at: local.updated_at + 100,
+            poster_canvas_preset_id: "cvpr-landscape",
+          },
+        },
+        imported_runs: 1,
+        user_isolated: false,
+      }), { status: 200, headers: { "Content-Type": "application/json" } });
+    }) as typeof fetch;
+    try {
+      await useApp.getState().loadServerHistory();
+      assert.equal(
+        useApp.getState().conversations[conversationId]?.poster_canvas_preset_id,
+        selectedId,
+      );
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  }
+});
+
+test("server history fills a canvas selection only when local truly lacks one", async () => {
+  const conversationId = resetStore();
+  const local = useApp.getState().conversations[conversationId]!;
+  const { poster_canvas_preset_id: _selection, ...withoutSelection } = local;
+  useApp.setState({
+    conversations: { [conversationId]: withoutSelection },
+  });
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (input: string | URL | Request) => {
+    const url = String(input);
+    assert.match(url, /^\/api\/history/);
+    return new Response(JSON.stringify({
+      conversations: {
+        [conversationId]: {
+          ...local,
+          updated_at: local.updated_at + 100,
+          poster_canvas_preset_id: "poster-classic-4x3",
+        },
+      },
+      imported_runs: 1,
+      user_isolated: false,
+    }), { status: 200, headers: { "Content-Type": "application/json" } });
+  }) as typeof fetch;
+  try {
+    await useApp.getState().loadServerHistory();
+    assert.equal(
+      useApp.getState().conversations[conversationId]?.poster_canvas_preset_id,
+      "poster-classic-4x3",
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("does not accept an unverified explicit preset while the catalog is unavailable", () => {
   const conversationId = resetStore();
   useApp.setState({
@@ -246,6 +313,100 @@ test("keeps the prompt and picker state after a canvas 422 without a connection-
       conversation.messages.some((message) => message.failure?.status === "connection_lost"),
       false,
     );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("resume returns a structured canvas 422 to composer validation without a Resume failure", async () => {
+  const conversationId = resetStore();
+  installFailedPosterResume(conversationId, { canvas_preset_id: "auto" });
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (input: string | URL | Request) => {
+    assert.equal(String(input), "/api/generate");
+    return new Response(JSON.stringify({
+      detail: {
+        code: "conflicting_canvas_directives",
+        message: "The resumed prompt contains incompatible canvas requirements.",
+      },
+    }), { status: 422, headers: { "Content-Type": "application/json" } });
+  }) as typeof fetch;
+  try {
+    await useApp.getState().resumeRun("resume-failure");
+    const state = useApp.getState();
+    const conversation = state.conversations[conversationId]!;
+    assert.equal(conversation.pending, false);
+    assert.deepEqual(conversation.messages.map((message) => message.id), ["resume-user"]);
+    assert.equal(
+      conversation.messages.some((message) => message.failure?.status === "connection_lost"),
+      false,
+    );
+    assert.deepEqual(state.canvas_validation_errors[conversationId], {
+      brief: "Resume this poster",
+      message: "The resumed prompt contains incompatible canvas requirements.",
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("retry returns a structured canvas 422 to composer validation without a Retry failure", async () => {
+  const conversationId = resetStore();
+  const conversation = useApp.getState().conversations[conversationId]!;
+  useApp.setState({
+    conversations: {
+      [conversationId]: {
+        ...conversation,
+        messages: [{
+          id: "retry-user",
+          role: "user",
+          text: "Retry this conflicting poster",
+          ts: 1,
+          status: "done",
+          task_type: "generate",
+          task_payload: { artifact_type: "poster", canvas_preset_id: "auto" },
+        }, {
+          id: "retry-failure",
+          run_id: "run-canvas-validation",
+          role: "assistant",
+          text: "Retry failed",
+          ts: 2,
+          status: "error",
+          task_type: "generate",
+          task_payload: { artifact_type: "poster", canvas_preset_id: "auto" },
+          failure: {
+            status: "connection_lost",
+            artifact_type: "poster",
+            produced_files: [],
+          },
+        }],
+      },
+    },
+  });
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (input: string | URL | Request) => {
+    assert.equal(String(input), "/api/runs/run-canvas-validation/retry");
+    return new Response(JSON.stringify({
+      detail: {
+        code: "conflicting_canvas_directives",
+        message: "The retried prompt contains incompatible canvas requirements.",
+      },
+    }), { status: 422, headers: { "Content-Type": "application/json" } });
+  }) as typeof fetch;
+  try {
+    await useApp.getState().retryRun("retry-failure");
+    const state = useApp.getState();
+    const updated = state.conversations[conversationId]!;
+    assert.equal(updated.pending, false);
+    assert.deepEqual(updated.messages.map((message) => message.id), ["retry-user"]);
+    assert.equal(
+      updated.messages.some((message) => message.failure?.status === "connection_lost"),
+      false,
+    );
+    assert.deepEqual(state.canvas_validation_errors[conversationId], {
+      brief: "Retry this conflicting poster",
+      message: "The retried prompt contains incompatible canvas requirements.",
+    });
   } finally {
     globalThis.fetch = originalFetch;
   }

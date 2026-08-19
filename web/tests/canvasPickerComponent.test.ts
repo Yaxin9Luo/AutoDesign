@@ -133,6 +133,10 @@ test("mounted CanvasPicker exposes listbox semantics and complete keyboard focus
     assert.equal(listbox.getAttribute("aria-label"), "Canvas");
     assert.equal(options.length, 6);
     assert.equal(options[0]?.getAttribute("aria-selected"), "true");
+    assert.match(
+      options[0]?.textContent ?? "",
+      /Prompt first · Academic\/PDF defaults to CVPR/,
+    );
     assert.equal(document.activeElement, options[0]);
 
     await act(async () => { press(options[0]!, "ArrowUp"); });

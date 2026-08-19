@@ -608,7 +608,7 @@ const ZH: Record<string, string> = {
   "1.4:1 Landscape": "1.4:1 横版",
   "4:3 Landscape": "4:3 横版",
   "3:4 Portrait": "3:4 竖版",
-  "Prompt first · CVPR default when unspecified": "优先遵循提示词 · 未指定时使用 CVPR 默认画布",
+  "Prompt first · Academic/PDF defaults to CVPR": "优先遵循提示词 · 学术/PDF 海报默认使用 CVPR 画布",
 
   "Color controls": "颜色控制",
   "Whole Poster": "整张海报",
@@ -1393,7 +1393,7 @@ const KO: Record<string, string> = {
   "1.4:1 Landscape": "1.4:1 가로형",
   "4:3 Landscape": "4:3 가로형",
   "3:4 Portrait": "3:4 세로형",
-  "Prompt first · CVPR default when unspecified": "프롬프트 우선 · 미지정 시 CVPR 기본값",
+  "Prompt first · Academic/PDF defaults to CVPR": "프롬프트 우선 · 학술/PDF 포스터는 CVPR 캔버스를 기본값으로 사용",
   "Start with an artifact...": "아티팩트로 시작...",
   "Poster": "포스터",
   "Landing": "랜딩",
