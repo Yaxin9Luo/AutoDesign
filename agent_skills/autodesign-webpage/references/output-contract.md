@@ -106,6 +106,17 @@ written by the harness itself.
 
 - Use HTML5 doctype, `html[lang]`, viewport metadata, one `main`, one visible
   `h1`, a labeled `nav`, and a skip link to `#main`.
+- Render `html`, `body`, and the required `main` research surface with an opaque
+  pure-white (`#fff`) computed background color and `background-image: none` at
+  desktop and mobile widths, both with JavaScript disabled and after JavaScript
+  settles. Keep these primary surfaces at full opacity with no filter, mask,
+  non-normal blend mode, or clipping effect. Apply the same paint-effect rule to
+  every ancestor between `main` and `html`, without requiring those wrappers to
+  have white backgrounds. Transparent, tinted, dark, gradient, image-backed, or
+  paint-modified primary canvases fail the read-only `primary_canvas_white`
+  browser check. This rule does not prohibit browser chrome, controls, code
+  blocks, or restrained local light section/card fills and descendant effects
+  that leave the primary white canvas intact.
 - Mark the eight narrative containers with `data-section-role`. Bind the H1 and
   thesis to the plan and keep at least half of each visible within the initial
   1440 x 1000 desktop viewport. Each container must render exactly its planned

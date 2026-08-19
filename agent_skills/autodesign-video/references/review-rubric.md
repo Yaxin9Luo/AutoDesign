@@ -17,7 +17,8 @@ Score every dimension from 1 through 5:
    actual question, contribution, method, evidence, limitations, and conclusion
    without invented claims.
 2. `scene_composition_and_visual_hierarchy` — each sampled scene has a clear
-   focal point, balanced composition, readable type, and intentional density.
+   focal point, balanced composition, readable type, intentional density, and
+   a clean white primary canvas that integrates white-background paper figures.
 3. `figure_legibility_and_evidence_use` — source visuals remain interpretable,
    properly cropped, meaningfully annotated, and connected to narration.
 4. `motion_continuity_and_seekability` — progression feels coherent and motion
@@ -31,7 +32,16 @@ Score every dimension from 1 through 5:
 
 Any invented/unbound claim, unsafe asset, unreadable evidence, nondeterministic
 motion, clipped narration, forced/burned-in-only subtitles, or invalid media
-contract is a blocker. Localized repairs name scene IDs and concrete changes.
+contract is a blocker. A transparent, tinted, dark, gradient, or image
+composition/scene root is also a blocker, as is primary-root opacity, filtering,
+masking, blending, clipping, interaction-driven canvas mutation, or an animated
+project whose active scenes cannot be deterministically sought and checked. A
+`data-no-timeline` marker is invalid when a player/timeline registry exists or
+when a composition/scene root has an active CSS animation, transition, or Web
+Animation; local descendant motion remains allowed.
+This does not prohibit purposeful player chrome, subtitles, overlays, or
+restrained light local panels. Localized repairs name scene IDs and concrete
+changes.
 For `verdict: "pass"`, every dimension must independently score at least 4/5;
 an average score cannot compensate for a weaker dimension. Missing, Boolean,
 NaN, infinite, or out-of-range scores are invalid.

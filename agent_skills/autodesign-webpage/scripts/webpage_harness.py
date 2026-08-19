@@ -1731,6 +1731,9 @@ DOM_AUDIT = r"""contract => {
   const contrast=(first,second)=>{const a=luminance(first),b=luminance(second);return (Math.max(a,b)+.05)/(Math.min(a,b)+.05);};
   const blend=(foreground,backdrop)=>({r:foreground.r*foreground.a+backdrop.r*(1-foreground.a),g:foreground.g*foreground.a+backdrop.g*(1-foreground.a),b:foreground.b*foreground.a+backdrop.b*(1-foreground.a),a:1});
   const background=el=>{for(let node=el;node;node=node.parentElement){const value=color(getComputedStyle(node).backgroundColor);if(value&&value.a>=.99)return value;}return {r:255,g:255,b:255,a:1};};
+  const neutralPrimaryPaint=el=>{if(!el)return false;const style=getComputedStyle(el),clip=String(style.clip||'auto').replace(/\s+/g,'').toLowerCase(),unmasked=(!style.maskImage||style.maskImage==='none')&&(!style.webkitMaskImage||style.webkitMaskImage==='none');return Number(style.opacity)===1&&style.filter==='none'&&style.mixBlendMode==='normal'&&style.clipPath==='none'&&unmasked&&(clip==='auto'||clip==='rect(auto,auto,auto,auto)');};
+  const opaqueWhiteSurface=el=>{if(!el)return false;const style=getComputedStyle(el),fill=color(style.backgroundColor);return Boolean(fill)&&fill.r===255&&fill.g===255&&fill.b===255&&fill.a===1&&style.backgroundImage==='none'&&neutralPrimaryPaint(el);};
+  const paintSafeToRoot=el=>{if(!el)return false;for(let node=el;node;node=node.parentElement){if(!neutralPrimaryPaint(node))return false;}return true;};
   const filteredOut=value=>[...String(value||'').matchAll(/opacity\(\s*([+-]?(?:\d*\.?\d+)(?:e[-+]?\d+)?)\s*(%)?\s*\)/gi)].some(match=>(Number(match[1])/(match[2]?100:1))<=.01);
   const transformedOut=value=>{if(!value||value==='none')return false;let matrix;try{matrix=new DOMMatrixReadOnly(value);}catch{return true;}const limit=Math.max(innerWidth,innerHeight)*4,scaleX=Math.hypot(matrix.m11,matrix.m12,matrix.m13),scaleY=Math.hypot(matrix.m21,matrix.m22,matrix.m23);return scaleX<=.01||scaleY<=.01||Math.abs(matrix.m41)>limit||Math.abs(matrix.m42)>limit;};
   const visibleRect=el=>{
@@ -1807,9 +1810,10 @@ DOM_AUDIT = r"""contract => {
   const identity=document.querySelector('[data-section-role="identity"]');
   const aboveFold=el=>{if(!visible(el))return false;const rect=el.getBoundingClientRect(),width=Math.max(0,Math.min(rect.right,innerWidth)-Math.max(rect.left,0)),height=Math.max(0,Math.min(rect.bottom,innerHeight)-Math.max(rect.top,0));return width>=Math.min(rect.width,innerWidth)*.5&&height>=Math.min(rect.height,innerHeight)*.5;};
   const identityAboveFold=aboveFold(identity)&&aboveFold(h1[0])&&aboveFold(thesis[0]);
+  const mainSurface=document.querySelector('main'),primaryCanvasWhite=[document.documentElement,document.body,mainSurface].every(opaqueWhiteSurface)&&paintSafeToRoot(mainSurface);
   const sourceGrounding=claimsExact&&!repeatedNarrativeText&&unboundAssertionsSafe&&pseudoSafe;
   const contractIntact=claimsExact&&referencesExact&&sectionsExact&&titleExact&&thesisExact&&inlineHandlersSafe&&visualsExact&&missingExact&&interactionsExact;
-  return {passed:sourceGrounding&&contractIntact,sourceGrounding,contractIntact,identityAboveFold,checks:{claimsExact,referencesExact,repeatedNarrativeText,sectionsExact,titleExact,thesisExact,inlineHandlersSafe,pseudoSafe,unboundAssertionsSafe,visualsExact,missingExact,interactionsExact}};
+  return {passed:sourceGrounding&&contractIntact&&primaryCanvasWhite,sourceGrounding,contractIntact,identityAboveFold,primaryCanvasWhite,checks:{claimsExact,referencesExact,repeatedNarrativeText,sectionsExact,titleExact,thesisExact,inlineHandlersSafe,pseudoSafe,unboundAssertionsSafe,visualsExact,missingExact,interactionsExact,primaryCanvasWhite}};
 }"""
 
 def inside(path, root):
@@ -1837,7 +1841,7 @@ def main():
     return c
   result={'format_version':1,'passed':False,'checks':{},'interactions':[]}
   mode_reports={}
-  nojs_ok=False; motion_ok=False; internal_ok=False; mobile_ok=False; identity_ok=False; timers_ok=False; runtime_grounding_ok=False; runtime_contract_ok=False
+  nojs_ok=False; motion_ok=False; internal_ok=False; mobile_ok=False; identity_ok=False; timers_ok=False; runtime_grounding_ok=False; runtime_contract_ok=False; primary_canvas_ok=False
   def audit_desktop(browser, *, reduced):
     c=context(browser,reduced=reduced); page=c.new_page()
     try:
@@ -1884,7 +1888,7 @@ def main():
       except Exception:
         quiescent=False
       dom=page.evaluate(DOM_AUDIT,plan)
-      return {'interactions':mode_interactions,'interactions_ok':bool(mode_interactions) and all(item['passed'] for item in mode_interactions),'observable_ok':bool(mode_interactions) and all(item['target_changed'] for item in mode_interactions),'focus_ok':bool(mode_interactions) and all(item['focus_indicator_visible'] for item in mode_interactions),'quiescent':quiescent,'internal_ok':links_ok,'reduced_motion_ok':bool(reduced_ok),'source_grounding':bool(dom['sourceGrounding']),'contract_intact':bool(dom['contractIntact']),'identity_above_fold':bool(initial_dom['identityAboveFold']),'dom_checks':dom['checks']}
+      return {'interactions':mode_interactions,'interactions_ok':bool(mode_interactions) and all(item['passed'] for item in mode_interactions),'observable_ok':bool(mode_interactions) and all(item['target_changed'] for item in mode_interactions),'focus_ok':bool(mode_interactions) and all(item['focus_indicator_visible'] for item in mode_interactions),'quiescent':quiescent,'internal_ok':links_ok,'reduced_motion_ok':bool(reduced_ok),'source_grounding':bool(dom['sourceGrounding']),'contract_intact':bool(dom['contractIntact']),'primary_canvas_white':bool(dom['primaryCanvasWhite']),'identity_above_fold':bool(initial_dom['identityAboveFold']),'dom_checks':dom['checks']}
     finally:
       c.close()
   try:
@@ -1924,14 +1928,21 @@ def main():
         runtime_contract_ok=bool(runtime_contract_ok and mobile_dom['contractIntact'])
         c.close()
         c=context(browser,javascript=False,reduced=True); nojs=c.new_page(); nojs.goto(html.as_uri(),wait_until='load',timeout=30000)
-        nojs_ok=bool(nojs.evaluate(DOM_AUDIT,plan)['passed'])
+        nojs_desktop_dom=nojs.evaluate(DOM_AUDIT,plan)
         c.close()
+        c=context(browser,javascript=False,reduced=True,width=390,height=844); nojs_mobile=c.new_page(); nojs_mobile.goto(html.as_uri(),wait_until='load',timeout=30000)
+        nojs_mobile_dom=nojs_mobile.evaluate(DOM_AUDIT,plan)
+        c.close()
+        nojs_ok=bool(nojs_desktop_dom['passed'] and nojs_mobile_dom['passed'])
+        primary_canvas_states={'desktop_js_default':bool(default_report['primary_canvas_white']),'desktop_js_reduced':bool(reduced_report['primary_canvas_white']),'mobile_js_reduced':bool(mobile_dom['primaryCanvasWhite']),'desktop_no_js_reduced':bool(nojs_desktop_dom['primaryCanvasWhite']),'mobile_no_js_reduced':bool(nojs_mobile_dom['primaryCanvasWhite'])}
+        primary_canvas_ok=all(primary_canvas_states.values())
       finally: browser.close()
     keyboard_ok=bool(mode_reports) and all(report['interactions_ok'] for report in mode_reports.values())
     observable_ok=bool(mode_reports) and all(report['observable_ok'] for report in mode_reports.values())
     focus_ok=bool(mode_reports) and all(report['focus_ok'] for report in mode_reports.values())
-    checks={'no_javascript_core_visible':bool(nojs_ok),'runtime_source_grounding':bool(runtime_grounding_ok),'runtime_contract_intact':bool(runtime_contract_ok),'default_motion_interactions':bool(mode_reports.get('default',{}).get('interactions_ok')),'reduced_motion_interactions':bool(mode_reports.get('reduced',{}).get('interactions_ok')),'default_motion_quiescent':bool(mode_reports.get('default',{}).get('quiescent')),'reduced_motion_quiescent':bool(mode_reports.get('reduced',{}).get('quiescent')),'keyboard_interactions':keyboard_ok,'observable_interaction_effects':observable_ok,'mobile_interaction_available':bool(mobile_ok),'desktop_identity_thesis_above_fold':bool(identity_ok),'focus_indicators_visible':focus_ok,'reduced_motion_effective':bool(motion_ok),'internal_links_resolve':bool(internal_ok),'delayed_tasks_quiescent':bool(timers_ok),'no_network_attempts':not blocked and not request_errors,'no_page_errors':not page_errors}
-    result={'format_version':1,'passed':all(checks.values()),'checks':checks,'interactions':interactions,'motion_modes':mode_reports,'blocked_request_count':len(blocked),'request_error_count':len(request_errors),'page_error_count':len(page_errors)}
+    checks={'no_javascript_core_visible':bool(nojs_ok),'runtime_source_grounding':bool(runtime_grounding_ok),'runtime_contract_intact':bool(runtime_contract_ok),'primary_canvas_white':bool(primary_canvas_ok),'default_motion_interactions':bool(mode_reports.get('default',{}).get('interactions_ok')),'reduced_motion_interactions':bool(mode_reports.get('reduced',{}).get('interactions_ok')),'default_motion_quiescent':bool(mode_reports.get('default',{}).get('quiescent')),'reduced_motion_quiescent':bool(mode_reports.get('reduced',{}).get('quiescent')),'keyboard_interactions':keyboard_ok,'observable_interaction_effects':observable_ok,'mobile_interaction_available':bool(mobile_ok),'desktop_identity_thesis_above_fold':bool(identity_ok),'focus_indicators_visible':focus_ok,'reduced_motion_effective':bool(motion_ok),'internal_links_resolve':bool(internal_ok),'delayed_tasks_quiescent':bool(timers_ok),'no_network_attempts':not blocked and not request_errors,'no_page_errors':not page_errors}
+    findings=[] if primary_canvas_ok else [{'code':'primary_canvas_white','message':'html, body, and main must render as opaque pure-white primary surfaces without background images or paint-compositing effects','states':primary_canvas_states}]
+    result={'format_version':1,'passed':all(checks.values()),'checks':checks,'findings':findings,'primary_canvas_states':primary_canvas_states,'interactions':interactions,'motion_modes':mode_reports,'blocked_request_count':len(blocked),'request_error_count':len(request_errors),'page_error_count':len(page_errors)}
   except Exception as error:
     result={'format_version':1,'passed':False,'checks':{},'interactions':interactions,'runtime_error':type(error).__name__}
   temp=a.report.with_name('.'+a.report.name+'.tmp'); temp.write_text(json.dumps(result,indent=2,sort_keys=True)+'\n',encoding='utf-8'); os.replace(temp,a.report)

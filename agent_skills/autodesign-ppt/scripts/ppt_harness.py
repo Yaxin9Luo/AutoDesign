@@ -1616,9 +1616,10 @@ def create_slide_audit_variants(
 def validate_computed_slide_canvases(
     measurements: Sequence[Mapping[str, Any]], expected_slide_count: int
 ) -> dict[str, Any]:
-    """Fail unless every authored slide root computes to the canonical canvas."""
+    """Fail unless every authored slide root computes to the canonical white canvas."""
 
     issues: list[str] = []
+    findings: list[dict[str, str]] = []
     expected_ids = [
         f"slide-{index:02d}" for index in range(1, expected_slide_count + 1)
     ]
@@ -1645,7 +1646,41 @@ def validate_computed_slide_canvases(
                 issues.append(
                     f"{slide_id}: actual {field} must be {target}, found {value!r}"
                 )
-    return {"name": "computed_slide_canvas", "passed": not issues, "issues": issues}
+        for media in ("screen", "print"):
+            appearance = item.get(media)
+            valid = isinstance(appearance, Mapping)
+            if valid:
+                rgba = appearance.get("background_rgba")
+                valid = (
+                    isinstance(rgba, list)
+                    and len(rgba) == 4
+                    and rgba == [255, 255, 255, 255]
+                    and appearance.get("background_image") == "none"
+                    and appearance.get("effective_opacity") == 1
+                    and appearance.get("paint_effects") == []
+                )
+            if valid:
+                continue
+            finding = {
+                "code": "slide_canvas_background",
+                "slide_id": slide_id,
+                "media": media,
+                "message": (
+                    "authored slide root must render as opaque pure white with no "
+                    "gradient, image, or root/ancestor filter, mask, or blend "
+                    f"effect in {media} media"
+                ),
+            }
+            findings.append(finding)
+            issues.append(
+                f"{finding['code']}: {slide_id} {media}: {finding['message']}"
+            )
+    return {
+        "name": "computed_slide_canvas",
+        "passed": not issues,
+        "issues": issues,
+        "findings": findings,
+    }
 
 
 def _measure_computed_slide_canvases(html_path: Path, runtime: Any) -> list[dict[str, Any]]:
@@ -1667,9 +1702,34 @@ with sync_playwright() as playwright:
     page.route('http://**/*', lambda route: route.abort('blockedbyclient'))
     page.route('https://**/*', lambda route: route.abort('blockedbyclient'))
     page.goto(source, wait_until='load', timeout=30000)
-    measurements = page.evaluate("""() => [...document.querySelectorAll('.deck-slide')].map(slide => {
+    measure = """() => [...document.querySelectorAll('.deck-slide')].map(slide => {
       const style = getComputedStyle(slide);
       const rect = slide.getBoundingClientRect();
+      const canvas = document.createElement('canvas');
+      canvas.width = 1;
+      canvas.height = 1;
+      const context = canvas.getContext('2d', {willReadFrequently: true});
+      context.clearRect(0, 0, 1, 1);
+      context.fillStyle = style.backgroundColor;
+      context.fillRect(0, 0, 1, 1);
+      const backgroundRgba = Array.from(context.getImageData(0, 0, 1, 1).data);
+      let effectiveOpacity = 1;
+      const paintEffects = [];
+      for (let node = slide; node; node = node.parentElement) {
+        const nodeStyle = getComputedStyle(node);
+        effectiveOpacity *= Number.parseFloat(nodeStyle.opacity || '1');
+        const element = `${node.tagName.toLowerCase()}${node.id ? `#${node.id}` : ''}`;
+        const standardMaskImage = nodeStyle.maskImage || 'none';
+        const maskImage = standardMaskImage !== 'none'
+          ? standardMaskImage : (nodeStyle.webkitMaskImage || 'none');
+        for (const [property, value, neutral] of [
+          ['filter', nodeStyle.filter, 'none'],
+          ['mix-blend-mode', nodeStyle.mixBlendMode, 'normal'],
+          ['mask-image', maskImage, 'none'],
+        ]) {
+          if (value && value !== neutral) paintEffects.push({element, property, value});
+        }
+      }
       return {
         slide_id: slide.id,
         computed_width: Number.parseFloat(style.width),
@@ -1678,8 +1738,26 @@ with sync_playwright() as playwright:
         offset_height: slide.offsetHeight,
         rect_width: rect.width,
         rect_height: rect.height,
+        appearance: {
+          background_color: style.backgroundColor,
+          background_rgba: backgroundRgba,
+          background_image: style.backgroundImage,
+          effective_opacity: effectiveOpacity,
+          paint_effects: paintEffects,
+        },
       };
-    })""")
+    })"""
+    page.emulate_media(media='screen')
+    screen = page.evaluate(measure)
+    page.emulate_media(media='print')
+    printed = page.evaluate(measure)
+    printed_by_id = {item['slide_id']: item['appearance'] for item in printed}
+    measurements = []
+    for item in screen:
+        appearance = item.pop('appearance')
+        item['screen'] = appearance
+        item['print'] = printed_by_id.get(item['slide_id'])
+        measurements.append(item)
     print(json.dumps(measurements, sort_keys=True))
     browser.close()
 '''

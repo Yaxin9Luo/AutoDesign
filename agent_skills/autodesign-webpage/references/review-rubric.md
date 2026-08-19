@@ -18,6 +18,11 @@ Fail before scoring when any of these is visible or evidenced:
   a decorative interaction unrelated to the cited research;
 - clipped, overlapping, horizontally overflowing, or unusably small content in
   either required viewport;
+- a transparent, tinted, dark, gradient, or image-backed primary research
+  canvas instead of opaque pure white on `html`, `body`, and `main`, including
+  drift introduced by responsive CSS, runtime JavaScript, opacity, filters,
+  masks, blending, or clipping on those surfaces or an ancestor wrapping
+  `main`;
 - generic product-marketing copy, repetitive cards, decorative gradients,
   excessive pills, arbitrary glow, stock SaaS composition, or other AI-slop;
 - a broken primary navigation/control, absent keyboard affordance, or an
@@ -62,7 +67,9 @@ research story rather than a generic landing-page funnel.
 
 Section rhythm, scale, whitespace, alignment, and evidence placement guide a
 reader through the argument. Desktop and mobile each feel intentionally
-composed; neither is merely a shrunken version of the other.
+composed; neither is merely a shrunken version of the other. Judge the primary
+canvas separately from permissible local light section/card fills, controls,
+code blocks, and browser chrome.
 
 ### `typography`
 

@@ -454,6 +454,16 @@ def validate_deck_html(
         attrs = slide.attrs
         if attrs.get("data-width") != "1920" or attrs.get("data-height") != "1080":
             issues.append(_issue("slide_canvas", "slide must declare 1920x1080", slide_id=slide_id))
+        background = attrs.get("data-background", "").strip()
+        background_match = _HEX_COLOR.fullmatch(background)
+        if background_match is None or background_match.group(1).lower() != "ffffff":
+            issues.append(
+                _issue(
+                    "slide_canvas_background",
+                    "slide data-background must be opaque pure white #FFFFFF",
+                    slide_id=slide_id,
+                )
+            )
         if attrs.get("data-slide-index") != str(index):
             issues.append(
                 _issue(
@@ -900,6 +910,44 @@ def _validate_native_contract(
     return slides
 
 
+def _pptx_slide_background_is_pure_white(slide: Any) -> bool:
+    from pptx.enum.dml import MSO_COLOR_TYPE, MSO_FILL_TYPE
+
+    fill = slide.background.fill
+    if fill.type != MSO_FILL_TYPE.SOLID:
+        return False
+    color = fill.fore_color
+    if (
+        color.type != MSO_COLOR_TYPE.RGB
+        or str(color.rgb).upper() != "FFFFFF"
+        or color.brightness != 0
+    ):
+        return False
+    properties = fill._xPr
+    children = list(properties)
+    solid_fills = [
+        child for child in children if child.tag.rsplit("}", 1)[-1] == "solidFill"
+    ]
+    if len(solid_fills) != 1:
+        return False
+    colors = list(solid_fills[0])
+    if (
+        len(colors) != 1
+        or colors[0].tag.rsplit("}", 1)[-1] != "srgbClr"
+        or colors[0].get("val", "").upper() != "FFFFFF"
+        or len(colors[0]) != 0
+    ):
+        return False
+    return all(
+        child.tag.rsplit("}", 1)[-1] == "solidFill"
+        or (
+            child.tag.rsplit("}", 1)[-1] == "effectLst"
+            and len(child) == 0
+        )
+        for child in children
+    )
+
+
 def inspect_pptx(
     path: Path | str,
     *,
@@ -931,6 +979,14 @@ def inspect_pptx(
     observed_native: list[dict[str, Any]] = []
     for index, slide in enumerate(presentation.slides, start=1):
         slide_id = f"slide-{index:02d}"
+        if not _pptx_slide_background_is_pure_white(slide):
+            issues.append(
+                _issue(
+                    "pptx_slide_background",
+                    "reopened slide background must be an opaque pure-white RGB fill",
+                    slide_id=slide_id,
+                )
+            )
         slide_text = 0
         slide_tables = 0
         slide_images = 0

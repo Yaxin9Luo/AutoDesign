@@ -82,6 +82,14 @@ or inline `on*` handlers, including through runtime DOM/style injection. Scripts
 must not mutate exact claim text after load. Copy no text, logos, claims,
 figures, links, or codes from style references.
 
+Set `html`, `body`, and the required `main` research surface to opaque pure
+white (`#fff`) with no background image in desktop and mobile layouts. Preserve
+that canvas without opacity, filter, mask, blend, or clipping effects, both with
+and without JavaScript and after scripts settle. Do not place `main` inside an
+ancestor wrapper with any of those effects. Browser chrome, controls, code
+blocks, and restrained local section/card fills may use other colors or local
+descendant effects; they must not replace or cover the white primary canvas.
+
 Write a source-map claims JSON, then validate:
 
 ```bash
@@ -99,9 +107,12 @@ not visible in either the no-JS or JavaScript-enabled state. The live DOM must
 still exactly match the planned sections, claims, visuals, metadata, and
 interaction bindings after scripts settle. Keyboard behavior and pending work
 are audited separately with default motion and reduced motion. Persistent
-timers, animation frames, and Web Animations fail either quiescence gate. Only
-`index.html`, files it reaches locally, and harness-written
-audit reports may exist in `artifact/`; do not add scratch or hardlinked files.
+timers, animation frames, and Web Animations fail either quiescence gate.
+The read-only browser audit reports `primary_canvas_white` and fails the attempt
+if a primary surface becomes transparent, tinted, dark, gradient-backed, or
+image-backed, including through a paint-compositing effect; it never rewrites
+the page. Only `index.html`, files it reaches locally, and harness-written audit
+reports may exist in `artifact/`; do not add scratch or hardlinked files.
 Do not waive a failing check. Begin the next attempt and
 repair only reported regions; preserve every prior attempt. Every repair must
 capture the new `attempt_id` returned by `begin` into `ATTEMPT_ID` before any

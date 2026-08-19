@@ -18,8 +18,11 @@ unsupported or wrong; reference content leaks into the target; the central
 method/result or research arc is missing or misleading; a selected source
 visual is fragmentary, wrong, unreadable, detached from its readout, or replaced
 by reconstruction; text/evidence clips, overlaps, escapes, or becomes
-illegible; the composition is a sparse landing page, screenshot wallpaper, or
-flattened image; the header contains more than title/authors/institutions; or
+illegible; the primary Poster canvas is transparent, tinted, dark, altered by
+root/ancestor paint effects, or uses a background image/gradient that clashes
+with white-background paper evidence;
+the composition is a sparse landing page, screenshot wallpaper, or flattened
+image; the header contains more than title/authors/institutions; or
 the planned editable one-page physical PDF cannot be presented.
 
 Score every dimension from 1 through 5. Use 3 for competent but improvable, 4
@@ -122,6 +125,7 @@ route must be at least the strongest minimum below.
 | `poster-dom-source-flow-gutter` | `layout_repair` |
 | `poster-dom-source-flow-sibling` | `layout_repair` |
 | `poster-dom-screen-print-mismatch` | `layout_repair` |
+| `poster-dom-canvas-background` | `layout_repair` |
 | `poster-dom-template-boxiness` | `layout_repair` |
 
 The reviewer may escalate but never downgrade. Multiple findings take the

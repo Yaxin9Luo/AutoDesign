@@ -124,7 +124,11 @@ or visually unreviewed deck is not a completed deliverable.
 
 Use a formal academic light theme with a restrained palette, serif display
 hierarchy, sans-serif labels, generous but purposeful whitespace, and native
-evidence. Prefer diagrams, plots, tables, equations, and paper figures over
+evidence. Keep every primary slide canvas opaque pure white (`#FFFFFF`) in
+screen and print so white-background paper figures integrate cleanly; never use
+a slide-root gradient or image, and do not apply filters, masks, or blend modes
+to a slide or its artifact ancestors. Restrained light fills and effects may
+distinguish local panels and cards. Prefer diagrams, plots, tables, equations, and paper figures over
 decorative stock imagery. Reject dark dashboards, repeated card grids,
 gradients, sparse slogan slides, oversized titles, tiny captions, and generic
 AI-marketing language. Keep references style-only; never copy their content.

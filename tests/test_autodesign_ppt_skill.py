@@ -115,14 +115,14 @@ def _deck_html(slide_count: int = 18, *, remote_asset: bool = False) -> str:
             f'data-slide-index="{index}" data-slide-role="evidence" data-section="paper-talk" '
             f'data-assertion-title="The paper presents a grounded research finding." '
             f'data-source-ids="ev-001" data-speaker-notes="[Sources] ev-001 [Talk] Explain slide {index}." '
-            'data-width="1920" data-height="1080" data-background="#F7F7F3">'
+            'data-width="1920" data-height="1080" data-background="#FFFFFF">'
             + "".join(content)
             + "</section>"
         )
     return "".join(
         [
             "<!doctype html><html><head><meta charset=\"utf-8\"><style>",
-            "html,body{margin:0;background:#efefec}.deck-slide{position:relative;width:1920px;height:1080px;overflow:hidden;background:#F7F7F3}",
+            "html,body{margin:0;background:#efefec}.deck-slide{position:relative;width:1920px;height:1080px;overflow:hidden;background:#FFFFFF}",
             "@media print{.deck-slide{display:block!important;break-after:page;page-break-after:always}}",
             "</style></head><body>",
             f'<main id="deck" data-autodesign-artifact-root="deck" data-slide-count="{slide_count}" data-width="1920" data-height="1080">',
@@ -1576,6 +1576,13 @@ class AutoDesignPptSkillTests(unittest.TestCase):
 
     def test_computed_canvas_gate_rejects_wrong_authored_slide_root_size(self) -> None:
         harness = self._require(self.harness, HARNESS_PATH)
+        white = {
+            "background_color": "rgb(255, 255, 255)",
+            "background_rgba": [255, 255, 255, 255],
+            "background_image": "none",
+            "effective_opacity": 1,
+            "paint_effects": [],
+        }
         measurements = [
             {
                 "slide_id": f"slide-{index:02d}",
@@ -1585,12 +1592,172 @@ class AutoDesignPptSkillTests(unittest.TestCase):
                 "offset_height": 100 if index == 4 else 1080,
                 "rect_width": 100 if index == 4 else 1920,
                 "rect_height": 100 if index == 4 else 1080,
+                "screen": dict(white),
+                "print": dict(white),
             }
             for index in range(1, 19)
         ]
         report = harness.validate_computed_slide_canvases(measurements, 18)
         self.assertFalse(report["passed"], report)
         self.assertIn("slide-04", "\n".join(report["issues"]))
+
+    def test_computed_canvas_gate_rejects_nonwhite_or_nonopaque_slide_backgrounds(self) -> None:
+        harness = self._require(self.harness, HARNESS_PATH)
+        white = {
+            "background_color": "rgb(255, 255, 255)",
+            "background_rgba": [255, 255, 255, 255],
+            "background_image": "none",
+            "effective_opacity": 1,
+            "paint_effects": [],
+        }
+        measurements = [
+            {
+                "slide_id": f"slide-{index:02d}",
+                "computed_width": 1920,
+                "computed_height": 1080,
+                "offset_width": 1920,
+                "offset_height": 1080,
+                "rect_width": 1920,
+                "rect_height": 1080,
+                "screen": dict(white),
+                "print": dict(white),
+            }
+            for index in range(1, 19)
+        ]
+        measurements[0]["screen"]["background_color"] = "rgb(247, 247, 243)"
+        measurements[0]["screen"]["background_rgba"] = [247, 247, 243, 255]
+        measurements[1]["screen"]["background_color"] = "rgba(255, 255, 255, 0)"
+        measurements[1]["screen"]["background_rgba"] = [0, 0, 0, 0]
+        measurements[2]["screen"]["background_image"] = (
+            "linear-gradient(rgb(255, 255, 255), rgb(238, 238, 238))"
+        )
+        measurements[3]["print"]["background_image"] = 'url("assets/paper.png")'
+        measurements[4]["print"]["effective_opacity"] = 0.9
+
+        report = harness.validate_computed_slide_canvases(measurements, 18)
+
+        self.assertFalse(report["passed"], report)
+        findings = {
+            (finding["slide_id"], finding["media"], finding["code"])
+            for finding in report["findings"]
+        }
+        self.assertEqual(
+            findings,
+            {
+                ("slide-01", "screen", "slide_canvas_background"),
+                ("slide-02", "screen", "slide_canvas_background"),
+                ("slide-03", "screen", "slide_canvas_background"),
+                ("slide-04", "print", "slide_canvas_background"),
+                ("slide-05", "print", "slide_canvas_background"),
+            },
+        )
+
+    def test_computed_canvas_gate_rejects_root_or_ancestor_paint_effects(self) -> None:
+        harness = self._require(self.harness, HARNESS_PATH)
+        white = {
+            "background_color": "rgb(255, 255, 255)",
+            "background_rgba": [255, 255, 255, 255],
+            "background_image": "none",
+            "effective_opacity": 1,
+            "paint_effects": [],
+        }
+        measurements = [
+            {
+                "slide_id": f"slide-{index:02d}",
+                "computed_width": 1920,
+                "computed_height": 1080,
+                "offset_width": 1920,
+                "offset_height": 1080,
+                "rect_width": 1920,
+                "rect_height": 1080,
+                "screen": {**white, "paint_effects": []},
+                "print": {**white, "paint_effects": []},
+            }
+            for index in range(1, 19)
+        ]
+        measurements[0]["screen"]["paint_effects"] = [
+            {
+                "element": "section#slide-01.deck-slide",
+                "property": "filter",
+                "value": "opacity(0.5)",
+            }
+        ]
+        measurements[1]["print"]["paint_effects"] = [
+            {
+                "element": "main#deck",
+                "property": "filter",
+                "value": "brightness(0.5)",
+            }
+        ]
+        measurements[2]["screen"]["paint_effects"] = [
+            {
+                "element": "section#slide-03.deck-slide",
+                "property": "mix-blend-mode",
+                "value": "multiply",
+            }
+        ]
+        measurements[3]["print"]["paint_effects"] = [
+            {
+                "element": "body",
+                "property": "mask-image",
+                "value": "linear-gradient(rgb(0, 0, 0), transparent)",
+            }
+        ]
+
+        report = harness.validate_computed_slide_canvases(measurements, 18)
+
+        self.assertFalse(report["passed"], report)
+        self.assertEqual(
+            {
+                (finding["slide_id"], finding["media"], finding["code"])
+                for finding in report["findings"]
+            },
+            {
+                ("slide-01", "screen", "slide_canvas_background"),
+                ("slide-02", "print", "slide_canvas_background"),
+                ("slide-03", "screen", "slide_canvas_background"),
+                ("slide-04", "print", "slide_canvas_background"),
+            },
+        )
+
+    def test_html_contract_rejects_nonwhite_pptx_slide_background_metadata(self) -> None:
+        exporter = self._require(self.exporter, EXPORTER_PATH)
+        html = self._write_fixture()
+        html.write_text(
+            re.sub(
+                r'data-background="[^"]*"',
+                'data-background="#F7F7F3"',
+                html.read_text(encoding="utf-8"),
+                count=1,
+            ),
+            encoding="utf-8",
+        )
+
+        report = exporter.validate_deck_html(html, expected_slide_count=18)
+
+        self.assertFalse(report["passed"], report)
+        self.assertIn(
+            "slide_canvas_background",
+            {item["code"] for item in report["issues"]},
+        )
+
+    def test_html_contract_requires_explicit_slide_background_metadata(self) -> None:
+        exporter = self._require(self.exporter, EXPORTER_PATH)
+        html = self._write_fixture()
+        html.write_text(
+            html.read_text(encoding="utf-8").replace(
+                ' data-background="#FFFFFF"', "", 1
+            ),
+            encoding="utf-8",
+        )
+
+        report = exporter.validate_deck_html(html, expected_slide_count=18)
+
+        self.assertFalse(report["passed"], report)
+        self.assertIn(
+            "slide_canvas_background",
+            {item["code"] for item in report["issues"]},
+        )
 
     def test_pptx_export_reopens_with_editable_text_table_image_shape_and_notes(self) -> None:
         exporter = self._require(self.exporter, EXPORTER_PATH)
@@ -1612,6 +1779,42 @@ class AutoDesignPptSkillTests(unittest.TestCase):
             slide_xml = archive.read("ppt/slides/slide3.xml")
             self.assertIn(b"<a:tbl>", slide_xml)
             self.assertIn(b"The paper presents a grounded research finding.", slide_xml)
+
+    def test_pptx_reopen_rejects_a_nonwhite_slide_background_fill(self) -> None:
+        exporter = self._require(self.exporter, EXPORTER_PATH)
+        html = self._write_fixture()
+        deck = exporter.parse_deck_html(html)
+        native_contract = exporter.native_object_contract(deck)
+        original = self.root / "white-background.pptx"
+        mutated = self.root / "red-background.pptx"
+        exporter.export_deck_to_pptx(html, original)
+
+        replaced = 0
+        with zipfile.ZipFile(original) as source, zipfile.ZipFile(mutated, "w") as target:
+            for member in source.infolist():
+                payload = source.read(member.filename)
+                if member.filename == "ppt/slides/slide1.xml":
+                    payload, replaced = re.subn(
+                        rb'(<p:bg\b.*?<a:srgbClr val=")FFFFFF(")',
+                        rb"\g<1>FF0000\g<2>",
+                        payload,
+                        count=1,
+                        flags=re.DOTALL,
+                    )
+                target.writestr(member, payload)
+        self.assertEqual(replaced, 1)
+
+        report = exporter.inspect_pptx(
+            mutated,
+            expected_slide_count=18,
+            native_contract=native_contract,
+        )
+
+        self.assertFalse(report["passed"], report)
+        self.assertIn(
+            "pptx_slide_background",
+            {item["code"] for item in report["issues"]},
+        )
 
     def test_pptx_reopen_enforces_native_table_image_text_shape_and_notes_contract(self) -> None:
         from pptx import Presentation

@@ -54,6 +54,11 @@ def _snapshot(*, media: str = "screen") -> dict[str, object]:
         "root": {
             "block_id": "paper-poster-root",
             "rect": _rect(0, 0, 1000, 600),
+            "background_color": "rgb(255, 255, 255)",
+            "background_rgba": [255, 255, 255, 255],
+            "background_image": "none",
+            "effective_opacity": 1,
+            "paint_effects": [],
             "scrollWidth": 1000,
             "scrollHeight": 600,
             "clientWidth": 1000,
@@ -216,6 +221,57 @@ class PosterDomPureEvaluatorTests(unittest.TestCase):
         second = self._evaluate(json.loads(json.dumps(screen)))
         self.assertEqual(first, second)
         self.assertEqual((first["passed"], first["findings"]), (True, []))
+
+    def test_primary_canvas_requires_opaque_white_without_a_background_image(self) -> None:
+        cases = {
+            "transparent": ("rgba(0, 0, 0, 0)", [0, 0, 0, 0], "none"),
+            "tinted": ("rgb(248, 250, 252)", [248, 250, 252, 255], "none"),
+            "dark": ("rgb(18, 24, 32)", [18, 24, 32, 255], "none"),
+            "gradient": (
+                "rgb(255, 255, 255)",
+                [255, 255, 255, 255],
+                "linear-gradient(rgb(255, 255, 255), rgb(238, 242, 247))",
+            ),
+        }
+        for media in ("screen", "print"):
+            for label, (color, rgba, image) in cases.items():
+                with self.subTest(media=media, label=label):
+                    snapshot = _dense_snapshot(media=media)
+                    snapshot["root"]["background_color"] = color
+                    snapshot["root"]["background_rgba"] = rgba
+                    snapshot["root"]["background_image"] = image
+                    result = self.audit.evaluate_dom_snapshot(
+                        snapshot,
+                        canvas=self.canvas,
+                        print_size=self.print_size,
+                    )
+                    self.assertIn("poster-dom-canvas-background", self._codes(result))
+
+        white = self.audit.evaluate_dom_snapshot(
+            _dense_snapshot(),
+            canvas=self.canvas,
+            print_size=self.print_size,
+        )
+        self.assertNotIn("poster-dom-canvas-background", self._codes(white))
+
+    def test_primary_canvas_rejects_paint_effects_that_change_rendered_white(self) -> None:
+        cases = {
+            "ancestor-opacity": {"effective_opacity": 0.5},
+            "root-filter": {"paint_effects": ["filter:opacity(0.5)"]},
+            "root-blend": {"paint_effects": ["mix-blend-mode:multiply"]},
+            "root-mask": {"paint_effects": ["mask-image:linear-gradient(#fff,transparent)"]},
+            "root-clip": {"paint_effects": ["clip:rect(0px,500px,600px,0px)"]},
+        }
+        for label, changes in cases.items():
+            with self.subTest(label=label):
+                snapshot = _dense_snapshot()
+                snapshot["root"].update(changes)
+                result = self.audit.evaluate_dom_snapshot(
+                    snapshot,
+                    canvas=self.canvas,
+                    print_size=self.print_size,
+                )
+                self.assertIn("poster-dom-canvas-background", self._codes(result))
 
     def test_canvas_fill_detects_blank_lower_canvas_without_panels(self) -> None:
         snapshot = _snapshot()
@@ -537,6 +593,14 @@ class PosterDomPureEvaluatorTests(unittest.TestCase):
         print_mismatch["root"]["scrollWidth"] = 900
         cases["poster-dom-screen-print-mismatch"] = (_snapshot(), print_mismatch)
 
+        canvas_background = _snapshot()
+        canvas_background["root"]["background_color"] = "rgb(245, 247, 250)"
+        canvas_background["root"]["background_rgba"] = [245, 247, 250, 255]
+        cases["poster-dom-canvas-background"] = (
+            canvas_background,
+            _snapshot(media="print"),
+        )
+
         boxy = _snapshot()
         boxy["elements"] = [
             {
@@ -568,6 +632,7 @@ class PosterDomPureEvaluatorTests(unittest.TestCase):
             "poster-dom-source-flow-gutter",
             "poster-dom-source-flow-sibling",
             "poster-dom-screen-print-mismatch",
+            "poster-dom-canvas-background",
             "poster-dom-template-boxiness",
         }
         self.assertEqual(set(cases), expected_codes)
@@ -1056,7 +1121,7 @@ class PosterDomRealBrowserTests(unittest.TestCase):
             * {{ box-sizing: border-box; }}
             html, body {{ margin: 0; width: 3072px; height: 1536px; overflow: hidden; }}
             body {{ font-family: Arial, sans-serif; background: white; color: #18202a; }}
-            .paper-poster {{ position: relative; width: 3072px; height: 1536px; overflow: hidden; }}
+            .paper-poster {{ position: relative; width: 3072px; height: 1536px; overflow: hidden; background: #fff; }}
             p, li, td, th {{ font-size: 24px; line-height: 1.25; }}
             @media print {{
               html, body, .paper-poster {{ width: 3072px; height: 1536px; }}
@@ -1176,6 +1241,89 @@ class PosterDomRealBrowserTests(unittest.TestCase):
                 attempt_root / "qa" / "previews" / "poster-print.png"
             ),
         )
+
+    def test_primary_canvas_background_is_checked_in_screen_and_print(self) -> None:
+        body = "".join(
+            f'<p data-block-id="copy-{index}" style="position:absolute;left:{80 + (index % 3) * 980}px;'
+            f'top:{80 + (index // 3) * 170}px;width:850px;height:120px">'
+            "Grounded methods and evidence fill this conference poster.</p>"
+            for index in range(24)
+        )
+        tinted, _before = self._run(
+            "real-tinted-canvas",
+            self._html(body, extra_style=".paper-poster { background: #f4f7fb; }"),
+        )
+        print_gradient, _before = self._run(
+            "real-print-gradient-canvas",
+            self._html(
+                body,
+                extra_style=(
+                    "@media print { .paper-poster { background: #fff; "
+                    "background-image: linear-gradient(#fff, #eef2f7); } }"
+                ),
+            ),
+        )
+        filtered, _before = self._run(
+            "real-filtered-canvas",
+            self._html(
+                body,
+                extra_style=(
+                    "body { background: #000; } "
+                    ".paper-poster { filter: opacity(.5); }"
+                ),
+            ),
+        )
+        translucent, _before = self._run(
+            "real-translucent-canvas",
+            self._html(
+                body,
+                extra_style=(
+                    "body { background: #000; } "
+                    ".paper-poster { opacity: .5; }"
+                ),
+            ),
+        )
+
+        tinted_findings = [
+            item
+            for item in tinted["findings"]
+            if item["code"] == "poster-dom-canvas-background"
+        ]
+        gradient_findings = [
+            item
+            for item in print_gradient["findings"]
+            if item["code"] == "poster-dom-canvas-background"
+        ]
+        filtered_findings = [
+            item
+            for item in filtered["findings"]
+            if item["code"] == "poster-dom-canvas-background"
+        ]
+        translucent_findings = [
+            item
+            for item in translucent["findings"]
+            if item["code"] == "poster-dom-canvas-background"
+        ]
+        self.assertEqual(
+            {item["geometry"]["media"] for item in tinted_findings},
+            {"screen", "print"},
+        )
+        self.assertEqual(
+            {item["geometry"]["media"] for item in gradient_findings},
+            {"print"},
+        )
+        self.assertEqual(
+            {item["geometry"]["media"] for item in filtered_findings},
+            {"screen", "print"},
+        )
+        self.assertEqual(
+            {item["geometry"]["media"] for item in translucent_findings},
+            {"screen", "print"},
+        )
+        self.assertTrue(tinted["artifact_unchanged"])
+        self.assertTrue(print_gradient["artifact_unchanged"])
+        self.assertTrue(filtered["artifact_unchanged"])
+        self.assertTrue(translucent["artifact_unchanged"])
 
     def test_sparse_top_canvas_without_recognized_panels_fails_fill_checks(self) -> None:
         body = "".join(

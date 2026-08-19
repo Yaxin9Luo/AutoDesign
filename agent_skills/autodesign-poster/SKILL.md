@@ -36,6 +36,11 @@ do not assume it is one shell token. Use
   There is no mandatory image-count quota.
 - Scripts never edit the Poster. In particular, DOM audit reports defects but
   never changes authored HTML, CSS, layout, or content.
+- Render the primary `.paper-poster` canvas as opaque pure white in both screen
+  and print media so white-background paper crops remain visually integrated.
+  Do not use a canvas gradient, image, tint, dark theme, transparent root, or
+  root/ancestor paint effect that changes white; restrained light fills remain
+  available inside local sections and panels.
 - Fresh source review must pass before `plan`. The artifact reviewer may
   escalate a repair route but never downgrade it.
 

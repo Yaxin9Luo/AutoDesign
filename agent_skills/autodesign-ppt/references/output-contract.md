@@ -139,6 +139,11 @@ Write `artifact/deck.html` with:
   browser checks the actual computed width, height, and layout box of every
   authored slide root before slide-isolation CSS is applied; a dummy rule or
   wrapper with the right dimensions cannot satisfy this gate;
+- `data-background="#FFFFFF"` and an opaque pure-white computed background on
+  every `.deck-slide` in both screen and print media. Slide-root transparency,
+  tint, gradient, or image is invalid. A filter, mask, or non-normal blend mode
+  on the slide or one of its artifact ancestors is also invalid; local panels
+  and cards may still use restrained light fills and effects;
 - ArrowLeft and ArrowRight keyboard navigation plus stable `#slide-01` hash
   navigation. Navigation controls may stay invisible in the rendered slide;
 - only local regular-file dependencies. No remote URL, hotlink, iframe, web
@@ -235,7 +240,8 @@ Unexpected files and directories, symlinks, hardlinks, and non-regular files are
 rejected. Browser QA must pass separately for every slide and the contact sheet.
 The PDF page count must equal the plan.
 The PPTX must reopen at 13.333333x7.5 inches with every slide, note, editable
-text layer, table, image, and shape present. When a local office renderer exists,
+text layer, table, image, and shape present. Every reopened slide must retain an
+explicit, opaque, pure-white RGB background fill. When a local office renderer exists,
 all pages must rasterize and pass both pixel-similarity and foreground-edge
 recall against canonical HTML. A page-count-only or blank render cannot pass.
 

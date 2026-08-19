@@ -154,7 +154,7 @@ def _poster_html(*, image: bool = False) -> str:
 * {{ box-sizing: border-box; }}
 html, body {{ margin: 0; width: 3072px; height: 1536px; }}
 body {{ font-family: Arial, Helvetica, sans-serif; color: #18202a; background: #fff; }}
-.paper-poster {{ width: 3072px; height: 1536px; padding: 48px; overflow: hidden; }}
+.paper-poster {{ width: 3072px; height: 1536px; padding: 48px; overflow: hidden; background: #fff; }}
 [data-role="identity-header"] {{ height: 250px; border-top: 18px solid #174a7e; }}
 [data-identity="title"] {{ margin: 18px 0 4px; font-size: 56px; line-height: 1.04; }}
 [data-identity="authors"], [data-identity="institutions"] {{ margin: 4px 0; font-size: 28px; }}

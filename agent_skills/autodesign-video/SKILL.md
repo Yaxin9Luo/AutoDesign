@@ -61,9 +61,13 @@ in `py -3`) with `$SKILL_ROOT/scripts/video_harness.py --help` and
    [output-contract.md](references/output-contract.md). Use native HTML/CSS/SVG
    text, real paper figures, deterministic seekable timelines, one composition
    root, literal `class="clip"` scenes, literal narration audio, and a working
-   subtitle toggle. Each scene's actual source-bound image IDs must equal its
-   canonical `visual_ids` exactly. Do not add inline `on*` handlers, remote
-   resources, or runtime network behavior.
+   subtitle toggle. Give the composition root and every content scene an opaque
+   pure-white rendered canvas so white-background paper figures integrate
+   cleanly. Keep these primary roots at full effective opacity and free of
+   filters, masks, blending, and clipping; animate an inner content wrapper
+   instead. Each scene's actual source-bound image IDs must equal its canonical
+   `visual_ids` exactly. Do not add inline `on*` handlers, remote resources, or
+   runtime network behavior.
 5. Write a non-empty claims JSON list. Every planned title and narration must
    equal the text of its named claim exactly; visible numbers must occur in one
    of that scene's `visible_claim_ids`. Every claim cites real evidence IDs.
@@ -80,11 +84,20 @@ in `py -3`) with `$SKILL_ROOT/scripts/video_harness.py --help` and
    strict offline Chromium interaction of every visible enabled native or ARIA
    control, with identity/result evidence and at least 500 ms of timer,
    request, navigation, and popup quiescence after every operation. Subtitle
-   checks include ancestor opacity and clipped viewport intersection; full real
-   HyperFrames lint; strict real HyperFrames render; subtitle mux; exact
-   ffprobe; representative frames and contact sheet. ffmpeg may mix audio, mux
-   subtitles, and extract frames; it must never replace HyperFrames as the final
-   renderer. A stale or invalid MP4 is deleted and cannot pass. Publishing uses
+   checks include ancestor opacity and clipped viewport intersection. The same
+   browser audits the composition root and every scene at initial load, after
+   each operated control, and in the final state, rejecting transparent,
+   tinted, dark, gradient, image, translucent, filtered, masked, blended, or
+   clipped primary canvases. For an animated project it also seeks each scene
+   midpoint through the existing player or unique composition timeline; a
+   missing seek API fails closed because active scenes cannot be verified. Use
+   `data-no-timeline` only when no player or timeline registry exists and the
+   composition/scene roots have no active CSS animation, transition, or Web
+   Animation. Local motion belongs on descendant wrappers and panels;
+   full real HyperFrames lint; strict real HyperFrames render; subtitle mux;
+   exact ffprobe; representative frames and contact sheet. ffmpeg may mix
+   audio, mux subtitles, and extract frames; it must never replace HyperFrames
+   as the final renderer. A stale or invalid MP4 is deleted and cannot pass. Publishing uses
    an exact generated allowlist through a sibling staging directory and atomic
    promotion. The promotion moves the pre-created empty destination aside for
    Windows compatibility and recovers interrupted stage/backup transactions;
@@ -124,6 +137,11 @@ fallback file is not success.
 Make a conference film, not a narrated slide dump. Use editorial scene
 composition, restrained academic typography, purposeful motion, direct visual
 continuity, readable source figures, and evidence-led narration. Keep captions
-optional and default them off in the authored player. Avoid repeated cards,
-gratuitous gradients, decorative stock media, fake logos, tiny figures, dense
-paper paragraphs, constant motion, and generic AI-marketing language.
+optional and default them off in the authored player. Use opaque pure white
+`#fff` with no background image for the composition root and every rendered
+content scene. Do not fade, filter, mask, blend, or clip these roots; apply
+motion to their inner content. Player chrome, subtitles, overlays, and
+restrained light local panels are not primary canvases and may use purposeful
+contrast. Avoid repeated
+cards, gratuitous gradients, decorative stock media, fake logos, tiny figures,
+dense paper paragraphs, constant motion, and generic AI-marketing language.

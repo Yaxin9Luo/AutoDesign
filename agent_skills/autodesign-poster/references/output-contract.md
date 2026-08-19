@@ -53,8 +53,14 @@ landscape work normally uses three editorial columns with one to three
 normal-flow sections per column. Avoid giant empty regions, clipped figures,
 tiny paper screenshots, repeated figure/table labels, heavy full-cell grids,
 decorative filler, gratuitous cards, gradients, and arbitrary section colors.
-Use a restrained academic palette and let source evidence carry the visual
-weight.
+Set the `.paper-poster` root itself to opaque pure white with no background
+image in screen and print media. Do not rely on a white `body` beneath a
+transparent Poster root, and do not apply root/ancestor opacity, filters,
+backdrop filters, masks, clipping, or blend modes that change its rendered
+white. Local sections may use restrained light fills and accent color, but the
+primary canvas stays white so original paper figures and tables do not clash
+with a tinted or dark field. Use a restrained academic palette and let source
+evidence carry the visual weight.
 
 ## Claim/source map
 
@@ -83,7 +89,8 @@ tree. `artifact_tree_sha256_before` must equal
 `artifact_tree_sha256_after`, and `artifact_unchanged` must be true. The audit
 may report overflow, clipping, overlap, viewport escape, blank bands, sparse
 oversized panels, low effective image resolution, table overflow/small text,
-source-flow defects, screen/print mismatch, or template boxiness. It never
+source-flow defects, screen/print mismatch, a non-white primary canvas, or
+template boxiness. It never
 moves elements, resizes panels, shrinks fonts, injects CSS, or accepts a repair.
 The Agent interprets findings, preserves design intent, and edits only a new or
 active authoring attempt.

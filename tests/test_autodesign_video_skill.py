@@ -206,9 +206,9 @@ def _project_html(plan: dict[str, object], *, bad: str = "") -> str:
     )
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">{meta_refresh}<style>
-html,body{{margin:0;width:1920px;height:1080px;overflow:hidden}}
-[data-composition-id]{{position:relative;width:1920px;height:1080px;background:#101820;color:white}}
-.clip{{position:absolute;inset:0}} .subtitle-overlay[hidden]{{display:none}}
+html,body{{margin:0;width:1920px;height:1080px;overflow:hidden;background:#fff}}
+[data-composition-id]{{position:relative;width:1920px;height:1080px;background:#fff;color:#132238}}
+.clip{{position:absolute;inset:0;background:#fff}} .subtitle-overlay[hidden]{{display:none}}
 {subtitle_override}
 </style></head><body>
 <main data-composition-id="conference-video" data-start="{root_start}"
@@ -246,6 +246,57 @@ def _make_executable(path: Path, body: str) -> Path:
     return path
 
 
+def _white_primary_canvas_surfaces(
+    *, scene_count: int = 12, composition_id: str = "conference-video"
+) -> list[dict[str, object]]:
+    return [
+        {
+            "kind": "composition",
+            "id": composition_id,
+            "background_color": "rgb(255, 255, 255)",
+            "background_image": "none",
+            "rgba": [255, 255, 255, 255],
+            "effective_opacity": 1.0,
+            "paint_effects": [],
+        },
+        *[
+            {
+                "kind": "scene",
+                "id": f"scene_{index + 1:02d}",
+                "background_color": "rgb(255, 255, 255)",
+                "background_image": "none",
+                "rgba": [255, 255, 255, 255],
+                "effective_opacity": 1.0,
+                "paint_effects": [],
+            }
+            for index in range(scene_count)
+        ],
+    ]
+
+
+def _primary_canvas_checkpoints(
+    surfaces: list[dict[str, object]],
+    control_results: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    labels = ["initial"]
+    for index, result in enumerate(control_results):
+        identity = result.get("identity")
+        token = (
+            identity.get("token")
+            if isinstance(identity, dict) and isinstance(identity.get("token"), str)
+            else f"control-{index + 1}"
+        )
+        if result.get("operation") == "toggle-twice":
+            labels.extend((f"control:{token}:step-1", f"control:{token}:step-2"))
+        else:
+            labels.append(f"control:{token}")
+    labels.append("final")
+    return [
+        {"label": label, "surfaces": json.loads(json.dumps(surfaces))}
+        for label in labels
+    ]
+
+
 def _fake_runtime(
     root: Path,
     *,
@@ -261,6 +312,9 @@ def _fake_runtime(
     quiescence_ms: int = 500,
     late_activity: list[str] | None = None,
     pending_timers: int = 0,
+    primary_canvas_surfaces: list[dict[str, object]] | None = None,
+    primary_canvas_checkpoints: list[dict[str, object]] | None = None,
+    timeline_sampling: dict[str, object] | None = None,
 ) -> dict[str, str]:
     bin_dir = root / "fake-bin"
     bin_dir.mkdir(parents=True)
@@ -367,6 +421,19 @@ def _fake_runtime(
         }
         for index in range(control_count + 3)
     ]
+    if primary_canvas_surfaces is None:
+        primary_canvas_surfaces = _white_primary_canvas_surfaces()
+    if primary_canvas_checkpoints is None:
+        primary_canvas_checkpoints = _primary_canvas_checkpoints(
+            primary_canvas_surfaces,
+            fake_control_results,
+        )
+    if timeline_sampling is None:
+        timeline_sampling = {
+            "mode": "static",
+            "sampled_scene_ids": [],
+            "reason": "data-no-timeline",
+        }
     node = _make_executable(
         bin_dir / "node",
         """
@@ -392,6 +459,10 @@ def _fake_runtime(
                                    'width': %d, 'height': %d, 'visible': %r,
                                    'effective_opacity': %r,
                                    'intersection_width': %d, 'intersection_height': %d},
+          },
+          'primary_canvas_audit': {
+            'checkpoints': %r,
+            'timeline_sampling': %r,
           },
           'control_count': %d,
           'controls_exercised': %d,
@@ -428,6 +499,8 @@ def _fake_runtime(
             subtitle_effective_opacity,
             hidden_extent,
             80 if subtitle_css_override else 0,
+            primary_canvas_checkpoints,
+            timeline_sampling,
             control_count,
             controls_exercised,
             fake_control_results,
@@ -529,6 +602,22 @@ class AutoDesignVideoSkillTests(unittest.TestCase):
     def _require(self, module: object | None, path: Path) -> object:
         self.assertIsNotNone(module, f"missing standalone video implementation: {path}")
         return module
+
+    def _real_browser_fixture(self, name: str) -> tuple[object, object, Path, Path, dict[str, str], dict[str, str]]:
+        harness = self._require(self.harness, HARNESS_PATH)
+        setup = self._require(self.setup, SETUP_PATH)
+        plan = harness.synthetic_smoke_plan()
+        project = harness.write_synthetic_smoke_project(self.root / name, plan)
+        segments = [
+            {
+                "scene_id": scene["scene_id"],
+                "speech_end_s": float(scene["start_s"]) + 1.0,
+            }
+            for scene in plan["scenes"]
+        ]
+        vtt = harness._write_subtitles(project, plan, segments)["vtt"]
+        runtime = setup.require_video_runtime().as_dict()
+        return harness, plan, project, vtt, runtime, harness._runtime_env(runtime)
 
     def _review_ready_run(
         self,
@@ -1244,6 +1333,222 @@ class AutoDesignVideoSkillTests(unittest.TestCase):
             browser["subtitle_source_sha256"],
             harness.sha256_file(project / "narration" / "subtitles.en.vtt"),
         )
+
+    def test_browser_preflight_rejects_nonwhite_primary_canvas_surfaces(self) -> None:
+        """Catches non-white composition or late-scene canvases behind paper figures."""
+        harness = self._require(self.harness, HARNESS_PATH)
+        plan = _plan()
+        valid_surfaces = _white_primary_canvas_surfaces()
+        invalid_cases = {
+            "transparent-composition": (0, {"rgba": [0, 0, 0, 0]}),
+            "tinted-scene": (12, {"rgba": [248, 250, 252, 255]}),
+            "dark-scene": (12, {"rgba": [16, 24, 40, 255]}),
+            "gradient-scene": (
+                12,
+                {
+                    "background_image": (
+                        "linear-gradient(rgb(255, 255, 255), rgb(238, 238, 238))"
+                    )
+                },
+            ),
+            "image-scene": (12, {"background_image": 'url("assets/background.png")'}),
+        }
+        for label, (surface_index, changes) in invalid_cases.items():
+            with self.subTest(label=label):
+                surfaces = json.loads(json.dumps(valid_surfaces))
+                surfaces[surface_index].update(changes)
+                project = _write_project(self.root / label, plan)
+                report = harness.deliver_project(
+                    project,
+                    plan,
+                    _fake_runtime(
+                        self.root / f"{label}-runtime",
+                        primary_canvas_surfaces=surfaces,
+                    ),
+                    claims=_claims(plan),
+                    smoke=True,
+                )
+                self.assertFalse(report["passed"], label)
+                self.assertEqual(report["failed_stage"], "browser_preflight")
+                self.assertIn("primary canvas", report["error"].lower())
+
+    def test_browser_preflight_requires_every_primary_canvas_surface(self) -> None:
+        """Catches audits that silently skip the final planned scene."""
+        harness = self._require(self.harness, HARNESS_PATH)
+        plan = _plan()
+        surfaces = _white_primary_canvas_surfaces(scene_count=11)
+        project = _write_project(self.root / "missing-final-scene", plan)
+        report = harness.deliver_project(
+            project,
+            plan,
+            _fake_runtime(
+                self.root / "missing-final-scene-runtime",
+                primary_canvas_surfaces=surfaces,
+            ),
+            claims=_claims(plan),
+            smoke=True,
+        )
+        self.assertFalse(report["passed"])
+        self.assertEqual(report["failed_stage"], "browser_preflight")
+        self.assertIn("primary canvas", report["error"].lower())
+
+    def test_browser_preflight_rejects_primary_canvas_paint_effects(self) -> None:
+        """Catches white declarations whose final paint is translucent or altered."""
+        harness = self._require(self.harness, HARNESS_PATH)
+        plan = _plan()
+        invalid_cases = {
+            "opacity": {"effective_opacity": 0.5},
+            "filter": {"paint_effects": ["main:filter=opacity(0.5)"]},
+            "mask": {"paint_effects": ["main:mask-image=linear-gradient(#000,#0000)"]},
+            "blend": {"paint_effects": ["main:mix-blend-mode=multiply"]},
+            "clip": {"paint_effects": ["main:clip-path=inset(10px)"]},
+        }
+        for label, changes in invalid_cases.items():
+            with self.subTest(label=label):
+                surfaces = _white_primary_canvas_surfaces()
+                surfaces[0].update(changes)
+                project = _write_project(self.root / f"paint-{label}", plan)
+                report = harness.deliver_project(
+                    project,
+                    plan,
+                    _fake_runtime(
+                        self.root / f"paint-{label}-runtime",
+                        primary_canvas_surfaces=surfaces,
+                    ),
+                    claims=_claims(plan),
+                    smoke=True,
+                )
+                self.assertFalse(report["passed"], label)
+                self.assertEqual(report["failed_stage"], "browser_preflight")
+                self.assertIn("primary canvas", report["error"].lower())
+
+    def test_browser_preflight_rechecks_primary_canvas_after_each_control(self) -> None:
+        """Catches a later exercised control that changes a valid canvas to black."""
+        harness = self._require(self.harness, HARNESS_PATH)
+        plan = _plan()
+        controls = [
+            {
+                "identity": {
+                    "token": f"control-{index}",
+                    "tag": "button",
+                    "id": f"button-{index}",
+                    "type": "button",
+                    "role": "",
+                    "name": "",
+                    "aria_label": "",
+                    "text": f"Control {index}",
+                },
+                "kind": "button",
+                "operation": "click",
+                "result": "ok",
+            }
+            for index in (1, 2)
+        ]
+        surfaces = _white_primary_canvas_surfaces()
+        checkpoints = _primary_canvas_checkpoints(surfaces, controls)
+        for checkpoint in checkpoints:
+            if checkpoint["label"] in {"control:control-2", "final"}:
+                checkpoint_surfaces = checkpoint["surfaces"]
+                assert isinstance(checkpoint_surfaces, list)
+                checkpoint_surfaces[0]["rgba"] = [0, 0, 0, 255]
+                checkpoint_surfaces[0]["background_color"] = "rgb(0, 0, 0)"
+        project = _write_project(self.root / "post-control-canvas", plan)
+        report = harness.deliver_project(
+            project,
+            plan,
+            _fake_runtime(
+                self.root / "post-control-canvas-runtime",
+                control_count=2,
+                controls_exercised=2,
+                control_results=controls,
+                primary_canvas_surfaces=surfaces,
+                primary_canvas_checkpoints=checkpoints,
+            ),
+            claims=_claims(plan),
+            smoke=True,
+        )
+        self.assertFalse(report["passed"])
+        self.assertEqual(report["failed_stage"], "browser_preflight")
+        self.assertIn("control:control-2", report["error"])
+
+    def test_browser_preflight_rejects_nonwhite_active_scene_sample(self) -> None:
+        """Catches a seekable timeline that makes a scene non-white only when active."""
+        harness = self._require(self.harness, HARNESS_PATH)
+        plan = _plan()
+        surfaces = _white_primary_canvas_surfaces()
+        controls = [
+            {
+                "identity": {
+                    "token": "control-1",
+                    "tag": "button",
+                    "id": "",
+                    "type": "button",
+                    "role": "",
+                    "name": "",
+                    "aria_label": "",
+                    "text": "Control",
+                },
+                "kind": "button",
+                "operation": "click",
+                "result": "ok",
+            }
+        ]
+        checkpoints = _primary_canvas_checkpoints(surfaces, controls)
+        active_surfaces = json.loads(json.dumps(surfaces))
+        active_surfaces[6]["rgba"] = [0, 0, 0, 255]
+        active_surfaces[6]["background_color"] = "rgb(0, 0, 0)"
+        checkpoints.insert(
+            1,
+            {
+                "label": "scene:scene_06",
+                "time_s": 165.0,
+                "surfaces": active_surfaces,
+            },
+        )
+        project = _write_project(self.root / "active-scene-canvas", plan)
+        report = harness.deliver_project(
+            project,
+            plan,
+            _fake_runtime(
+                self.root / "active-scene-canvas-runtime",
+                control_results=controls,
+                primary_canvas_surfaces=surfaces,
+                primary_canvas_checkpoints=checkpoints,
+                timeline_sampling={
+                    "mode": "direct-timeline",
+                    "sampled_scene_ids": [scene["scene_id"] for scene in plan["scenes"]],
+                    "reason": "",
+                },
+            ),
+            claims=_claims(plan),
+            smoke=True,
+        )
+        self.assertFalse(report["passed"])
+        self.assertEqual(report["failed_stage"], "browser_preflight")
+        self.assertIn("scene:scene_06", report["error"])
+
+    def test_browser_preflight_fails_closed_without_seekable_animated_timeline(self) -> None:
+        """Catches animated projects whose active-scene canvas cannot be inspected."""
+        harness = self._require(self.harness, HARNESS_PATH)
+        plan = _plan()
+        project = _write_project(self.root / "unseekable-canvas", plan)
+        report = harness.deliver_project(
+            project,
+            plan,
+            _fake_runtime(
+                self.root / "unseekable-canvas-runtime",
+                timeline_sampling={
+                    "mode": "unavailable",
+                    "sampled_scene_ids": [],
+                    "reason": "animated composition exposes no seek function",
+                },
+            ),
+            claims=_claims(plan),
+            smoke=True,
+        )
+        self.assertFalse(report["passed"])
+        self.assertEqual(report["failed_stage"], "browser_preflight")
+        self.assertIn("timeline", report["error"].lower())
 
     def test_subtitle_toggle_uses_computed_visibility_not_only_hidden_attribute(self) -> None:
         """Catches CSS !important rules that visually override the hidden attribute."""
@@ -2192,6 +2497,245 @@ class AutoDesignVideoSkillTests(unittest.TestCase):
             0,
         )
         self.assertFalse(browser["computed_states"]["after_second_click"]["visible"])
+
+    @unittest.skipUnless(
+        os.environ.get("AUTODESIGN_VIDEO_REAL_SMOKE") == "1",
+        "set AUTODESIGN_VIDEO_REAL_SMOKE=1 for the real Chromium audit",
+    )
+    def test_real_browser_rejects_filtered_white_composition_over_black(self) -> None:
+        harness, _plan_value, project, vtt, runtime, env = self._real_browser_fixture(
+            "real-filtered-canvas"
+        )
+        index = project / "index.html"
+        text = index.read_text(encoding="utf-8").replace(
+            "</style>",
+            "body{background:#000}[data-composition-id]{filter:opacity(.5)}</style>",
+        )
+        index.write_text(text, encoding="utf-8")
+        with self.assertRaisesRegex(harness.StageError, "primary_canvas_background"):
+            harness._browser_preflight(project, vtt, runtime, env)
+
+    @unittest.skipUnless(
+        os.environ.get("AUTODESIGN_VIDEO_REAL_SMOKE") == "1",
+        "set AUTODESIGN_VIDEO_REAL_SMOKE=1 for the real Chromium audit",
+    )
+    def test_real_browser_rejects_canvas_changed_by_exercised_control(self) -> None:
+        harness, _plan_value, project, vtt, runtime, env = self._real_browser_fixture(
+            "real-control-canvas"
+        )
+        index = project / "index.html"
+        text = index.read_text(encoding="utf-8").replace(
+            "</script>",
+            "document.getElementById('smoke-details').addEventListener('click',()=>{"
+            "document.querySelector('[data-composition-id]').style.background='#000';"
+            "});</script>",
+        )
+        index.write_text(text, encoding="utf-8")
+        with self.assertRaisesRegex(harness.StageError, "primary_canvas_background"):
+            harness._browser_preflight(project, vtt, runtime, env)
+
+    @unittest.skipUnless(
+        os.environ.get("AUTODESIGN_VIDEO_REAL_SMOKE") == "1",
+        "set AUTODESIGN_VIDEO_REAL_SMOKE=1 for the real Chromium audit",
+    )
+    def test_real_browser_samples_each_seekable_active_scene(self) -> None:
+        harness, plan, project, vtt, runtime, env = self._real_browser_fixture(
+            "real-active-scene-canvas"
+        )
+        index = project / "index.html"
+        text = index.read_text(encoding="utf-8").replace(" data-no-timeline", "")
+        timeline_script = """
+<script>
+let currentSmokeTime = 0;
+window.__timelines = {smoke: {
+  duration: () => 6,
+  time: () => currentSmokeTime,
+  play: () => {},
+  pause: () => {},
+  seek: value => {
+    currentSmokeTime = Number(value);
+    const target = document.getElementById('scene_02');
+    target.style.background = currentSmokeTime >= 2 && currentSmokeTime < 4 ? '#000' : '#fff';
+  },
+}};
+</script>
+"""
+        text = text.replace("</body>", timeline_script + "</body>")
+        index.write_text(text, encoding="utf-8")
+        with self.assertRaisesRegex(harness.StageError, "scene:scene_02"):
+            harness._browser_preflight(project, vtt, runtime, env)
+
+    @unittest.skipUnless(
+        os.environ.get("AUTODESIGN_VIDEO_REAL_SMOKE") == "1",
+        "set AUTODESIGN_VIDEO_REAL_SMOKE=1 for the real Chromium audit",
+    )
+    def test_real_browser_static_marker_rejects_bounded_primary_root_animation(self) -> None:
+        harness, plan, project, vtt, runtime, env = self._real_browser_fixture(
+            "real-static-marker-animation"
+        )
+        index = project / "index.html"
+        text = index.read_text(encoding="utf-8").replace(
+            "</style>",
+            """
+@keyframes hiddenCanvasFlash {
+  0%, 36.10% { background:#fff; }
+  36.12%, 38.88% { background:#000; }
+  38.90%, 100% { background:#fff; }
+}
+#scene_02 { animation:hiddenCanvasFlash 6s linear 1 both; }
+</style>
+""",
+        )
+        index.write_text(text, encoding="utf-8")
+        structural = harness.validate_project(
+            project,
+            plan,
+            claims=harness.synthetic_smoke_claims(plan),
+            smoke=True,
+        )
+        self.assertTrue(structural["passed"], structural)
+        with self.assertRaisesRegex(harness.StageError, "primary_canvas_timeline_unavailable"):
+            harness._browser_preflight(project, vtt, runtime, env)
+
+    @unittest.skipUnless(
+        os.environ.get("AUTODESIGN_VIDEO_REAL_SMOKE") == "1",
+        "set AUTODESIGN_VIDEO_REAL_SMOKE=1 for the real Chromium audit",
+    )
+    def test_real_browser_static_marker_rejects_active_primary_root_motion(self) -> None:
+        cases = {
+            "css-transition": (
+                "#scene_02{transition:transform 6s linear}</style>",
+                "const scene=document.getElementById('scene_02');"
+                "scene.getBoundingClientRect();scene.style.transform='translateX(1px)';",
+            ),
+            "web-animation": (
+                "</style>",
+                "document.getElementById('scene_02').animate("
+                "[{transform:'translateX(0)'},{transform:'translateX(1px)'}],"
+                "{duration:6000,fill:'both'});",
+            ),
+        }
+        for label, (style, script) in cases.items():
+            with self.subTest(label=label):
+                harness, plan, project, vtt, runtime, env = self._real_browser_fixture(
+                    f"real-static-marker-{label}"
+                )
+                index = project / "index.html"
+                text = index.read_text(encoding="utf-8").replace("</style>", style)
+                text = text.replace("</body>", f"<script>{script}</script></body>")
+                index.write_text(text, encoding="utf-8")
+                structural = harness.validate_project(
+                    project,
+                    plan,
+                    claims=harness.synthetic_smoke_claims(plan),
+                    smoke=True,
+                )
+                self.assertTrue(structural["passed"], structural)
+                with self.assertRaisesRegex(
+                    harness.StageError,
+                    "primary_canvas_timeline_unavailable",
+                ):
+                    harness._browser_preflight(project, vtt, runtime, env)
+
+    @unittest.skipUnless(
+        os.environ.get("AUTODESIGN_VIDEO_REAL_SMOKE") == "1",
+        "set AUTODESIGN_VIDEO_REAL_SMOKE=1 for the real Chromium audit",
+    )
+    def test_real_browser_static_marker_rejects_ambiguous_direct_timelines(self) -> None:
+        harness, plan, project, vtt, runtime, env = self._real_browser_fixture(
+            "real-ambiguous-timeline"
+        )
+        index = project / "index.html"
+        text = index.read_text(encoding="utf-8")
+        timeline_script = """
+<script>
+const makeTimeline = () => ({
+  duration: () => 6,
+  time: () => 0,
+  play: () => {},
+  pause: () => {},
+  seek: () => {},
+});
+window.__timelines = {smoke: makeTimeline(), extra: makeTimeline()};
+</script>
+"""
+        index.write_text(text.replace("</body>", timeline_script + "</body>"), encoding="utf-8")
+        structural = harness.validate_project(
+            project,
+            plan,
+            claims=harness.synthetic_smoke_claims(plan),
+            smoke=True,
+        )
+        self.assertTrue(structural["passed"], structural)
+        with self.assertRaisesRegex(harness.StageError, "primary_canvas_timeline_unavailable"):
+            harness._browser_preflight(project, vtt, runtime, env)
+
+    @unittest.skipUnless(
+        os.environ.get("AUTODESIGN_VIDEO_REAL_SMOKE") == "1",
+        "set AUTODESIGN_VIDEO_REAL_SMOKE=1 for the real Chromium audit",
+    )
+    def test_real_browser_static_marker_rejects_wrong_direct_timeline_key(self) -> None:
+        harness, plan, project, vtt, runtime, env = self._real_browser_fixture(
+            "real-wrong-timeline"
+        )
+        index = project / "index.html"
+        timeline_script = """
+<script>
+window.__timelines = {wrong: {
+  duration: () => 6,
+  time: () => 0,
+  play: () => {},
+  pause: () => {},
+  seek: () => {},
+}};
+</script>
+"""
+        text = index.read_text(encoding="utf-8").replace(
+            "</body>", timeline_script + "</body>"
+        )
+        index.write_text(text, encoding="utf-8")
+        structural = harness.validate_project(
+            project,
+            plan,
+            claims=harness.synthetic_smoke_claims(plan),
+            smoke=True,
+        )
+        self.assertTrue(structural["passed"], structural)
+        with self.assertRaisesRegex(harness.StageError, "primary_canvas_timeline_unavailable"):
+            harness._browser_preflight(project, vtt, runtime, env)
+
+    @unittest.skipUnless(
+        os.environ.get("AUTODESIGN_VIDEO_REAL_SMOKE") == "1",
+        "set AUTODESIGN_VIDEO_REAL_SMOKE=1 for the real Chromium audit",
+    )
+    def test_real_browser_static_marker_allows_descendant_motion(self) -> None:
+        harness, _plan_value, project, vtt, runtime, env = self._real_browser_fixture(
+            "real-descendant-motion"
+        )
+        index = project / "index.html"
+        text = index.read_text(encoding="utf-8").replace(
+            "</style>",
+            """
+@keyframes localPulse { from { opacity:.9; } to { opacity:1; } }
+#smoke-controls { animation:localPulse 1s linear infinite; transition:transform 1s linear; }
+</style>
+""",
+        )
+        text = text.replace(
+            "</body>",
+            """<script>
+const localPanel=document.getElementById('smoke-controls');
+localPanel.getBoundingClientRect();
+localPanel.style.transform='translateX(1px)';
+localPanel.animate(
+  [{letterSpacing:'0px'},{letterSpacing:'0.1px'}],
+  {duration:1000,iterations:Infinity}
+);
+</script></body>""",
+        )
+        index.write_text(text, encoding="utf-8")
+        browser = harness._browser_preflight(project, vtt, runtime, env)
+        self.assertEqual(browser["primary_canvas_audit"]["timeline_sampling"]["mode"], "static")
 
 
 if __name__ == "__main__":

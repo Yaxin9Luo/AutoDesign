@@ -1137,6 +1137,202 @@ def _vtt_cues(path: Path) -> list[str]:
     return cues
 
 
+def _validate_primary_canvas_audit(
+    payload: Mapping[str, Any],
+    project: Path,
+    control_results: Sequence[Mapping[str, Any]],
+) -> None:
+    audit = payload.get("primary_canvas_audit")
+    if not isinstance(audit, Mapping):
+        raise StageError(
+            "browser_preflight",
+            "primary_canvas_audit_invalid: computed primary canvas audit is missing",
+            failure_class="runtime",
+        )
+    checkpoints = audit.get("checkpoints")
+    timeline_sampling = audit.get("timeline_sampling")
+    if not isinstance(checkpoints, list) or not isinstance(timeline_sampling, Mapping):
+        raise StageError(
+            "browser_preflight",
+            "primary_canvas_audit_invalid: primary canvas checkpoints or timeline sampling are missing",
+            failure_class="runtime",
+        )
+
+    parser = _ProjectParser()
+    try:
+        parser.feed((project / "index.html").read_text(encoding="utf-8"))
+        parser.close()
+    except (OSError, UnicodeError) as error:
+        raise StageError(
+            "browser_preflight",
+            "primary_canvas_audit_invalid: project HTML is unreadable",
+            failure_class="runtime",
+        ) from error
+    expected_primary_canvases = {
+        ("composition", attrs.get("data-composition-id", ""))
+        for attrs in parser.roots
+    }
+    expected_scene_ids = {attrs.get("id", "") for attrs in parser.scenes}
+    expected_primary_canvases.update(("scene", scene_id) for scene_id in expected_scene_ids)
+
+    sampling_mode = timeline_sampling.get("mode")
+    sampled_scene_ids = timeline_sampling.get("sampled_scene_ids")
+    sampling_reason = timeline_sampling.get("reason")
+    if (
+        sampling_mode not in {"static", "player-render-seek", "direct-timeline", "unavailable"}
+        or not isinstance(sampled_scene_ids, list)
+        or any(not isinstance(scene_id, str) or not scene_id for scene_id in sampled_scene_ids)
+        or not isinstance(sampling_reason, str)
+    ):
+        raise StageError(
+            "browser_preflight",
+            "primary_canvas_audit_invalid: primary canvas timeline sampling is malformed",
+            failure_class="runtime",
+        )
+    sampled_scene_set = set(sampled_scene_ids)
+    if len(sampled_scene_set) != len(sampled_scene_ids):
+        raise StageError(
+            "browser_preflight",
+            "primary_canvas_coverage: primary canvas timeline samples contain duplicate scenes",
+            failure_class="runtime",
+        )
+    if sampling_mode in {"player-render-seek", "direct-timeline"}:
+        if sampled_scene_set != expected_scene_ids:
+            raise StageError(
+                "browser_preflight",
+                "primary_canvas_coverage: seekable primary canvas audit must sample every scene",
+                failure_class="runtime",
+            )
+    elif sampled_scene_ids or (sampling_mode == "unavailable" and not sampling_reason):
+        raise StageError(
+            "browser_preflight",
+            "primary_canvas_audit_invalid: unavailable/static timeline sampling is inconsistent",
+            failure_class="runtime",
+        )
+    if sampling_mode == "unavailable":
+        raise StageError(
+            "browser_preflight",
+            "primary_canvas_timeline_unavailable: active-scene primary canvases cannot be verified: "
+            + sampling_reason,
+            failure_class="authoring",
+        )
+
+    expected_checkpoint_labels = {"initial", "final"}
+    for result in control_results:
+        identity = result.get("identity")
+        token = identity.get("token") if isinstance(identity, Mapping) else None
+        if not isinstance(token, str) or not token:
+            raise StageError(
+                "browser_preflight",
+                "primary_canvas_audit_invalid: control identity is unavailable for canvas checkpoints",
+                failure_class="runtime",
+            )
+        if result.get("operation") == "toggle-twice":
+            expected_checkpoint_labels.update(
+                {f"control:{token}:step-1", f"control:{token}:step-2"}
+            )
+        else:
+            expected_checkpoint_labels.add(f"control:{token}")
+    expected_checkpoint_labels.update(f"scene:{scene_id}" for scene_id in sampled_scene_ids)
+
+    observed_checkpoint_labels: set[str] = set()
+    for checkpoint in checkpoints:
+        if not isinstance(checkpoint, Mapping):
+            raise StageError(
+                "browser_preflight",
+                "primary_canvas_audit_invalid: primary canvas checkpoint is not an object",
+                failure_class="runtime",
+            )
+        label = checkpoint.get("label")
+        surfaces = checkpoint.get("surfaces")
+        if (
+            not isinstance(label, str)
+            or not label
+            or label in observed_checkpoint_labels
+            or not isinstance(surfaces, list)
+        ):
+            raise StageError(
+                "browser_preflight",
+                "primary_canvas_coverage: primary canvas checkpoints must be unique and complete",
+                failure_class="runtime",
+            )
+        observed_checkpoint_labels.add(label)
+        observed_primary_canvases: set[tuple[str, str]] = set()
+        invalid_surfaces: list[str] = []
+        for surface in surfaces:
+            if not isinstance(surface, Mapping):
+                raise StageError(
+                    "browser_preflight",
+                    "primary_canvas_audit_invalid: primary canvas surface is not an object",
+                    failure_class="runtime",
+                )
+            kind = surface.get("kind")
+            surface_id = surface.get("id")
+            rgba = surface.get("rgba")
+            background_image = surface.get("background_image")
+            effective_opacity = surface.get("effective_opacity")
+            paint_effects = surface.get("paint_effects")
+            if (
+                kind not in {"composition", "scene"}
+                or not isinstance(surface_id, str)
+                or not surface_id
+                or not isinstance(surface.get("background_color"), str)
+                or not isinstance(background_image, str)
+                or not isinstance(rgba, list)
+                or len(rgba) != 4
+                or any(
+                    isinstance(channel, bool)
+                    or not isinstance(channel, int)
+                    or not 0 <= channel <= 255
+                    for channel in rgba
+                )
+                or isinstance(effective_opacity, bool)
+                or not isinstance(effective_opacity, (int, float))
+                or not math.isfinite(float(effective_opacity))
+                or not isinstance(paint_effects, list)
+                or any(not isinstance(effect, str) or not effect for effect in paint_effects)
+            ):
+                raise StageError(
+                    "browser_preflight",
+                    "primary_canvas_audit_invalid: primary canvas computed paint is malformed",
+                    failure_class="runtime",
+                )
+            surface_identity = (kind, surface_id)
+            if surface_identity in observed_primary_canvases:
+                raise StageError(
+                    "browser_preflight",
+                    f"primary_canvas_coverage: duplicate primary canvas surface at {label}",
+                    failure_class="runtime",
+                )
+            observed_primary_canvases.add(surface_identity)
+            if (
+                rgba != [255, 255, 255, 255]
+                or background_image.strip().lower() != "none"
+                or abs(float(effective_opacity) - 1.0) > 1e-6
+                or paint_effects
+            ):
+                invalid_surfaces.append(f"{kind}:{surface_id}")
+        if observed_primary_canvases != expected_primary_canvases:
+            raise StageError(
+                "browser_preflight",
+                f"primary_canvas_coverage: primary canvas audit at {label} must cover the composition and every scene",
+                failure_class="runtime",
+            )
+        if invalid_surfaces:
+            raise StageError(
+                "browser_preflight",
+                f"primary_canvas_background: checkpoint={label} primary canvas must render as unaltered opaque pure white for "
+                + ", ".join(sorted(invalid_surfaces)),
+                failure_class="authoring",
+            )
+    if observed_checkpoint_labels != expected_checkpoint_labels:
+        raise StageError(
+            "browser_preflight",
+            "primary_canvas_coverage: primary canvas audit must cover initial, every control, sampled scenes, and final states",
+            failure_class="runtime",
+        )
+
+
 def _browser_preflight(
     project: Path,
     vtt: Path,
@@ -1281,6 +1477,215 @@ const inside = value => value === projectRoot || value.startsWith(projectRoot + 
       return checkpoint;
     };
     await quiesce('initial-load');
+    const primaryCanvasAudit = {
+      checkpoints: [],
+      timeline_sampling: {mode: 'unavailable', sampled_scene_ids: [], reason: ''},
+    };
+    const capturePrimaryCanvases = async (label, timeS = null) => {
+      const surfaces = await page.evaluate(() => {
+        const colorProbe = document.createElement('canvas');
+        colorProbe.width = 1;
+        colorProbe.height = 1;
+        const context = colorProbe.getContext('2d', {willReadFrequently: true});
+        if (!context) throw new Error('primary canvas color probe is unavailable');
+        const inspect = (element, kind, id) => {
+          const style = getComputedStyle(element);
+          let effectiveOpacity = 1;
+          const paintEffects = [];
+          for (let current = element; current; current = current.parentElement) {
+            const currentStyle = getComputedStyle(current);
+            const opacity = Number.parseFloat(currentStyle.opacity);
+            effectiveOpacity *= Number.isFinite(opacity) ? opacity : 1;
+            const scope = current === element ? 'self' : 'ancestor';
+            if (currentStyle.filter && currentStyle.filter !== 'none') {
+              paintEffects.push(`${scope}:filter=${currentStyle.filter}`);
+            }
+            if (currentStyle.mixBlendMode && currentStyle.mixBlendMode !== 'normal') {
+              paintEffects.push(`${scope}:mix-blend-mode=${currentStyle.mixBlendMode}`);
+            }
+            const maskImage = currentStyle.maskImage || currentStyle.webkitMaskImage;
+            if (maskImage && maskImage !== 'none') {
+              paintEffects.push(`${scope}:mask-image=${maskImage}`);
+            }
+            if (currentStyle.clipPath && currentStyle.clipPath !== 'none') {
+              paintEffects.push(`${scope}:clip-path=${currentStyle.clipPath}`);
+            }
+            if (currentStyle.clip && currentStyle.clip !== 'auto') {
+              paintEffects.push(`${scope}:clip=${currentStyle.clip}`);
+            }
+          }
+          if (style.backgroundClip && style.backgroundClip !== 'border-box') {
+            paintEffects.push(`self:background-clip=${style.backgroundClip}`);
+          }
+          context.clearRect(0, 0, 1, 1);
+          context.fillStyle = style.backgroundColor;
+          context.fillRect(0, 0, 1, 1);
+          return {
+            kind,
+            id,
+            background_color: style.backgroundColor,
+            background_image: style.backgroundImage,
+            rgba: Array.from(context.getImageData(0, 0, 1, 1).data),
+            effective_opacity: effectiveOpacity,
+            paint_effects: paintEffects,
+          };
+        };
+        const values = [];
+        for (const root of document.querySelectorAll('[data-composition-id]')) {
+          values.push(inspect(root, 'composition', root.getAttribute('data-composition-id') || ''));
+          for (const scene of root.querySelectorAll('section.clip')) {
+            values.push(inspect(scene, 'scene', scene.id || ''));
+          }
+        }
+        return values;
+      });
+      const checkpoint = {label, surfaces};
+      if (Number.isFinite(timeS)) checkpoint.time_s = timeS;
+      primaryCanvasAudit.checkpoints.push(checkpoint);
+      return checkpoint;
+    };
+    await capturePrimaryCanvases('initial');
+    const timeline = await page.evaluate(() => {
+      const root = document.querySelector('[data-composition-id]');
+      if (!root) {
+        return {
+          has_static_marker: false,
+          composition_id: '',
+          direct_timeline_key: '',
+          has_player_registry: false,
+          has_timeline_registry: false,
+          has_player_seek: false,
+          has_direct_seek: false,
+          primary_motion_inspection_complete: false,
+          active_primary_motion: [],
+          root_start_s: 0,
+          scenes: [],
+        };
+      }
+      const compositionId = root.getAttribute('data-composition-id') || '';
+      const timelines = globalThis.__timelines;
+      const timelineKeys = timelines && typeof timelines === 'object'
+        ? Object.keys(timelines)
+        : [];
+      const directTimelineKey = compositionId && timelineKeys.length === 1
+        && timelineKeys[0] === compositionId
+        ? compositionId
+        : '';
+      const directTimeline = directTimelineKey ? timelines[directTimelineKey] : null;
+      const primarySurfaces = [
+        {element: root, kind: 'composition', id: compositionId},
+        ...Array.from(root.querySelectorAll('section.clip')).map(element => ({
+          element,
+          kind: 'scene',
+          id: element.id || '',
+        })),
+      ];
+      let primaryMotionInspectionComplete = true;
+      const activePrimaryMotion = [];
+      for (const surface of primarySurfaces) {
+        if (typeof surface.element.getAnimations !== 'function') {
+          primaryMotionInspectionComplete = false;
+          continue;
+        }
+        let animations;
+        try {
+          animations = surface.element.getAnimations({subtree: false});
+        } catch (_error) {
+          primaryMotionInspectionComplete = false;
+          continue;
+        }
+        for (const animation of animations) {
+          if (animation.playState !== 'running' && animation.pending !== true) continue;
+          activePrimaryMotion.push({
+            kind: surface.kind,
+            id: surface.id,
+            play_state: animation.playState,
+            animation_type: animation.constructor && animation.constructor.name || 'Animation',
+          });
+        }
+      }
+      return {
+        has_static_marker: root.hasAttribute('data-no-timeline'),
+        composition_id: compositionId,
+        direct_timeline_key: directTimelineKey,
+        has_player_registry: globalThis.__player !== undefined && globalThis.__player !== null,
+        has_timeline_registry: globalThis.__timelines !== undefined && globalThis.__timelines !== null,
+        has_player_seek: Boolean(
+          globalThis.__player && typeof globalThis.__player.renderSeek === 'function'
+        ),
+        has_direct_seek: Boolean(directTimeline && typeof directTimeline.seek === 'function'),
+        primary_motion_inspection_complete: primaryMotionInspectionComplete,
+        active_primary_motion: activePrimaryMotion,
+        root_start_s: Number(root.getAttribute('data-start')),
+        scenes: Array.from(root.querySelectorAll('section.clip')).map(scene => ({
+          id: scene.id || '',
+          start_s: Number(scene.getAttribute('data-start')),
+          duration_s: Number(scene.getAttribute('data-duration')),
+        })),
+      };
+    });
+    let seekMode = null;
+    if (timeline.has_player_seek) {
+      seekMode = 'player-render-seek';
+    } else if (timeline.has_direct_seek) {
+      seekMode = 'direct-timeline';
+    } else if (
+      timeline.has_static_marker
+      && !timeline.has_player_registry
+      && !timeline.has_timeline_registry
+      && timeline.primary_motion_inspection_complete
+      && timeline.active_primary_motion.length === 0
+    ) {
+      primaryCanvasAudit.timeline_sampling = {
+        mode: 'static',
+        sampled_scene_ids: [],
+        reason: 'data-no-timeline with no runtime timeline or active primary-root motion',
+      };
+    } else {
+      const limitations = [];
+      if (!timeline.has_static_marker) limitations.push('composition has no data-no-timeline marker');
+      if (timeline.has_player_registry) limitations.push('__player is present without renderSeek');
+      if (timeline.has_timeline_registry) {
+        limitations.push('__timelines is not one seekable entry keyed by composition id');
+      }
+      if (!timeline.primary_motion_inspection_complete) {
+        limitations.push('primary-root animation inspection is unavailable');
+      }
+      if (timeline.active_primary_motion.length > 0) {
+        limitations.push('composition or scene root has active animation or transition');
+      }
+      primaryCanvasAudit.timeline_sampling = {
+        mode: 'unavailable',
+        sampled_scene_ids: [],
+        reason: limitations.join('; ') || 'active-scene timeline state cannot be verified',
+      };
+    }
+    const seekTimeline = async timeS => page.evaluate(
+      async ({mode, directTimelineKey, time}) => {
+        if (mode === 'player-render-seek') {
+          await Promise.resolve(globalThis.__player.renderSeek(time, {suppressEvents: true}));
+          return;
+        }
+        await Promise.resolve(globalThis.__timelines[directTimelineKey].seek(time));
+      },
+      {mode: seekMode, directTimelineKey: timeline.direct_timeline_key, time: timeS},
+    );
+    if (seekMode) {
+      primaryCanvasAudit.timeline_sampling = {
+        mode: seekMode,
+        sampled_scene_ids: [],
+        reason: '',
+      };
+      for (const scene of timeline.scenes) {
+        const midpoint = scene.start_s + scene.duration_s / 2;
+        await seekTimeline(midpoint);
+        await quiesce(`timeline:${scene.id}`);
+        await capturePrimaryCanvases(`scene:${scene.id}`, midpoint);
+        primaryCanvasAudit.timeline_sampling.sampled_scene_ids.push(scene.id);
+      }
+      await seekTimeline(Number.isFinite(timeline.root_start_s) ? timeline.root_start_s : 0);
+      await quiesce('timeline:restore');
+    }
     const state = async () => page.$eval('[data-subtitle-toggle]', button => {
       const overlay = document.getElementById(button.getAttribute('aria-controls'));
       if (!overlay) throw new Error('subtitle overlay is missing');
@@ -1338,9 +1743,11 @@ const inside = value => value === projectRoot || value.startsWith(projectRoot + 
     });
     await page.click('[data-subtitle-toggle]');
     await quiesce('subtitle-on');
+    const subtitleStepOneCanvas = await capturePrimaryCanvases('subtitle:step-1');
     const afterFirstState = await state();
     await page.click('[data-subtitle-toggle]');
     await quiesce('subtitle-off');
+    const subtitleStepTwoCanvas = await capturePrimaryCanvases('subtitle:step-2');
     const afterSecondState = await state();
     const controls = await page.evaluate(() => {
       const selectors = [
@@ -1397,6 +1804,7 @@ const inside = value => value === projectRoot || value.startsWith(projectRoot + 
           return {
             token,
             kind,
+            is_subtitle: element.hasAttribute('data-subtitle-toggle'),
             identity: {
               token,
               tag,
@@ -1411,12 +1819,16 @@ const inside = value => value === projectRoot || value.startsWith(projectRoot + 
           };
         });
     });
+    const subtitleDescriptor = controls.find(descriptor => descriptor.is_subtitle);
+    if (!subtitleDescriptor) throw new Error('subtitle control disappeared before canvas audit labeling');
+    subtitleStepOneCanvas.label = `control:${subtitleDescriptor.token}:step-1`;
+    subtitleStepTwoCanvas.label = `control:${subtitleDescriptor.token}:step-2`;
     const controlResults = [];
     let controlsExercised = 0;
     for (const descriptor of controls) {
       const selector = `[data-autodesign-preflight-control="${descriptor.token}"]`;
       const control = await page.$(selector);
-      const isSubtitle = control && await control.evaluate(element => element.hasAttribute('data-subtitle-toggle'));
+      const isSubtitle = descriptor.is_subtitle;
       const record = {
         identity: descriptor.identity,
         kind: descriptor.kind,
@@ -1468,12 +1880,16 @@ const inside = value => value === projectRoot || value.startsWith(projectRoot + 
         record.result = `error:${String(error && error.message || error)}`;
         pageErrors.push(`control ${descriptor.token}: ${record.result}`);
       }
-      if (!isSubtitle) await quiesce(`control:${descriptor.token}`);
+      if (!isSubtitle) {
+        await quiesce(`control:${descriptor.token}`);
+        await capturePrimaryCanvases(`control:${descriptor.token}`);
+      }
       if (descriptor.navigation) record.navigation = descriptor.navigation;
       activeControl = null;
       controlResults.push(record);
     }
     await quiesce('all-controls');
+    await capturePrimaryCanvases('final');
     const pendingTimers = checkpoints.reduce(
       (maximum, checkpoint) => Math.max(maximum, checkpoint.pending_timers),
       0,
@@ -1488,6 +1904,7 @@ const inside = value => value === projectRoot || value.startsWith(projectRoot + 
         after_first_click: afterFirstState.computed,
         after_second_click: afterSecondState.computed,
       },
+      primary_canvas_audit: primaryCanvasAudit,
       control_count: controls.length,
       controls_exercised: controlsExercised,
       control_results: controlResults,
@@ -1672,6 +2089,7 @@ const inside = value => value === projectRoot || value.startsWith(projectRoot + 
                 ("", "", relative_path, parsed_navigation.query, parsed_navigation.fragment)
             )
         control_tokens.add(token)
+    _validate_primary_canvas_audit(payload, project, control_results)
     quiescence = payload.get("quiescence")
     checkpoints = quiescence.get("checkpoints") if isinstance(quiescence, Mapping) else None
     minimum_wait_ms = quiescence.get("minimum_wait_ms") if isinstance(quiescence, Mapping) else None
@@ -2518,7 +2936,6 @@ def write_synthetic_smoke_project(project_dir: Path | str, plan: Mapping[str, An
         raise VideoContractError(f"synthetic smoke project already exists: {project}")
     (project / "assets").mkdir(parents=True)
     sections = []
-    colors = ("#132238", "#193d3b", "#3d2638")
     for index, scene in enumerate(plan["scenes"]):
         sections.append(
             f'<section id="{scene["scene_id"]}" class="clip" data-hf-clip="true" '
@@ -2528,12 +2945,12 @@ def write_synthetic_smoke_project(project_dir: Path | str, plan: Mapping[str, An
             f'data-narration-claim-id="{scene["narration_claim_id"]}" '
             f'data-claim-ids="{scene["title_claim_id"]}" '
             f'data-narration="{html.escape(scene["narration"], quote=True)}" '
-            f'style="background:{colors[index]}"><p>AutoDesign video lifecycle smoke</p>'
+            f'style="background:#fff"><p>AutoDesign video lifecycle smoke</p>'
             f'<h1 data-claim-id="{scene["title_claim_id"]}">{html.escape(scene["title"])}</h1></section>'
         )
     html_text = f'''<!doctype html><html lang="en"><head><meta charset="utf-8"><style>
-html,body{{margin:0;width:1920px;height:1080px;overflow:hidden;background:#101820;color:#fff;font-family:Arial,sans-serif}}
-[data-composition-id]{{position:relative;width:1920px;height:1080px}}.clip{{position:absolute;inset:0;display:grid;place-content:center;padding:120px}}
+html,body{{margin:0;width:1920px;height:1080px;overflow:hidden;background:#fff;color:#132238;font-family:Arial,sans-serif}}
+[data-composition-id]{{position:relative;width:1920px;height:1080px;background:#fff}}.clip{{position:absolute;inset:0;display:grid;place-content:center;padding:120px;background:#fff}}
 h1{{font-size:120px;margin:20px 0}}p{{font-size:34px}}.subtitle-overlay[hidden]{{display:none}}
 [data-subtitle-toggle]{{position:absolute;right:48px;bottom:40px;z-index:100;padding:16px 20px}}
 #smoke-details{{position:absolute;left:48px;bottom:40px;z-index:100;padding:16px 20px}}

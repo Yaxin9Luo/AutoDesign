@@ -68,6 +68,17 @@ retain each visual's eligibility, allowed content roles, and reuse limit, and
 pass the shared visual-plan validator. Preserve native text, SVG text, tables,
 and equations.
 
+The computed background of the composition root and every content scene is an
+opaque pure white (`#fff`) with `background-image: none`. Styles may come from
+normal project CSS, classes, or deterministic runtime setup; the browser checks
+the rendered computed result for every scene. Keep the roots themselves at full
+effective opacity with no filter, mask, non-normal blending, or clipping that
+alters or limits their white paint; animate an inner content wrapper instead.
+Transparent, off-white/tinted, dark, gradient, and image backgrounds are invalid
+on these primary canvases.
+Player chrome, subtitle overlays, annotations, and restrained light local
+panels are not primary canvases and may use purposeful contrast.
+
 Include exactly one narration element before delivery:
 
 ```html
@@ -97,12 +108,25 @@ linked targets, and containment escapes. A real Chromium preflight blocks non-pr
 requests and enumerates every visible enabled native or ARIA control, including
 buttons, supported inputs, selects, textareas, summaries, anchors, and custom
 roles. It operates each one and records a unique identity, operation, and
-result. After initial load, each operation, and the complete sequence, it waits
-at least 500 ms and fails closed on pending timers or late requests,
-navigations, popups, and page errors. It clicks the subtitle control twice,
-proving `aria-pressed`, computed `display`/`visibility`, effective opacity
-through all ancestors, clipped viewport intersection, and nonzero painted
-bounds transition off → on → off against cues from the locally generated VTT.
+result. One read-only canvas audit records exact computed paint evidence for
+the composition root and every content scene at initial load, after each
+operated control, and in the final state, then fails closed on incomplete
+coverage or any non-white, non-opaque, gradient, image, filtered, masked,
+blended, or clipped primary canvas. For an animated composition, it uses the
+existing `window.__player.renderSeek` or unique composition
+`window.__timelines` seek function to inspect every scene midpoint. An
+explicit `data-no-timeline` project is audited statically only when no player
+or timeline registry exists and no composition/scene root has an active CSS
+animation, transition, or Web Animation. A contradictory static marker or an
+animated project without a usable seek API fails closed. Descendant wrappers
+and local panels may animate without making a genuinely static primary canvas
+seekable. After initial load, each operation, and the complete sequence, the
+browser waits at least 500 ms and fails closed on pending timers or late
+requests, navigations, popups, and page errors.
+It clicks the subtitle control twice, proving `aria-pressed`, computed
+`display`/`visibility`, effective opacity through all ancestors, clipped
+viewport intersection, and nonzero painted bounds transition off → on → off
+against cues from the locally generated VTT.
 
 ## Non-negotiable delivery order
 
@@ -116,7 +140,9 @@ bounds transition off → on → off against cues from the locally generated VTT
 3. Write the English transcript, SRT, VTT, per-scene timing, voice ID, speed,
    engine, and optional-caption metadata.
 4. Launch the exact installed HyperFrames browser in strict offline mode. Reject
-   network attempts or page errors; click the subtitle toggle twice and bind
+   network attempts or page errors; verify the computed opaque-white primary
+   canvas for the composition and every scene across initial, active-scene,
+   operated-control, and final states; click the subtitle toggle twice and bind
    every overlay cue to the generated VTT hash.
 5. Run the real complete `hyperframes lint` only after the referenced narration
    WAV exists and is hash-bound.

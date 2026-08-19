@@ -48,6 +48,7 @@ STABLE_FINDING_CODES = (
     "poster-dom-source-flow-gutter",
     "poster-dom-source-flow-sibling",
     "poster-dom-screen-print-mismatch",
+    "poster-dom-canvas-background",
     "poster-dom-template-boxiness",
 )
 _FINDING_ORDER = {code: index for index, code in enumerate(STABLE_FINDING_CODES)}
@@ -153,6 +154,17 @@ _READ_ONLY_MEASUREMENT_SCRIPT = r"""
     const blue = Number(match[3]);
     const alpha = match[4] === undefined ? 1 : Number(match[4]);
     return alpha > 0 && Math.min(red, green, blue) < 248;
+  };
+  const colorRgba = (value) => {
+    const canvas = document.createElement('canvas');
+    canvas.width = 1;
+    canvas.height = 1;
+    const context = canvas.getContext('2d', {willReadFrequently: true});
+    if (!context) return null;
+    context.clearRect(0, 0, 1, 1);
+    context.fillStyle = String(value || 'rgba(0,0,0,0)');
+    context.fillRect(0, 0, 1, 1);
+    return Array.from(context.getImageData(0, 0, 1, 1).data);
   };
 
   const textNodes = [];
@@ -278,13 +290,36 @@ _READ_ONLY_MEASUREMENT_SCRIPT = r"""
   });
 
   const rootStyle = getComputedStyle(root);
+  let effectiveOpacity = 1;
+  const paintEffects = [];
+  for (let current = root; current; current = current.parentElement) {
+    const style = getComputedStyle(current);
+    const opacity = Number.parseFloat(style.opacity || '1');
+    effectiveOpacity *= Number.isFinite(opacity) ? opacity : 1;
+    const label = current === root ? 'root' : current.tagName.toLowerCase();
+    const values = [
+      ['filter', style.filter, 'none'],
+      ['backdrop-filter', style.backdropFilter || style.webkitBackdropFilter, 'none'],
+      ['mix-blend-mode', style.mixBlendMode, 'normal'],
+      ['mask-image', style.maskImage || style.webkitMaskImage, 'none'],
+      ['clip-path', style.clipPath, 'none'],
+      ['clip', style.clip, 'auto'],
+    ];
+    for (const [name, value, identityValue] of values) {
+      const normalized = String(value || identityValue).trim().toLowerCase();
+      if (normalized !== identityValue) paintEffects.push(`${label}:${name}:${normalized}`);
+    }
+  }
   return {
     media,
     viewport: {width: window.innerWidth, height: window.innerHeight,
       document_width: document.documentElement.scrollWidth, document_height: document.documentElement.scrollHeight},
     root: {block_id: identity(root), rect: rectOf(rootRect), scrollWidth: root.scrollWidth,
       scrollHeight: root.scrollHeight, clientWidth: root.clientWidth, clientHeight: root.clientHeight,
-      overflowX: rootStyle.overflowX, overflowY: rootStyle.overflowY},
+      overflowX: rootStyle.overflowX, overflowY: rootStyle.overflowY,
+      background_color: rootStyle.backgroundColor, background_rgba: colorRgba(rootStyle.backgroundColor),
+      background_image: rootStyle.backgroundImage, effective_opacity: effectiveOpacity,
+      paint_effects: paintEffects},
     text_nodes: textNodes, elements, images, tables, lists, panels, source_flows: sourceFlows,
   };
 }
@@ -305,6 +340,27 @@ def _number(value: Any, default: float = 0.0) -> float:
     except (TypeError, ValueError):
         return default
     return result if math.isfinite(result) else default
+
+
+def _is_opaque_white(value: Any) -> bool:
+    text = str(value or "").strip().lower()
+    if text in {"white", "#fff", "#ffffff"}:
+        return True
+    if not (text.startswith("rgb(") or text.startswith("rgba(")):
+        return False
+    values = re.findall(r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)%?", text)
+    if len(values) not in {3, 4}:
+        return False
+
+    def channel_is_white(token: str) -> bool:
+        return token.endswith("%") and float(token[:-1]) == 100.0 or (
+            not token.endswith("%") and float(token) == 255.0
+        )
+
+    alpha_is_opaque = len(values) == 3 or (
+        values[3].endswith("%") and float(values[3][:-1]) == 100.0
+    ) or (not values[3].endswith("%") and float(values[3]) == 1.0)
+    return all(channel_is_white(token) for token in values[:3]) and alpha_is_opaque
 
 
 def _rect(value: Any) -> dict[str, float]:
@@ -559,6 +615,41 @@ def evaluate_dom_snapshot(
     root = snapshot.get("root")
     root = root if isinstance(root, Mapping) else {}
     root_rect = _rect(root.get("rect"))
+    background_color = str(root.get("background_color") or "")
+    background_rgba = root.get("background_rgba")
+    background_image = str(root.get("background_image") or "")
+    normalized_white = (
+        isinstance(background_rgba, list)
+        and len(background_rgba) == 4
+        and all(isinstance(channel, int) and not isinstance(channel, bool) for channel in background_rgba)
+        and background_rgba == [255, 255, 255, 255]
+    ) if background_rgba is not None else _is_opaque_white(background_color)
+    effective_opacity = _number(root.get("effective_opacity"), 1.0)
+    paint_effects = root.get("paint_effects", [])
+    paint_effects_safe = isinstance(paint_effects, list) and not paint_effects
+    if (
+        not normalized_white
+        or background_image.strip().lower() != "none"
+        or not math.isclose(effective_opacity, 1.0, abs_tol=1e-9)
+        or not paint_effects_safe
+    ):
+        findings.append(
+            _finding(
+                "poster-dom-canvas-background",
+                str(root.get("block_id") or "paper-poster-root"),
+                "P1",
+                {
+                    "background_color": background_color,
+                    "background_rgba": background_rgba,
+                    "background_image": background_image,
+                    "effective_opacity": effective_opacity,
+                    "paint_effects": paint_effects,
+                    "required_background_color": "rgb(255, 255, 255)",
+                    "required_background_image": "none",
+                },
+                "Poster canvas must render with an opaque pure-white background and no background image.",
+            )
+        )
     matches_canvas = _matches_size(root_rect, canvas_width, canvas_height)
     matches_physical_print = _matches_size(root_rect, print_width, print_height)
     use_physical_print = (
@@ -1114,6 +1205,11 @@ def evaluate_dom_snapshot(
         "passed": not findings,
         "findings": findings,
         "metrics": {
+            f"{media}_canvas_background_color": background_color,
+            f"{media}_canvas_background_rgba": background_rgba,
+            f"{media}_canvas_background_image": background_image,
+            f"{media}_canvas_effective_opacity": effective_opacity,
+            f"{media}_canvas_paint_effects": paint_effects,
             f"{media}_text_node_count": len(text_nodes),
             f"{media}_element_count": len(snapshot.get("elements", [])),
             f"{media}_image_count": len(snapshot.get("images", [])),

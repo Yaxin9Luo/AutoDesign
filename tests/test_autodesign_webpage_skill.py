@@ -164,7 +164,8 @@ def _valid_html(asset_path: str = "assets/vis-001.svg") -> str:
   <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Atlas: Evidence-Aware Research Communication</title>
   <style>
-    :root {{ --ink:#182033; --paper:#f7f3ea; --accent:#c65332; }}
+    :root {{ --ink:#182033; --paper:#fff; --accent:#c65332; }}
+    html, body, main {{ background-color:var(--paper); background-image:none; }}
     * {{ box-sizing:border-box; }} html {{ scroll-behavior:smooth; }}
     body {{ margin:0; color:var(--ink); background:var(--paper); font:17px/1.6 Arial,sans-serif; }}
     a:focus-visible, button:focus-visible {{ outline:3px solid var(--accent); outline-offset:4px; }}
@@ -1319,6 +1320,176 @@ class WebpageSkillRealBrowserTest(unittest.TestCase):
             self.assertTrue(interaction["checks"]["desktop_identity_thesis_above_fold"])
             self.assertTrue(interaction["checks"]["focus_indicators_visible"])
 
+    def test_primary_canvas_rejects_runtime_background_mutation(self) -> None:
+        harness = _load_harness()
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+
+            def mutate_primary_canvas(html: str) -> str:
+                return html.replace(
+                    "</script>",
+                    "setTimeout(()=>{document.querySelector('main').style.backgroundColor="
+                    "'rgb(250, 250, 250)';},20);</script>",
+                    1,
+                )
+
+            _run, _attempt, artifact = self._author_browser_attempt(
+                root, harness, mutate_primary_canvas
+            )
+
+            report = self._run_probe(root, harness, artifact)
+
+            self.assertFalse(report["passed"], report)
+            self.assertFalse(report["checks"].get("primary_canvas_white", True))
+            self.assertIn(
+                "primary_canvas_white",
+                {finding["code"] for finding in report.get("findings", [])},
+            )
+
+    def test_primary_canvas_is_white_across_desktop_mobile_and_no_javascript(self) -> None:
+        harness = _load_harness()
+        all_states = {
+            "desktop_js_default",
+            "desktop_js_reduced",
+            "mobile_js_reduced",
+            "desktop_no_js_reduced",
+            "mobile_no_js_reduced",
+        }
+        mutations = {
+            "transparent-root": (
+                "html { background-color:transparent!important; }",
+                all_states,
+            ),
+            "tinted-body": (
+                "body { background-color:#f7f7f7!important; }",
+                all_states,
+            ),
+            "dark-main": (
+                "main { background-color:#111!important; }",
+                all_states,
+            ),
+            "primary-background-image": (
+                "main { background-image:url('assets/vis-001.svg')!important; }",
+                all_states,
+            ),
+            "primary-gradient": (
+                "main { background-image:linear-gradient(#fff,#eee)!important; }",
+                all_states,
+            ),
+            "mobile-only-tint": (
+                "@media (max-width:720px) { main { background-color:#fafafa!important; } }",
+                {"mobile_js_reduced", "mobile_no_js_reduced"},
+            ),
+            "no-javascript-only-tint": (
+                "</style><noscript><style>main { "
+                "background-color:#fafafa!important; "
+                "}</style></noscript><style>",
+                {"desktop_no_js_reduced", "mobile_no_js_reduced"},
+            ),
+        }
+        for label, (css, failed_states) in mutations.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as raw:
+                root = Path(raw)
+                _run, _attempt, artifact = self._author_browser_attempt(
+                    root,
+                    harness,
+                    lambda html, css=css: html.replace(
+                        "</style>", f"{css}</style>", 1
+                    ),
+                )
+
+                report = self._run_probe(root, harness, artifact)
+
+                self.assertFalse(report["passed"], (label, report))
+                self.assertFalse(report["checks"]["primary_canvas_white"])
+                actual_failed = {
+                    state
+                    for state, passed in report["primary_canvas_states"].items()
+                    if not passed
+                }
+                self.assertEqual(actual_failed, failed_states)
+
+    def test_primary_canvas_rejects_compositing_effects(self) -> None:
+        harness = _load_harness()
+        effects = {
+            "filter": "main { filter:brightness(0)!important; }",
+            "opacity": "body { opacity:.5!important; }",
+            "mask": (
+                "main { -webkit-mask-image:linear-gradient(transparent,transparent)!important; "
+                "mask-image:linear-gradient(transparent,transparent)!important; }"
+            ),
+            "blend": "main { mix-blend-mode:difference!important; }",
+            "clip": "main { clip-path:inset(1px)!important; }",
+        }
+        for label, css in effects.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as raw:
+                root = Path(raw)
+                _run, _attempt, artifact = self._author_browser_attempt(
+                    root,
+                    harness,
+                    lambda html, css=css: html.replace(
+                        "</style>", f"{css}</style>", 1
+                    ),
+                )
+
+                report = self._run_probe(root, harness, artifact)
+
+                self.assertFalse(
+                    report["checks"].get("primary_canvas_white", True),
+                    (label, report),
+                )
+
+    def test_primary_canvas_rejects_effect_on_intermediate_ancestor(self) -> None:
+        harness = _load_harness()
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+
+            def wrap_main(html: str) -> str:
+                return html.replace(
+                    '<main id="main">',
+                    '<div style="filter:brightness(0)"><main id="main">',
+                    1,
+                ).replace("</main>", "</main></div>", 1)
+
+            _run, _attempt, artifact = self._author_browser_attempt(
+                root, harness, wrap_main
+            )
+
+            report = self._run_probe(root, harness, artifact)
+
+            self.assertFalse(report["passed"], report)
+            self.assertFalse(report["checks"].get("primary_canvas_white", True))
+            self.assertIn(
+                "primary_canvas_white",
+                {finding["code"] for finding in report.get("findings", [])},
+            )
+
+    def test_primary_canvas_check_does_not_reject_local_control_effects(self) -> None:
+        harness = _load_harness()
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            local_effects = (
+                "button { filter:brightness(.95); opacity:.9; "
+                "mix-blend-mode:multiply; clip-path:inset(0); "
+                "-webkit-mask-image:linear-gradient(#000,#000); "
+                "mask-image:linear-gradient(#000,#000); }"
+            )
+            _run, _attempt, artifact = self._author_browser_attempt(
+                root,
+                harness,
+                lambda html: html.replace(
+                    "</style>", f"{local_effects}</style>", 1
+                ),
+            )
+
+            report = self._run_probe(root, harness, artifact)
+
+            self.assertTrue(report["checks"]["primary_canvas_white"], report)
+            self.assertNotIn(
+                "primary_canvas_white",
+                {finding["code"] for finding in report.get("findings", [])},
+            )
+
     def test_failed_review_resumes_at_attempt_02_and_finalizes_real_browser_delivery(self) -> None:
         cache = self._browser_cache()
         harness = _load_harness()
@@ -1814,7 +1985,7 @@ class WebpageSkillRealBrowserTest(unittest.TestCase):
         harness = _load_harness()
         mutations = {
             "transparent": 'style="color:transparent"',
-            "same-color": 'style="color:#f7f3ea"',
+            "same-color": 'style="color:#fff"',
             "clip": 'style="position:absolute;clip:rect(0 0 0 0)"',
             "clip-path": 'style="clip-path:inset(50%)"',
             "mask": 'style="-webkit-mask-image:linear-gradient(transparent,transparent);mask-image:linear-gradient(transparent,transparent)"',
@@ -1972,7 +2143,7 @@ class WebpageSkillRealBrowserTest(unittest.TestCase):
         harness = _load_harness()
         mutations = {
             "transparent": "node.style.color='transparent';",
-            "same-color": "node.style.color='#f7f3ea';",
+            "same-color": "node.style.color='#fff';",
             "low-alpha-contrast": "node.style.color='rgba(24,32,51,.02)';",
             "clip-path": "node.style.clipPath='inset(50%)';",
             "mask": "node.style.maskImage='linear-gradient(transparent,transparent)';",

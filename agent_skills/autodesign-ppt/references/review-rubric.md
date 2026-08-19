@@ -51,6 +51,8 @@ localized evidence are invalid repair instructions.
   merely because a distant structure phrase exists;
 - a slide not inspected by the reviewer;
 - illegible, clipped, overlapping, or blank content;
+- a primary slide canvas that is not opaque pure white, or a white-background
+  paper visual whose boundary visibly clashes with the surrounding canvas;
 - visible remote/missing asset or runtime error;
 - screenshot-only text/table content in the PPTX;
 - missing speaker notes or source IDs;
