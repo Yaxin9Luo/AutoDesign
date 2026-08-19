@@ -597,7 +597,9 @@ def _explicit_canvas_pixels(text: str) -> tuple[int, int] | None:
 def _explicit_canvas_pixel_values(text: str) -> list[tuple[int, int]]:
     patterns = (
         r"(?<!\d)(\d{2,5})\s*[x×]\s*(\d{2,5})\s*(?:px|pixels?|像素)(?!\w)",
-        r"(?:canvas|size|画布|尺寸)[^\n]{0,40}?(\d{2,5})\s*[x×]\s*(\d{2,5})(?!\d)",
+        r"(?:canvas|size|resolution|dimensions?|画布|尺寸|分辨率)[^\n]{0,40}?(\d{2,5})\s*[x×]\s*(\d{2,5})(?!\d)",
+        r"(?:poster|海报)\s*(?:at|in|为|尺寸为|大小为)\s*(\d{2,5})\s*[x×]\s*(\d{2,5})(?!\d)",
+        r"(?<!\d)(\d{2,5})\s*[x×]\s*(\d{2,5})\s*(?:academic\s+)?(?:poster|海报)\b",
         r"\bw_px\s*[:=]\s*(\d{2,5})\b[^\n]{0,80}?\bh_px\s*[:=]\s*(\d{2,5})\b",
     )
     values: list[tuple[int, int]] = []
@@ -649,7 +651,17 @@ def _explicit_ratio_values(text: str) -> list[tuple[float, str]]:
         r"(?<![\w.-])([+-]?\d+(?:\.\d+)?)\s*([:/x×])\s*([+-]?\d+(?:\.\d+)?)(?![\d.])",
         flags=re.IGNORECASE,
     )
-    for match in pattern.finditer(text):
+    matches = list(pattern.finditer(text))
+    contextual = [_ratio_has_canvas_context(text, match) for match in matches]
+    for index in range(1, len(matches)):
+        connector = text[matches[index - 1].end():matches[index].start()]
+        if re.fullmatch(r"\s*(?:and|or|,|和|或)\s*", connector) and (
+            contextual[index - 1] or contextual[index]
+        ):
+            contextual[index - 1] = contextual[index] = True
+    for match, has_context in zip(matches, contextual):
+        if not has_context:
+            continue
         left = float(match.group(1))
         right = float(match.group(3))
         if not isfinite(left) or not isfinite(right) or left <= 0 or right <= 0:
@@ -664,6 +676,23 @@ def _explicit_ratio_values(text: str) -> list[tuple[float, str]]:
         if not any(_ratios_match(ratio, prior) for prior, _prior_label in values):
             values.append((ratio, label))
     return values
+
+
+def _ratio_has_canvas_context(text: str, match: re.Match[str]) -> bool:
+    before = text[max(0, match.start() - 48):match.start()]
+    after = text[match.end():match.end() + 48]
+    explicit_cue = (
+        r"(?:aspect\s+ratios?|ratios?|canvas|size|resolution|dimensions?|"
+        r"宽高比|比例|画布|尺寸|分辨率)"
+    )
+    orientation = r"(?:landscape|horizontal|portrait|vertical|横版|横向|竖版|竖向)"
+    return bool(
+        re.search(rf"{explicit_cue}\s*(?:of|is|[:=])?\s*$", before)
+        or re.match(rf"\s*{explicit_cue}\b", after)
+        or re.search(rf"{orientation}\s*$", before)
+        or re.match(rf"\s*(?:{orientation}\s+)?(?:poster|海报)\b", after)
+        or re.search(r"(?:poster|海报)\s+in\s*(?:an?\s+)?$", before)
+    )
 
 
 def _explicit_orientations(text: str) -> list[str]:

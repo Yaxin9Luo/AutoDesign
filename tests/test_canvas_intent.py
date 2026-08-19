@@ -26,6 +26,38 @@ def _reference_metadata(width: int, height: int) -> dict[str, object]:
 
 
 class CanvasIntentTest(unittest.TestCase):
+    def test_contextual_bare_dimensions_are_exact_pixels(self) -> None:
+        plan = plan_canvas(
+            "Create an academic poster at 1400x1000",
+            [],
+        )
+
+        self.assertEqual(plan["source"], "explicit_pixels")
+        self.assertEqual(plan["preset_id"], "custom-1400x1000")
+        self.assertEqual(plan["canvas"]["w_px"], 1400)
+        self.assertEqual(plan["canvas"]["h_px"], 1000)
+
+    def test_ambiguous_grid_and_schedule_dimensions_are_not_ratios(self) -> None:
+        for brief in (
+            "Create an academic poster with a 3x4 qualitative comparison grid",
+            "Create an academic poster for the 10:30 session schedule",
+        ):
+            with self.subTest(brief=brief):
+                self.assertIsNone(parse_canvas_intent(brief))
+
+    def test_explicit_and_idiomatic_ratio_context_remains_supported(self) -> None:
+        cases = (
+            ("I want a 1.4:1 landscape poster", "1.4:1"),
+            ("Academic poster, aspect ratio 5:3", "5:3"),
+            ("landscape 4:3 poster", "4:3"),
+        )
+        for brief, aspect_ratio in cases:
+            with self.subTest(brief=brief):
+                intent = parse_canvas_intent(brief)
+
+                self.assertIsNotNone(intent)
+                self.assertEqual(intent["ratio"][1], aspect_ratio)
+
     def test_prompt_ratio_uses_short_edge_and_long_edge_cap(self) -> None:
         cases = [
             ("Academic poster, aspect ratio 1.4:1", 2150, 1536, "1.4:1"),
