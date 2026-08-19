@@ -133,6 +133,7 @@ export type { RunProgress };
 const _SSE_HANDLES: Map<string, EventSource> = new Map();
 let _SERVER_HISTORY_LOAD: Promise<void> | null = null;
 const _SERVER_HISTORY_DETAIL_LOADS = new Map<string, Promise<void>>();
+let _POSTER_CANVAS_PRESET_LOAD: Promise<void> | null = null;
 type RunWaitOwner = {
   runId: string;
   controller: AbortController;
@@ -6988,35 +6989,44 @@ export const useApp = create<AppStore>()(persist((set, get) => {
       }
     },
 
-    loadPosterCanvasPresets: async () => {
-      const status = get().poster_canvas_presets_status;
-      if (status === "loading" || status === "ready") return;
+    loadPosterCanvasPresets: () => {
+      if (get().poster_canvas_presets_status === "ready") return Promise.resolve();
+      if (_POSTER_CANVAS_PRESET_LOAD) return _POSTER_CANVAS_PRESET_LOAD;
       set({
         poster_canvas_presets_status: "loading",
         poster_canvas_presets_error: null,
       });
-      try {
-        const catalog = await fetchPosterCanvasPresets();
-        const presets = validatePosterCanvasCatalog(catalog);
-        set((state) => ({
-          poster_canvas_presets: presets,
-          poster_canvas_presets_status: "ready",
-          poster_canvas_presets_error: null,
-          conversations: validatePosterCanvasSelections(
-            state.conversations,
-            "ready",
-            presets,
-          ),
-        }));
-      } catch (error) {
-        set({
-          poster_canvas_presets: [],
-          poster_canvas_presets_status: "error",
-          poster_canvas_presets_error: error instanceof Error
-            ? error.message
-            : "Failed to load Poster canvas presets.",
-        });
-      }
+      const load = (async () => {
+        try {
+          const catalog = await fetchPosterCanvasPresets();
+          const presets = validatePosterCanvasCatalog(catalog);
+          set((state) => ({
+            poster_canvas_presets: presets,
+            poster_canvas_presets_status: "ready",
+            poster_canvas_presets_error: null,
+            conversations: validatePosterCanvasSelections(
+              state.conversations,
+              "ready",
+              presets,
+            ),
+          }));
+        } catch (error) {
+          set({
+            poster_canvas_presets: [],
+            poster_canvas_presets_status: "error",
+            poster_canvas_presets_error: error instanceof Error
+              ? error.message
+              : "Failed to load Poster canvas presets.",
+          });
+        }
+      })();
+      _POSTER_CANVAS_PRESET_LOAD = load;
+      void load.finally(() => {
+        if (_POSTER_CANVAS_PRESET_LOAD === load) {
+          _POSTER_CANVAS_PRESET_LOAD = null;
+        }
+      });
+      return load;
     },
 
     // ---- settings drawer ----

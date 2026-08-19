@@ -138,6 +138,12 @@ function installFailedPosterResume(
   });
 }
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((settle) => { resolve = settle; });
+  return { promise, resolve };
+}
+
 test("stores explicit Auto independently from a legacy absent selection", () => {
   const conversationId = resetStore();
   useApp.getState().setPosterCanvasPreset("poster-classic-4x3");
@@ -284,6 +290,58 @@ test("resume validates an explicit canvas preset before replacing a stale legacy
   }
 });
 
+test("explicit resume joins an already-pending canvas catalog load before generating", async () => {
+  const conversationId = resetStore();
+  installFailedPosterResume(conversationId, {
+    canvas_preset_id: "poster-classic-4x3",
+    template: "cvpr-landscape",
+  });
+  const originalFetch = globalThis.fetch;
+  const catalogResponse = deferred<Response>();
+  let catalogCalls = 0;
+  let generateBody: FormData | null = null;
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = String(input);
+    if (url === "/api/canvas-presets?artifact_type=poster") {
+      catalogCalls += 1;
+      return catalogResponse.promise;
+    }
+    if (url === "/api/generate") {
+      generateBody = init?.body as FormData;
+      return new Response(JSON.stringify({ detail: "stop after request inspection" }), {
+        status: 500,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    throw new Error(`unexpected fetch ${url}`);
+  }) as typeof fetch;
+  try {
+    const catalogLoad = useApp.getState().loadPosterCanvasPresets();
+    assert.equal(useApp.getState().poster_canvas_presets_status, "loading");
+    let resumeSettled = false;
+    const resume = useApp.getState().resumeRun("resume-failure").finally(() => {
+      resumeSettled = true;
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.equal(resumeSettled, false);
+    assert.equal(generateBody, null);
+
+    catalogResponse.resolve(new Response(JSON.stringify({
+      version: 1,
+      kind: "poster_canvas_presets",
+      default_preset_id: "cvpr-landscape",
+      presets: canvasPresets,
+    }), { status: 200, headers: { "Content-Type": "application/json" } }));
+    await Promise.all([catalogLoad, resume]);
+    assert.equal(catalogCalls, 1);
+    assert.equal(generateBody?.get("canvas_preset_id"), "poster-classic-4x3");
+    assert.equal(generateBody?.get("template"), "poster-classic-4x3");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("resume stops with visible validation when an explicit canvas catalog cannot load", async () => {
   const conversationId = resetStore();
   installFailedPosterResume(conversationId, {
@@ -291,25 +349,74 @@ test("resume stops with visible validation when an explicit canvas catalog canno
     template: "cvpr-landscape",
   });
   const originalFetch = globalThis.fetch;
+  const catalogResponse = deferred<Response>();
   let generateCalls = 0;
   globalThis.fetch = (async (input: string | URL | Request) => {
     const url = String(input);
     if (url === "/api/canvas-presets?artifact_type=poster") {
-      return new Response(JSON.stringify({ detail: "catalog offline" }), {
-        status: 503,
-        headers: { "Content-Type": "application/json" },
-      });
+      return catalogResponse.promise;
     }
     if (url === "/api/generate") generateCalls += 1;
     throw new Error(`unexpected fetch ${url}`);
   }) as typeof fetch;
   try {
-    await useApp.getState().resumeRun("resume-failure");
+    const catalogLoad = useApp.getState().loadPosterCanvasPresets();
+    let resumeSettled = false;
+    const resume = useApp.getState().resumeRun("resume-failure").finally(() => {
+      resumeSettled = true;
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.equal(resumeSettled, false);
+    catalogResponse.resolve(new Response(JSON.stringify({ detail: "catalog offline" }), {
+      status: 503,
+      headers: { "Content-Type": "application/json" },
+    }));
+    await Promise.all([catalogLoad, resume]);
     const state = useApp.getState();
     assert.equal(generateCalls, 0);
     assert.match(state.canvas_validation_errors[conversationId]?.message ?? "", /catalog/i);
     assert.notEqual(state.conversations[conversationId]?.pending, true);
     assert.equal(state.conversations[conversationId]?.messages.at(-1)?.id, "resume-failure");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("Auto resume does not wait for an unrelated pending canvas catalog load", async () => {
+  const conversationId = resetStore();
+  installFailedPosterResume(conversationId, { canvas_preset_id: "auto" });
+  const originalFetch = globalThis.fetch;
+  const catalogResponse = deferred<Response>();
+  let generateCalls = 0;
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = String(input);
+    if (url === "/api/canvas-presets?artifact_type=poster") {
+      return catalogResponse.promise;
+    }
+    if (url === "/api/generate") {
+      generateCalls += 1;
+      const body = init?.body as FormData;
+      assert.equal(body.get("canvas_preset_id"), "auto");
+      assert.equal(body.has("template"), false);
+      return new Response(JSON.stringify({ detail: "stop after request inspection" }), {
+        status: 500,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    throw new Error(`unexpected fetch ${url}`);
+  }) as typeof fetch;
+  try {
+    const catalogLoad = useApp.getState().loadPosterCanvasPresets();
+    await useApp.getState().resumeRun("resume-failure");
+    assert.equal(generateCalls, 1);
+    catalogResponse.resolve(new Response(JSON.stringify({
+      version: 1,
+      kind: "poster_canvas_presets",
+      default_preset_id: "cvpr-landscape",
+      presets: canvasPresets,
+    }), { status: 200, headers: { "Content-Type": "application/json" } }));
+    await catalogLoad;
   } finally {
     globalThis.fetch = originalFetch;
   }
